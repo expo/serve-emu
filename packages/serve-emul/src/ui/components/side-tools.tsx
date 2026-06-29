@@ -5,6 +5,7 @@ import { FontScalePanel, NetworkPanel, NightModePanel, OrientationPanel } from "
 import { LocationPanel } from "./location-panel";
 import { LogcatPanel } from "./logcat-panel";
 import { SessionPanel } from "./session-panel";
+import { ScreenshotPanel } from "./screenshot-panel";
 import { ToolSection } from "./tool-section";
 
 type Props = {
@@ -70,6 +71,7 @@ export const SideTools = memo(function SideTools({
       </ToolSection>
       <StaticTool id="location-tool" title="Location" panel={LocationPanel} />
       <StaticTool id="apps-tool" title="Apps" panel={AppManagementPanel} />
+      <StaticTool id="screenshot-tool" title="Screenshot" panel={ScreenshotPanel} />
       <StaticTool id="logcat-tool" title="Logcat" panel={LogcatPanel} />
       <StaticTool id="session-tool" title="Session" panel={SessionPanel} />
     </>
