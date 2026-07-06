@@ -1097,12 +1097,10 @@ export async function startScrcpy(
         );
       });
     });
-    proc.stdout?.on("data", (b: Buffer) =>
-      process.stdout.write(`[scrcpy] ${b}`),
-    );
+    // Drain routine device-server output without forwarding it to the CLI.
+    proc.stdout?.resume();
     proc.stderr?.on("data", (b: Buffer) => {
       stderrTail = `${stderrTail}${b.toString("utf8")}`.slice(-8_192);
-      process.stderr.write(`[scrcpy] ${b}`);
     });
 
     await withDeadline(
