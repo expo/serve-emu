@@ -53,6 +53,10 @@ function splitUrlList(value: unknown): string[] {
     .filter(Boolean);
 }
 
+function hasTurnUrl(urls: string[]): boolean {
+  return urls.some((url) => /^turns?:/i.test(url));
+}
+
 function streamSettingsFromOptions(): StreamSettings {
   const transport = String(values.transport ?? "websocket").toLowerCase();
   if (transport !== "websocket" && transport !== "webrtc") {
@@ -72,11 +76,17 @@ function streamSettingsFromOptions(): StreamSettings {
 
   const turnUrls = splitUrlList(values["turn-url"]);
   if (turnUrls.length) {
+    if (!values["turn-username"] || !values["turn-credential"]) {
+      throw new Error("--turn-url requires both --turn-username and --turn-credential.");
+    }
     iceServers.push({
       urls: turnUrls,
-      ...(values["turn-username"] ? { username: values["turn-username"] } : {}),
-      ...(values["turn-credential"] ? { credential: values["turn-credential"] } : {}),
+      username: values["turn-username"],
+      credential: values["turn-credential"],
     });
+  }
+  if (icePolicy === "relay" && !hasTurnUrl(turnUrls)) {
+    throw new Error("--webrtc-ice-policy relay requires at least one --turn-url.");
   }
 
   return {
@@ -147,6 +157,7 @@ async function main() {
     throw new Error("Use either --avd to launch an emulator or --serial to attach to an existing device, not both.");
   }
 
+  const streamSettings = streamSettingsFromOptions();
   let emulatorLaunch: Awaited<ReturnType<typeof startEmulator>> | null = null;
   const serial = values.avd
     ? (emulatorLaunch = await startEmulator({
@@ -161,7 +172,6 @@ async function main() {
   const bitRate = numberOption("bit-rate", 8_000_000);
   const maxSize = numberOption("max-size", 1920);
   const keyFrameInterval = numberOption("key-frame-interval", 1);
-  const streamSettings = streamSettingsFromOptions();
 
   const { server, stop: stopServer } = await startServer({
     serial,

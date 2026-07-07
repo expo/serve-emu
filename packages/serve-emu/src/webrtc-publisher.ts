@@ -1,3 +1,6 @@
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import type nodeDataChannel from "node-datachannel";
 import type {
   DataChannel,
@@ -28,12 +31,14 @@ export type WebRtcPublisherOptions = {
 
 type NodeDataChannel = typeof nodeDataChannel;
 
+const requireModule = createRequire(import.meta.url);
 const PAYLOAD_TYPE_H264 = 96;
 const RTP_CLOCK_RATE = 90_000;
 const ICE_GATHERING_TIMEOUT_MS = 3_000;
 const MAX_TRACK_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 let loggerInitialized = false;
+let nativeRepairAttempted = false;
 
 function randomSsrc(): number {
   return Math.floor(1 + Math.random() * 0x7ffffffe);
@@ -84,9 +89,74 @@ function iceUrlsForNodeDataChannel(servers: WebRtcIceServer[]): string[] {
   return urls;
 }
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function isMissingNativeBindingError(err: unknown): boolean {
+  const message = errorMessage(err);
+  return message.includes("node_datachannel.node") || message.includes("build/Release");
+}
+
+function nodeDataChannelPackageDir(): string {
+  const entry = requireModule.resolve("node-datachannel");
+  return join(dirname(entry), "..", "..", "..");
+}
+
+function requireNativeNodeDataChannel(): NodeDataChannel {
+  return requireModule(
+    join(nodeDataChannelPackageDir(), "build", "Release", "node_datachannel.node"),
+  ) as NodeDataChannel;
+}
+
+function runPrebuildInstall(packageDir: string): Promise<void> {
+  const packageRequire = createRequire(join(packageDir, "package.json"));
+  const prebuildInstallBin = packageRequire.resolve("prebuild-install/bin.js");
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [prebuildInstallBin, "-r", "napi"], {
+      cwd: packageDir,
+      stdio: "inherit",
+    });
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(
+        new Error(
+          `prebuild-install exited with code ${code ?? "null"} signal ${signal ?? "null"}`,
+        ),
+      );
+    });
+  });
+}
+
+async function loadNodeDataChannel(): Promise<NodeDataChannel> {
+  try {
+    return requireNativeNodeDataChannel();
+  } catch (err) {
+    if (!isMissingNativeBindingError(err) || nativeRepairAttempted) throw err;
+    nativeRepairAttempted = true;
+    const packageDir = nodeDataChannelPackageDir();
+    console.warn(
+      "node-datachannel native binding is missing; attempting to download the prebuilt N-API binary...",
+    );
+    try {
+      await runPrebuildInstall(packageDir);
+      return requireNativeNodeDataChannel();
+    } catch (repairErr) {
+      throw new Error(
+        `node-datachannel native binding is missing and automatic repair failed. ` +
+          `Run "bun pm trust node-datachannel" and "bun install", then retry. ` +
+          `Original error: ${errorMessage(err)}. Repair error: ${errorMessage(repairErr)}`,
+      );
+    }
+  }
+}
+
 export async function createWebRtcPublisher(options: WebRtcPublisherOptions): Promise<WebRtcPublisher> {
-  const imported = await import("node-datachannel");
-  const ndc = imported.default;
+  const ndc = await loadNodeDataChannel();
   if (!loggerInitialized) {
     loggerInitialized = true;
     ndc.initLogger("Warning");
@@ -122,9 +192,10 @@ export class WebRtcPublisher {
       onKeyframeRequest: this.options.onKeyframeRequest,
       onClose: (closedPeer) => this.peers.delete(closedPeer),
     });
+    this.peers.add(peer);
     try {
       const answer = await peer.answer(offer);
-      this.peers.add(peer);
+      if (peer.closed) throw new Error("WebRTC peer closed before answer was created");
       this.options.onKeyframeRequest("WebRTC peer opened");
       return answer;
     } catch (err) {

@@ -6,6 +6,9 @@
     "dev": "bun run --filter serve-emu dev",
     "build": "bun run --filter serve-emu build"
   },
+  "trustedDependencies": [
+    "node-datachannel"
+  ],
   "devDependencies": {
     "typescript": "^5.6.0",
     "@types/bun": "latest"
