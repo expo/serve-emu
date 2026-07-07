@@ -1,10 +1,13 @@
 import { useRef } from "react";
 import type { PointerEvent, RefObject } from "react";
 import type { Sender } from "../lib/use-stream";
+import type { StreamTransport } from "../lib/use-stream";
 import type { AccessibilityNode } from "./accessibility-panel";
 
 type Props = {
   canvasRef: RefObject<HTMLCanvasElement>;
+  videoRef: RefObject<HTMLVideoElement>;
+  streamMode: StreamTransport;
   send: Sender;
   accessibilityNodes?: AccessibilityNode[];
   accessibilityEnabled?: boolean;
@@ -18,6 +21,8 @@ const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
 
 export function DeviceStream({
   canvasRef,
+  videoRef,
+  streamMode,
   send,
   accessibilityNodes = [],
   accessibilityEnabled = false,
@@ -25,20 +30,22 @@ export function DeviceStream({
   deviceSize = null,
 }: Props) {
   const activeRef = useRef<{ id: number; x: number; y: number } | null>(null);
+  const surfaceRef = useRef<HTMLDivElement>(null);
   const pendingMoveRef = useRef<Point | null>(null);
   const moveRafRef = useRef(0);
 
   const pointFromClient = (clientX: number, clientY: number): Point | null => {
-    const canvas = canvasRef.current;
-    if (!canvas) return null;
-    const r = canvas.getBoundingClientRect();
+    const surface = surfaceRef.current;
+    if (!surface) return null;
+    const r = surface.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
     return {
       x: clamp01((clientX - r.left) / r.width),
       y: clamp01((clientY - r.top) / r.height),
     };
   };
 
-  const norm = (e: PointerEvent<HTMLCanvasElement>): Point | null =>
+  const norm = (e: PointerEvent<HTMLDivElement>): Point | null =>
     pointFromClient(e.clientX, e.clientY);
 
   const sendTouch = (action: "down" | "move" | "up", p: Point, pointerId: number) => {
@@ -63,11 +70,11 @@ export function DeviceStream({
     }
   };
 
-  const onPointerDown = (e: PointerEvent<HTMLCanvasElement>) => {
+  const onPointerDown = (e: PointerEvent<HTMLDivElement>) => {
     if (e.pointerType === "mouse" && e.button !== 0) return;
     if (activeRef.current) return;
     e.preventDefault();
-    canvasRef.current?.setPointerCapture(e.pointerId);
+    e.currentTarget.setPointerCapture(e.pointerId);
     const p = norm(e);
     if (!p) return;
     activeRef.current = { id: e.pointerId, ...p };
@@ -75,7 +82,7 @@ export function DeviceStream({
     sendTouch("down", p, e.pointerId);
   };
 
-  const onPointerMove = (e: PointerEvent<HTMLCanvasElement>) => {
+  const onPointerMove = (e: PointerEvent<HTMLDivElement>) => {
     const active = activeRef.current;
     if (!active || e.pointerId !== active.id) return;
     e.preventDefault();
@@ -92,7 +99,7 @@ export function DeviceStream({
     }
   };
 
-  const stopPointer = (e: PointerEvent<HTMLCanvasElement>) => {
+  const stopPointer = (e: PointerEvent<HTMLDivElement>) => {
     const active = activeRef.current;
     if (!active || e.pointerId !== active.id) return;
     e.preventDefault();
@@ -103,21 +110,32 @@ export function DeviceStream({
     const up = norm(e);
     if (up) sendTouch("up", up, active.id);
     try {
-      canvasRef.current?.releasePointerCapture(active.id);
+      e.currentTarget.releasePointerCapture(active.id);
     } catch {}
     activeRef.current = null;
     pendingMoveRef.current = null;
   };
 
+  const aspectRatio = deviceSize ? `${deviceSize.width} / ${deviceSize.height}` : undefined;
+
   return (
-    <div className="stream-surface">
-      <canvas
-        ref={canvasRef}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={stopPointer}
-        onPointerCancel={stopPointer}
-        onContextMenu={(e) => e.preventDefault()}
+    <div
+      ref={surfaceRef}
+      className="stream-surface"
+      style={aspectRatio ? { aspectRatio } : undefined}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={stopPointer}
+      onPointerCancel={stopPointer}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <canvas ref={canvasRef} className={streamMode === "websocket" ? "active" : "inactive"} />
+      <video
+        ref={videoRef}
+        className={streamMode === "webrtc" ? "active" : "inactive"}
+        muted
+        playsInline
+        autoPlay
       />
       {accessibilityEnabled && deviceSize && (
         <div className="ax-overlay" aria-hidden="true">

@@ -44,17 +44,25 @@ main {
   overflow: hidden;
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6);
 }
-canvas {
-  display: block;
-  max-height: 80vh;
-  max-width: 90vw;
-  height: auto;
+.stream-surface {
+  position: relative;
   cursor: default;
   user-select: none;
   touch-action: none;
 }
-.stream-surface {
-  position: relative;
+.stream-surface canvas,
+.stream-surface video {
+  display: block;
+  max-height: 80vh;
+  max-width: 90vw;
+  height: auto;
+  background: #000;
+}
+.stream-surface video {
+  object-fit: contain;
+}
+.stream-surface .inactive {
+  display: none;
 }
 .ax-overlay {
   position: absolute;

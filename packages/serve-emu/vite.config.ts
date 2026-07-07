@@ -13,6 +13,7 @@ export default defineConfig({
     proxy: {
       "/api": "http://localhost:3300",
       "/health": "http://localhost:3300",
+      "/webrtc": "http://localhost:3300",
       "/ws": { target: "ws://localhost:3300", ws: true },
     },
   },

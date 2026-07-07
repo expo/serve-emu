@@ -11,7 +11,7 @@ bunx serve-emu
 # → Preview at http://localhost:3300
 ```
 
-`serve-emu` spawns the scrcpy server on the device, opens an adb forward tunnel, pipes H.264 frames over a WebSocket, and decodes them in the browser with WebCodecs. Input events flow back over the same socket to scrcpy's control channel.
+`serve-emu` spawns the scrcpy server on the device, opens an adb forward tunnel, and streams H.264 frames to the browser. It uses WebSocket + WebCodecs by default, or WebRTC with configurable STUN/TURN servers for tunnel-friendly remote streaming. Input events flow back to scrcpy's control channel over the active transport.
 
 ## Status
 
@@ -21,6 +21,7 @@ v1. Working:
 - Taps, swipes, hardware buttons (Back / Home / Recents / Power)
 - Text injection, keyevents
 - Multi-client (multiple browser tabs share one stream)
+- Optional WebRTC transport with STUN/TURN configuration
 - Auto-replay of SPS/PPS to clients joining mid-stream
 - Emulator GPS location control from the browser UI and `POST /api/location`
 - Route playback from GPX, GeoJSON, KML, or waypoint JSON
@@ -39,7 +40,7 @@ Planned:
 - Node.js 18+ or Bun 1.1+
 - `adb` on PATH (Android platform-tools)
 - A booted device/emulator (`adb devices` shows it), or an AVD name passed with `--avd`
-- Chrome / Edge / Safari 16.4+ (for WebCodecs)
+- Chrome / Edge / Safari 16.4+ for the default WebSocket/WebCodecs viewer, or a browser with WebRTC H.264 support for `--transport webrtc`
 
 ## Quick start
 
@@ -52,10 +53,20 @@ bun run packages/serve-emu/src/cli.ts
 
 The `setup` step is also run lazily on first start, so you can skip it.
 
+For WebRTC streaming with a TURN relay:
+
+```sh
+bun run packages/serve-emu/src/cli.ts --transport webrtc \
+  --stun-url stun:stun.l.google.com:19302 \
+  --turn-url turn:turn.example.com:3478 \
+  --turn-username "$TURN_USERNAME" \
+  --turn-credential "$TURN_CREDENTIAL"
+```
+
 ## CLI
 
 ```
-serve-emu [-p <port>] [-s <serial>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec]
+serve-emu [-p <port>] [-s <serial>] [--transport websocket|webrtc] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec]
 serve-emu --avd <name> [--restart-avd]
 serve-emu --avd-list
 serve-emu --running-avds
@@ -69,6 +80,12 @@ serve-emu --running-avds
 | `--bit-rate` | `8000000` | H.264 bit rate in bps |
 | `--max-size` | `1920` | downscale longest edge to N pixels; `0` = native (encoders on many emulators reject above ~2560, so the default trims) |
 | `--key-frame-interval` | `1` | ask the encoder for regular keyframes so clients can recover without resetting video capture; `0` disables this codec option |
+| `--transport` | `websocket` | stream transport: `websocket` keeps the original WebCodecs path; `webrtc` serves H.264 over WebRTC |
+| `--stun-url` | Google STUN in WebRTC mode | comma-separated STUN URLs for WebRTC ICE |
+| `--turn-url` | none | comma-separated TURN URLs for WebRTC ICE |
+| `--turn-username` | none | TURN username used with `--turn-url` |
+| `--turn-credential` | none | TURN credential used with `--turn-url` |
+| `--webrtc-ice-policy` | `all` | WebRTC ICE transport policy: `all` or `relay` |
 | `--avd` | none | launch this Android Virtual Device before streaming |
 | `--restart-avd` | false | stop a running matching AVD before launching it |
 | `--avd-list` | false | list available Android Virtual Device names |
@@ -77,6 +94,8 @@ serve-emu --running-avds
 | `--emulator-port` | auto | emulator console port for `--avd`; must be an even port from 5554 through 5682 |
 
 ## HTTP API
+
+`GET /api` returns device metadata and the selected stream transport. In WebRTC mode the browser creates an SDP offer and posts it to `POST /webrtc/offer`; the response is the SDP answer. TURN credentials are included in `/api` for the viewer and redacted from `/health`.
 
 Set an Android Emulator GPS fix:
 
@@ -154,19 +173,20 @@ curl -X POST http://localhost:3300/api/apps/grant \
 ## How it works
 
 ```
-┌──────────────────┐ adb forward  ┌─────────────┐  H264 / WS    ┌─────────┐
-│ scrcpy-server.jar│ ◄──────────► │  serve-emu  │ ────────────► │ Browser │
-│ on device        │  TCP tunnel  │   (Bun)     │   WebCodecs   │ <canvas>│
-│  • video socket  │              │             │ ◄──────────── │         │
-│  • control socket│              │             │  input JSON   │         │
-└──────────────────┘              └─────────────┘               └─────────┘
+┌──────────────────┐ adb forward  ┌─────────────┐  H264 / WS or WebRTC  ┌─────────┐
+│ scrcpy-server.jar│ ◄──────────► │  serve-emu  │ ────────────────────► │ Browser │
+│ on device        │  TCP tunnel  │   (Bun)     │     WebCodecs/video   │ canvas/ │
+│  • video socket  │              │             │ ◄──────────────────── │ video   │
+│  • control socket│              │             │        input JSON     │         │
+└──────────────────┘              └─────────────┘                       └─────────┘
 ```
 
 1. The CLI pushes `scrcpy-server-v3.1` to `/data/local/tmp/scrcpy-server.jar`.
 2. It opens `adb forward tcp:<localPort> localabstract:scrcpy_<scid>`.
 3. It spawns `app_process` with the scrcpy server class on the device, then connects two sockets through the tunnel: video and control.
-4. The Bun server reads scrcpy's framed H.264 stream (12-byte header + Annex-B payload) and forwards each Access Unit as a binary WebSocket message. Raw `/ws` clients receive the Annex-B payload unchanged; the built-in browser UI opts into a 16-byte frame metadata header with keyframe and PTS data.
-5. The browser configures a `VideoDecoder` from the SPS, uses server-provided frame metadata to avoid per-frame NAL scans, and draws frames to a `<canvas>`. Pointer events are normalized to device coordinates and written back to scrcpy's control socket as 32-byte touch packets.
+4. The Bun server reads scrcpy's framed H.264 stream (12-byte header + Annex-B payload). In WebSocket mode it forwards each Access Unit as a binary `/ws` message; in WebRTC mode it packetizes the same Annex-B access units into an H.264 media track.
+5. The browser discovers the transport from `/api`. WebSocket mode configures a `VideoDecoder` and draws to a `<canvas>`; WebRTC mode creates an offer for `/webrtc/offer` and renders the remote media track in a `<video>`.
+6. Pointer events are normalized to device coordinates and written back to scrcpy's control socket as 32-byte touch packets.
 
 ## License
 

@@ -12,7 +12,8 @@ import { useStream } from "./lib/use-stream";
 
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const { state, send } = useStream(canvasRef);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const { state, send, transport } = useStream(canvasRef, videoRef);
   const [accessibilityEnabled, setAccessibilityEnabled] = useState(false);
   const [accessibilityNodes, setAccessibilityNodes] = useState<AccessibilityNode[]>([]);
   const [highlightedAccessibilityId, setHighlightedAccessibilityId] = useState<string | null>(null);
@@ -48,6 +49,8 @@ export function App() {
         <div className="device">
           <DeviceStream
             canvasRef={canvasRef}
+            videoRef={videoRef}
+            streamMode={transport ?? "websocket"}
             send={send}
             accessibilityEnabled={accessibilityEnabled}
             accessibilityNodes={accessibilityNodes}

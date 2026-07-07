@@ -12,11 +12,29 @@ export type StreamState = {
 
 export type Sender = (msg: Record<string, unknown>, ack?: boolean) => void;
 
+export type StreamTransport = "websocket" | "webrtc";
+
+type WebRtcIceServer = {
+  urls: string[];
+  username?: string;
+  credential?: string;
+};
+
+type StreamSettings =
+  | { transport: "websocket" }
+  | {
+      transport: "webrtc";
+      codec: "h264";
+      iceServers: WebRtcIceServer[];
+      iceTransportPolicy: RTCIceTransportPolicy;
+    };
+
 type ApiInfo = {
   size: DeviceSize;
   status?: "streaming" | "stopped" | "error";
   lastFrameAt?: string | null;
   lastError?: string | null;
+  stream?: StreamSettings;
 };
 
 const SOFT_DECODE_QUEUE_SIZE = 4;
@@ -28,6 +46,19 @@ const FRAME_META_MAGIC = 0x53454d55; // "SEMU"
 const FRAME_META_VERSION = 1;
 const FRAME_META_HEADER_BYTES = 16;
 const FRAME_FLAG_KEY = 1 << 0;
+const WEBRTC_ICE_GATHERING_TIMEOUT_MS = 3000;
+const WEBRTC_FIRST_FRAME_TIMEOUT_MS = 5000;
+
+type VideoFrameCallbackMetadata = {
+  presentedFrames: number;
+};
+
+type VideoFrameCallback = (now: DOMHighResTimeStamp, metadata: VideoFrameCallbackMetadata) => void;
+
+type VideoWithFrameCallback = HTMLVideoElement & {
+  requestVideoFrameCallback?: (callback: VideoFrameCallback) => number;
+  cancelVideoFrameCallback?: (handle: number) => void;
+};
 
 type FramePacket = {
   data: Uint8Array;
@@ -51,21 +82,93 @@ function parseFramePacket(raw: ArrayBuffer | Uint8Array): FramePacket {
   return { data: bytes, isKey: null, timestamp: null };
 }
 
-export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
+function waitForIceGathering(pc: RTCPeerConnection): Promise<void> {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      pc.removeEventListener("icegatheringstatechange", onStateChange);
+      resolve();
+    };
+    const onStateChange = () => {
+      if (pc.iceGatheringState === "complete") finish();
+    };
+    pc.addEventListener("icegatheringstatechange", onStateChange);
+    setTimeout(finish, WEBRTC_ICE_GATHERING_TIMEOUT_MS);
+  });
+}
+
+function preferH264(transceiver: RTCRtpTransceiver) {
+  const capabilities = RTCRtpReceiver.getCapabilities("video");
+  const codecs = capabilities?.codecs ?? [];
+  const h264 = codecs.filter((codec) => codec.mimeType.toLowerCase() === "video/h264");
+  if (!h264.length || typeof transceiver.setCodecPreferences !== "function") return;
+  transceiver.setCodecPreferences(h264);
+}
+
+function iceServersForBrowser(settings: Extract<StreamSettings, { transport: "webrtc" }>): RTCIceServer[] {
+  return settings.iceServers.map((server) => ({
+    urls: server.urls,
+    ...(server.username ? { username: server.username } : {}),
+    ...(server.credential ? { credential: server.credential } : {}),
+  }));
+}
+
+export function useStream(
+  canvasRef: RefObject<HTMLCanvasElement>,
+  videoRef: RefObject<HTMLVideoElement>,
+) {
   const [state, setState] = useState<StreamState>({
     status: "connecting…",
     fps: 0,
     deviceSize: null,
   });
+  const [transport, setTransport] = useState<StreamTransport | null>(null);
+  const [streamSettings, setStreamSettings] = useState<StreamSettings | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const dataChannelRef = useRef<RTCDataChannel | null>(null);
 
   const send = useCallback<Sender>((msg, ack = true) => {
+    const dataChannel = dataChannelRef.current;
+    if (dataChannel?.readyState === "open") {
+      dataChannel.send(JSON.stringify(ack ? msg : { ...msg, ack: false }));
+      return;
+    }
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify(ack ? msg : { ...msg, ack: false }));
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    fetch("/api")
+      .then((r) => r.json() as Promise<ApiInfo>)
+      .then((d) => {
+        if (cancelled) return;
+        const settings = d.stream ?? { transport: "websocket" as const };
+        setStreamSettings(settings);
+        setTransport(settings.transport);
+        setState((s) => ({
+          ...s,
+          deviceSize: d.size,
+          status: d.status && d.status !== "streaming" ? d.lastError || d.status : s.status,
+        }));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setStreamSettings({ transport: "websocket" });
+        setTransport("websocket");
+        setState((s) => ({ ...s, status: "metadata unavailable" }));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (transport !== "websocket") return;
     const canDecode = "VideoDecoder" in globalThis && "EncodedVideoChunk" in globalThis;
     if (!canDecode) {
       setState((s) => ({ ...s, status: "WebCodecs unsupported" }));
@@ -308,7 +411,218 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
       wsRef.current = null;
       decoder = null;
     };
-  }, [canvasRef]);
+  }, [canvasRef, transport]);
 
-  return { state, send };
+  useEffect(() => {
+    if (transport !== "webrtc" || streamSettings?.transport !== "webrtc") return;
+    if (!("RTCPeerConnection" in globalThis)) {
+      setState((s) => ({ ...s, status: "WebRTC unsupported" }));
+      return;
+    }
+
+    let cancelled = false;
+    let reconnectDelay = 500;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let healthTimer: ReturnType<typeof setInterval> | null = null;
+    let firstFrameTimer: ReturnType<typeof setTimeout> | null = null;
+    let pc: RTCPeerConnection | null = null;
+    let dataChannel: RTCDataChannel | null = null;
+    let frameCallbackHandle: number | null = null;
+    let fpsCount = 0;
+    let fpsTimer = performance.now();
+    let sawFirstFrame = false;
+
+    const video = videoRef.current as VideoWithFrameCallback | null;
+
+    const setStatus = (s: string) =>
+      setState((prev) => (prev.status === s ? prev : { ...prev, status: s }));
+
+    const applyServerStatus = (d: ApiInfo) => {
+      const lastFrameAgeMs = d.lastFrameAt ? Date.now() - Date.parse(d.lastFrameAt) : Infinity;
+      setState((s) => ({
+        ...s,
+        deviceSize: d.size,
+        status:
+          d.status && d.status !== "streaming"
+            ? d.lastError || d.status
+            : lastFrameAgeMs > 3000 && !sawFirstFrame
+              ? "stream stalled"
+              : s.status,
+      }));
+    };
+
+    const requestKeyframe = () => {
+      if (dataChannel?.readyState !== "open") return;
+      dataChannel.send(JSON.stringify({ type: "reset-video", ack: false }));
+    };
+
+    const onVideoFrame: VideoFrameCallback = () => {
+      if (cancelled || !video?.requestVideoFrameCallback) return;
+      if (!sawFirstFrame) {
+        sawFirstFrame = true;
+        if (firstFrameTimer) clearTimeout(firstFrameTimer);
+        setStatus("streaming");
+      }
+      fpsCount++;
+      const now = performance.now();
+      if (now - fpsTimer >= 1000) {
+        const fps = Math.round((fpsCount * 1000) / (now - fpsTimer));
+        fpsCount = 0;
+        fpsTimer = now;
+        setState((s) => (s.fps === fps ? s : { ...s, fps }));
+      }
+      frameCallbackHandle = video.requestVideoFrameCallback(onVideoFrame);
+    };
+
+    const markFirstFrame = () => {
+      if (sawFirstFrame) return;
+      sawFirstFrame = true;
+      if (firstFrameTimer) clearTimeout(firstFrameTimer);
+      setStatus("streaming");
+    };
+
+    const startFrameCounter = () => {
+      if (!video) return;
+      if (video.requestVideoFrameCallback) {
+        frameCallbackHandle = video.requestVideoFrameCallback(onVideoFrame);
+        return;
+      }
+      video.addEventListener("playing", markFirstFrame);
+      video.addEventListener("loadeddata", markFirstFrame);
+    };
+
+    const clearPeer = () => {
+      if (dataChannelRef.current === dataChannel) dataChannelRef.current = null;
+      try {
+        dataChannel?.close();
+      } catch {}
+      try {
+        pc?.close();
+      } catch {}
+      dataChannel = null;
+      pc = null;
+    };
+
+    const scheduleReconnect = () => {
+      if (cancelled || retryTimer) return;
+      const retryIn = reconnectDelay;
+      setStatus(`disconnected — retrying in ${Math.round(retryIn / 1000)}s`);
+      clearPeer();
+      reconnectDelay = Math.min(Math.round(reconnectDelay * 1.6), 5000);
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        void connect();
+      }, retryIn);
+    };
+
+    const connect = async () => {
+      if (cancelled) return;
+      setStatus("connecting WebRTC");
+      sawFirstFrame = false;
+      if (firstFrameTimer) clearTimeout(firstFrameTimer);
+      firstFrameTimer = setTimeout(() => {
+        if (cancelled || sawFirstFrame) return;
+        requestKeyframe();
+        setStatus("waiting for first frame");
+      }, WEBRTC_FIRST_FRAME_TIMEOUT_MS);
+
+      try {
+        const nextPc = new RTCPeerConnection({
+          iceServers: iceServersForBrowser(streamSettings),
+          iceTransportPolicy: streamSettings.iceTransportPolicy,
+        });
+        pc = nextPc;
+        const transceiver = nextPc.addTransceiver("video", { direction: "recvonly" });
+        preferH264(transceiver);
+
+        dataChannel = nextPc.createDataChannel("input");
+        dataChannelRef.current = dataChannel;
+        dataChannel.onopen = () => {
+          reconnectDelay = 500;
+          requestKeyframe();
+        };
+        dataChannel.onclose = () => {
+          if (dataChannelRef.current === dataChannel) dataChannelRef.current = null;
+        };
+
+        nextPc.ontrack = (event) => {
+          if (!video) return;
+          const stream = event.streams[0] ?? new MediaStream([event.track]);
+          if (video.srcObject !== stream) video.srcObject = stream;
+          video.muted = true;
+          video.playsInline = true;
+          void video.play().catch(() => {});
+          startFrameCounter();
+        };
+        nextPc.onconnectionstatechange = () => {
+          const state = nextPc.connectionState;
+          if (state === "connected") {
+            reconnectDelay = 500;
+            setStatus(sawFirstFrame ? "streaming" : "connecting video");
+          } else if (state === "failed" || state === "disconnected" || state === "closed") {
+            scheduleReconnect();
+          }
+        };
+
+        const offer = await nextPc.createOffer();
+        await nextPc.setLocalDescription(offer);
+        await waitForIceGathering(nextPc);
+        const localDescription = nextPc.localDescription;
+        if (!localDescription) throw new Error("WebRTC offer was not created");
+
+        const response = await fetch("/webrtc/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: localDescription.type,
+            sdp: localDescription.sdp,
+            codec: streamSettings.codec,
+          }),
+        });
+        const answer = await response.json();
+        if (!response.ok) throw new Error(answer?.error ?? "WebRTC offer failed");
+        if (cancelled || pc !== nextPc) return;
+        await nextPc.setRemoteDescription(answer);
+      } catch (err) {
+        console.error("WebRTC connection failed", err);
+        scheduleReconnect();
+      }
+    };
+
+    void connect();
+
+    fetch("/health")
+      .then((r) => r.json() as Promise<ApiInfo>)
+      .then((d) => {
+        if (!cancelled) applyServerStatus(d);
+      })
+      .catch(() => {
+        if (!cancelled) setStatus("metadata unavailable");
+      });
+
+    healthTimer = setInterval(() => {
+      fetch("/health")
+        .then((r) => r.json() as Promise<ApiInfo>)
+        .then((d) => {
+          if (!cancelled) applyServerStatus(d);
+        })
+        .catch(() => {
+          if (!cancelled) setStatus("metadata unavailable");
+        });
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (healthTimer) clearInterval(healthTimer);
+      if (firstFrameTimer) clearTimeout(firstFrameTimer);
+      if (frameCallbackHandle !== null) video?.cancelVideoFrameCallback?.(frameCallbackHandle);
+      video?.removeEventListener("playing", markFirstFrame);
+      video?.removeEventListener("loadeddata", markFirstFrame);
+      clearPeer();
+      if (video) video.srcObject = null;
+    };
+  }, [streamSettings, transport, videoRef]);
+
+  return { state, send, transport };
 }
