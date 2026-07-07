@@ -1,7 +1,7 @@
 {
   "name": "serve-emu",
   "version": "0.0.3",
-  "description": "The `npx serve` of Android devices — stream a booted emulator or attached device over a WebSocket H.264 feed decoded in the browser with WebCodecs.",
+  "description": "The `npx serve` of Android devices — stream a booted emulator or attached device over WebSocket/WebCodecs or WebRTC H.264.",
   "license": "Apache-2.0",
   "type": "module",
   "author": "jiunshinn",
@@ -51,9 +51,13 @@
     "LICENSE"
   ],
   "dependencies": {
+    "node-datachannel": "^0.32.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
+  "trustedDependencies": [
+    "node-datachannel"
+  ],
   "devDependencies": {
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",

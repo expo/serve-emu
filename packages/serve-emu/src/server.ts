@@ -18,6 +18,8 @@ import { dispatch, parseGesture, resetVideoPacket, type Gesture, type Screen } f
 import { parseGeoFix, setEmulatorLocationAsync, type GeoFix } from "./location.ts";
 import { parseRoutePlaybackRequest, RoutePlayback } from "./route-playback.ts";
 import { SessionRecorder } from "./session-recorder.ts";
+import { redactedStreamSettings, type StreamSettings } from "./stream-settings.ts";
+import { createWebRtcPublisher, type WebRtcPublisher } from "./webrtc-publisher.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -29,6 +31,7 @@ export type ServerOpts = {
   bitRate?: number;
   maxSize?: number;
   keyFrameInterval?: number;
+  streamSettings?: StreamSettings;
 };
 
 type SessionStatus = "streaming" | "stopped" | "error";
@@ -55,10 +58,12 @@ const FRAME_FLAG_KEY = 1 << 0;
 const VIDEO_RESET_COOLDOWN_MS = 1500;
 const STALE_VIDEO_RESET_MS = 2500;
 const MAX_JSON_BODY_BYTES = 8 * 1024;
+const MAX_WEBRTC_OFFER_BYTES = 256 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_LOGCAT_QUERY_BYTES = 200;
 
 export async function startServer(opts: ServerOpts) {
+  const streamSettings = opts.streamSettings ?? { transport: "websocket" as const };
   const session: ScrcpySession = await startScrcpy({
     serial: opts.serial,
     maxFps: opts.maxFps,
@@ -66,11 +71,18 @@ export async function startServer(opts: ServerOpts) {
     maxSize: opts.maxSize,
     keyFrameInterval: opts.keyFrameInterval,
   });
+  if (streamSettings.transport === "webrtc" && session.meta.codecId !== "h264") {
+    session.close();
+    throw new Error(
+      `WebRTC transport currently supports only H.264, but scrcpy selected ${session.meta.codecId}.`,
+    );
+  }
   console.log(
-    `scrcpy ready: ${session.meta.deviceName} • ${session.meta.codecId} • ${session.meta.width}×${session.meta.height}`,
+    `scrcpy ready: ${session.meta.deviceName} • ${session.meta.codecId} • ${session.meta.width}×${session.meta.height} • ${streamSettings.transport}`,
   );
 
   const clients = new Set<Client>();
+  let webRtcPublisher: WebRtcPublisher | null = null;
   const screen: Screen = { width: session.meta.width, height: session.meta.height };
   const startedMs = Date.now();
   const startedAt = new Date(startedMs).toISOString();
@@ -118,6 +130,8 @@ export async function startServer(opts: ServerOpts) {
     location: lastLocation,
     route: routePlayback.snapshot(),
     session: sessionRecorder.snapshot(),
+    stream: redactedStreamSettings(streamSettings),
+    webrtc: webRtcPublisher?.snapshot() ?? null,
     clientsDetail: Array.from(clients, (client) => ({
       id: client.id,
       frameMeta: client.frameMeta,
@@ -150,6 +164,8 @@ export async function startServer(opts: ServerOpts) {
     if (watchdog) clearInterval(watchdog);
     routePlayback.close();
     session.close();
+    webRtcPublisher?.close();
+    webRtcPublisher = null;
     closeClients(nextStatus === "error" ? 1011 : 1000, reason);
   };
 
@@ -199,6 +215,12 @@ export async function startServer(opts: ServerOpts) {
     const contentLength = Number(req.headers.get("content-length") ?? "0");
     if (contentLength > maxBytes) throw new Error("request body too large");
     return req.json();
+  };
+
+  const jsonCorsHeaders = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
   };
 
   const shouldRecord = (value: unknown) =>
@@ -453,6 +475,30 @@ export async function startServer(opts: ServerOpts) {
     }
     client.sentFrames++;
   };
+
+  if (streamSettings.transport === "webrtc") {
+    webRtcPublisher = await createWebRtcPublisher({
+      settings: streamSettings,
+      bitRate: opts.bitRate ?? 8_000_000,
+      onKeyframeRequest: requestVideoReset,
+      onInput: (payload, peerId) => {
+        try {
+          if (status !== "streaming") throw new Error(`session is ${status}`);
+          if (isResetVideoRequest(payload)) {
+            requestVideoReset(`WebRTC peer ${peerId} requested keyframe`);
+            return;
+          }
+          const msg = parseGesture(payload);
+          void dispatchGesture(msg, "webrtc", shouldRecord(payload)).catch((err) => {
+            console.warn(`WebRTC input failed: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        } catch (err) {
+          console.warn(`WebRTC input failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
+    });
+  }
+
   // Cache the SPS+PPS bytes that scrcpy emits as a standalone "config" packet
   // and inline them in front of every keyframe so each WS message is a
   // self-contained Access Unit the browser can hand straight to WebCodecs.
@@ -487,6 +533,7 @@ export async function startServer(opts: ServerOpts) {
             : (rawOut ??= withConfig(f.data, config));
           sendFrame(c, out, f.isKey);
         }
+        webRtcPublisher?.sendFrame(f, config);
       }
     } catch (err) {
       if (!stopRequested) markTerminal("error", String(err));
@@ -496,7 +543,9 @@ export async function startServer(opts: ServerOpts) {
   watchdog = setInterval(() => {
     sourceFps = frameCount - lastFpsFrameCount;
     lastFpsFrameCount = frameCount;
-    if (status !== "streaming" || clients.size === 0) return;
+    if (status !== "streaming" || (clients.size === 0 && (webRtcPublisher?.activePeerCount ?? 0) === 0)) {
+      return;
+    }
     const lastFrameSeenMs = lastFrameMs || startedMs;
     if (Date.now() - lastFrameSeenMs > STALE_VIDEO_RESET_MS) {
       requestVideoReset("source stream stalled");
@@ -528,6 +577,7 @@ export async function startServer(opts: ServerOpts) {
           size: { width: session.meta.width, height: session.meta.height },
           status,
           clients: clients.size,
+          stream: streamSettings,
         });
       }
 
@@ -552,6 +602,32 @@ export async function startServer(opts: ServerOpts) {
 
       if (url.pathname === "/health") {
         return Response.json(health(), { status: status === "streaming" ? 200 : 503 });
+      }
+
+      if (url.pathname === "/webrtc/offer") {
+        if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: jsonCorsHeaders });
+        if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+        if (status !== "streaming") {
+          return Response.json(health(), {
+            status: 503,
+            headers: jsonCorsHeaders,
+          });
+        }
+        if (!webRtcPublisher) {
+          return Response.json(
+            { ok: false, error: "WebRTC transport is not enabled. Start serve-emu with --transport webrtc." },
+            { status: 404, headers: jsonCorsHeaders },
+          );
+        }
+        try {
+          const payload = await readJsonBody(req, MAX_WEBRTC_OFFER_BYTES);
+          return Response.json(await webRtcPublisher.handleOffer(payload), { headers: jsonCorsHeaders });
+        } catch (err) {
+          return Response.json(
+            { ok: false, error: err instanceof Error ? err.message : String(err) },
+            { status: 400, headers: jsonCorsHeaders },
+          );
+        }
       }
 
       if (url.pathname === "/api/logcat") {
@@ -848,6 +924,8 @@ export async function startServer(opts: ServerOpts) {
       stoppedAt = new Date().toISOString();
     }
     closeClients(1001, "server stopping");
+    webRtcPublisher?.close();
+    webRtcPublisher = null;
     if (watchdog) clearInterval(watchdog);
     routePlayback.close();
     server.stop(true);

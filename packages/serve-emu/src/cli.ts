@@ -3,6 +3,12 @@ import { parseArgs } from "node:util";
 import { pickDevice } from "./adb.ts";
 import { listAvds, listRunningAvds, startEmulator } from "./emulator.ts";
 import { startServer } from "./server.ts";
+import {
+  DEFAULT_WEBRTC_ICE_SERVERS,
+  type StreamSettings,
+  type WebRtcIceServer,
+  type WebRtcIceTransportPolicy,
+} from "./stream-settings.ts";
 
 const argv = Bun.argv.slice(2);
 const { values } = parseArgs({
@@ -14,6 +20,12 @@ const { values } = parseArgs({
     "bit-rate": { type: "string", default: "8000000" },
     "max-size": { type: "string", default: "1920" },
     "key-frame-interval": { type: "string", default: "1" },
+    transport: { type: "string", default: "websocket" },
+    "stun-url": { type: "string" },
+    "turn-url": { type: "string" },
+    "turn-username": { type: "string" },
+    "turn-credential": { type: "string" },
+    "webrtc-ice-policy": { type: "string", default: "all" },
     avd: { type: "string" },
     "avd-list": { type: "boolean" },
     "running-avds": { type: "boolean" },
@@ -33,11 +45,53 @@ function numberOption(name: string, fallback: number): number {
   return n;
 }
 
+function splitUrlList(value: unknown): string[] {
+  if (typeof value !== "string") return [];
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function streamSettingsFromOptions(): StreamSettings {
+  const transport = String(values.transport ?? "websocket").toLowerCase();
+  if (transport !== "websocket" && transport !== "webrtc") {
+    throw new Error("--transport must be one of: websocket, webrtc.");
+  }
+
+  if (transport === "websocket") return { transport: "websocket" };
+
+  const icePolicy = String(values["webrtc-ice-policy"] ?? "all").toLowerCase();
+  if (icePolicy !== "all" && icePolicy !== "relay") {
+    throw new Error("--webrtc-ice-policy must be one of: all, relay.");
+  }
+
+  const iceServers: WebRtcIceServer[] = [];
+  const stunUrls = splitUrlList(values["stun-url"]);
+  if (stunUrls.length) iceServers.push({ urls: stunUrls });
+
+  const turnUrls = splitUrlList(values["turn-url"]);
+  if (turnUrls.length) {
+    iceServers.push({
+      urls: turnUrls,
+      ...(values["turn-username"] ? { username: values["turn-username"] } : {}),
+      ...(values["turn-credential"] ? { credential: values["turn-credential"] } : {}),
+    });
+  }
+
+  return {
+    transport: "webrtc",
+    codec: "h264",
+    iceServers: iceServers.length ? iceServers : DEFAULT_WEBRTC_ICE_SERVERS,
+    iceTransportPolicy: icePolicy as WebRtcIceTransportPolicy,
+  };
+}
+
 if (values.help) {
-  console.log(`serve-emu — host an Android device over scrcpy + WebSocket
+  console.log(`serve-emu — host an Android device over scrcpy + WebSocket/WebRTC
 
 Usage:
-  serve-emu [-p <port>] [-s <serial>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec]
+  serve-emu [-p <port>] [-s <serial>] [--transport websocket|webrtc] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec]
   serve-emu --avd <name> [--restart-avd]
   serve-emu --avd-list
   serve-emu --running-avds
@@ -53,6 +107,14 @@ Options:
       --key-frame-interval <sec>
                          Ask the encoder for regular keyframes; 0 disables this
                          codec option (default: 1)
+      --transport <mode>  Stream transport: websocket or webrtc (default: websocket)
+      --stun-url <urls>   Comma-separated STUN URL(s) for WebRTC ICE
+      --turn-url <urls>   Comma-separated TURN URL(s) for WebRTC ICE
+      --turn-username <u> TURN username for --turn-url
+      --turn-credential <c>
+                         TURN credential for --turn-url
+      --webrtc-ice-policy <all|relay>
+                         ICE transport policy for WebRTC (default: all)
       --avd <name>       Launch this Android Virtual Device before streaming
       --restart-avd      Stop a running matching AVD before launching it
       --avd-list         Print available Android Virtual Device names
@@ -99,6 +161,7 @@ async function main() {
   const bitRate = numberOption("bit-rate", 8_000_000);
   const maxSize = numberOption("max-size", 1920);
   const keyFrameInterval = numberOption("key-frame-interval", 1);
+  const streamSettings = streamSettingsFromOptions();
 
   const { server, stop: stopServer } = await startServer({
     serial,
@@ -107,6 +170,7 @@ async function main() {
     bitRate,
     maxSize,
     keyFrameInterval,
+    streamSettings,
   }).catch((err) => {
     emulatorLaunch?.stop();
     throw err;
