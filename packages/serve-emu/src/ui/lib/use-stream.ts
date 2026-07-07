@@ -47,6 +47,7 @@ const FRAME_META_VERSION = 1;
 const FRAME_META_HEADER_BYTES = 16;
 const FRAME_FLAG_KEY = 1 << 0;
 const WEBRTC_ICE_GATHERING_TIMEOUT_MS = 3000;
+const WEBRTC_SIGNALING_TIMEOUT_MS = 10_000;
 const WEBRTC_FIRST_FRAME_TIMEOUT_MS = 5000;
 
 type VideoFrameCallbackMetadata = {
@@ -86,17 +87,19 @@ function waitForIceGathering(pc: RTCPeerConnection): Promise<void> {
   if (pc.iceGatheringState === "complete") return Promise.resolve();
   return new Promise((resolve) => {
     let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
     const finish = () => {
       if (settled) return;
       settled = true;
       pc.removeEventListener("icegatheringstatechange", onStateChange);
+      if (timeout) clearTimeout(timeout);
       resolve();
     };
     const onStateChange = () => {
       if (pc.iceGatheringState === "complete") finish();
     };
     pc.addEventListener("icegatheringstatechange", onStateChange);
-    setTimeout(finish, WEBRTC_ICE_GATHERING_TIMEOUT_MS);
+    timeout = setTimeout(finish, WEBRTC_ICE_GATHERING_TIMEOUT_MS);
   });
 }
 
@@ -425,6 +428,8 @@ export function useStream(
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let healthTimer: ReturnType<typeof setInterval> | null = null;
     let firstFrameTimer: ReturnType<typeof setTimeout> | null = null;
+    let offerController: AbortController | null = null;
+    let offerTimeout: ReturnType<typeof setTimeout> | null = null;
     let pc: RTCPeerConnection | null = null;
     let dataChannel: RTCDataChannel | null = null;
     let frameCallbackHandle: number | null = null;
@@ -461,6 +466,7 @@ export function useStream(
       if (!sawFirstFrame) {
         sawFirstFrame = true;
         if (firstFrameTimer) clearTimeout(firstFrameTimer);
+        firstFrameTimer = null;
         setStatus("streaming");
       }
       fpsCount++;
@@ -478,6 +484,7 @@ export function useStream(
       if (sawFirstFrame) return;
       sawFirstFrame = true;
       if (firstFrameTimer) clearTimeout(firstFrameTimer);
+      firstFrameTimer = null;
       setStatus("streaming");
     };
 
@@ -507,6 +514,8 @@ export function useStream(
       if (cancelled || retryTimer) return;
       const retryIn = reconnectDelay;
       setStatus(`disconnected — retrying in ${Math.round(retryIn / 1000)}s`);
+      if (firstFrameTimer) clearTimeout(firstFrameTimer);
+      firstFrameTimer = null;
       clearPeer();
       reconnectDelay = Math.min(Math.round(reconnectDelay * 1.6), 5000);
       retryTimer = setTimeout(() => {
@@ -570,15 +579,25 @@ export function useStream(
         const localDescription = nextPc.localDescription;
         if (!localDescription) throw new Error("WebRTC offer was not created");
 
-        const response = await fetch("/webrtc/offer", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            type: localDescription.type,
-            sdp: localDescription.sdp,
-            codec: streamSettings.codec,
-          }),
-        });
+        offerController = new AbortController();
+        offerTimeout = setTimeout(() => offerController?.abort(), WEBRTC_SIGNALING_TIMEOUT_MS);
+        let response: Response;
+        try {
+          response = await fetch("/webrtc/offer", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal: offerController.signal,
+            body: JSON.stringify({
+              type: localDescription.type,
+              sdp: localDescription.sdp,
+              codec: streamSettings.codec,
+            }),
+          });
+        } finally {
+          if (offerTimeout) clearTimeout(offerTimeout);
+          offerTimeout = null;
+          offerController = null;
+        }
         const answer = await response.json();
         if (!response.ok) throw new Error(answer?.error ?? "WebRTC offer failed");
         if (cancelled || pc !== nextPc) return;
@@ -616,6 +635,8 @@ export function useStream(
       if (retryTimer) clearTimeout(retryTimer);
       if (healthTimer) clearInterval(healthTimer);
       if (firstFrameTimer) clearTimeout(firstFrameTimer);
+      if (offerTimeout) clearTimeout(offerTimeout);
+      offerController?.abort();
       if (frameCallbackHandle !== null) video?.cancelVideoFrameCallback?.(frameCallbackHandle);
       video?.removeEventListener("playing", markFirstFrame);
       video?.removeEventListener("loadeddata", markFirstFrame);
