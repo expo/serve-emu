@@ -25,6 +25,7 @@ v1. Working:
 - Logcat forwarding over SSE with browser-side filter, pause, and copy controls
 - Agent-friendly REST input APIs plus session event replay
 - App management controls for APK install, launch, clear data, force stop, and permission grants
+- Full-resolution screenshot capture from the browser UI (download / copy) and `GET /api/screenshot`
 
 Planned:
 
@@ -63,9 +64,9 @@ serve-emu --running-avds
 |---|---|---|
 | `-p, --port` | `3300` | HTTP port for the preview server |
 | `-s, --serial` | auto | adb device serial (only required when multiple devices are attached) |
-| `--max-fps` | `60` | cap source frame rate |
+| `--max-fps` | `30` | cap source frame rate |
 | `--bit-rate` | `8000000` | H.264 bit rate in bps |
-| `--max-size` | `1920` | downscale longest edge to N pixels; `0` = native (encoders on many emulators reject above ~2560, so the default trims) |
+| `--max-size` | `1024` | downscale longest edge to N pixels; `0` = native (encoders on many emulators reject above ~2560, so the default trims) |
 | `--key-frame-interval` | `1` | ask the encoder for regular keyframes so clients can recover without resetting video capture; `0` disables this codec option |
 | `--avd` | none | launch this Android Virtual Device before streaming |
 | `--restart-avd` | false | stop a running matching AVD before launching it |

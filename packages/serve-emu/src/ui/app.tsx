@@ -3,16 +3,20 @@ import { StatusBar } from "./components/status-bar";
 import { AppManagementPanel } from "./components/app-management-panel";
 import { AccessibilityPanel, type AccessibilityNode } from "./components/accessibility-panel";
 import { DevicePanel } from "./components/device-panel";
+import { AppearancePanel } from "./components/appearance-panel";
+import { ScreenshotPanel } from "./components/screenshot-panel";
 import { DeviceStream } from "./components/device-stream";
 import { ControlBar, type HardwareKey } from "./components/control-bar";
 import { LogcatPanel } from "./components/logcat-panel";
 import { LocationPanel } from "./components/location-panel";
 import { SessionPanel } from "./components/session-panel";
+import { useDevice } from "./lib/device";
 import { useStream } from "./lib/use-stream";
 
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const { state, send } = useStream(canvasRef);
+  const { serial } = useDevice();
+  const { state, send } = useStream(canvasRef, serial);
   const [accessibilityEnabled, setAccessibilityEnabled] = useState(false);
   const [accessibilityNodes, setAccessibilityNodes] = useState<AccessibilityNode[]>([]);
   const [highlightedAccessibilityId, setHighlightedAccessibilityId] = useState<string | null>(null);
@@ -57,6 +61,8 @@ export function App() {
         </div>
         <aside className="side-panel">
           <DevicePanel />
+          <AppearancePanel />
+          <ScreenshotPanel />
           <AccessibilityPanel
             enabled={accessibilityEnabled}
             nodes={accessibilityNodes}

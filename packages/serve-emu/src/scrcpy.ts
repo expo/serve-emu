@@ -1,7 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createConnection, type Socket } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
-import { SCRCPY_VERSION, ensureScrcpyServer } from "../scripts/fetch-scrcpy.ts";
+import { SCRCPY_VERSION, ensureScrcpyServer } from "./scrcpy-server.ts";
 
 const DEVICE_JAR_PATH = "/data/local/tmp/scrcpy-server.jar";
 
@@ -264,9 +264,9 @@ function parseVideoPreamble(buf: Buffer): {
 export async function startScrcpy(opts: StartOpts): Promise<ScrcpySession> {
   const jar = await ensureScrcpyServer();
   const { serial } = opts;
-  const maxFps = opts.maxFps ?? 60;
+  const maxFps = opts.maxFps ?? 30;
   const bitRate = opts.bitRate ?? 8_000_000;
-  const maxSize = opts.maxSize ?? 0;
+  const maxSize = opts.maxSize ?? 1280;
   const keyFrameInterval = opts.keyFrameInterval ?? 1;
   const scid = randomScid();
   let localPort: number | null = null;
