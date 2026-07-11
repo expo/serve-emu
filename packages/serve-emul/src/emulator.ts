@@ -47,7 +47,7 @@ function sdkEmulatorCandidates(): string[] {
   ]);
 }
 
-export async function resolveEmulator(explicit?: string): Promise<string> {
+async function resolveEmulator(explicit?: string): Promise<string> {
   if (explicit) return explicit;
 
   const pathProbe = await execText("emulator", ["-version"]);

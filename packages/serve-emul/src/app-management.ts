@@ -30,10 +30,6 @@ async function adb(serial: string, args: string[], timeout = 30_000): Promise<Ap
   return { ok: true, output: text };
 }
 
-function adbHost(serial: string, args: string[], timeout = 30_000): Promise<AppActionResult> {
-  return adb(serial, args, timeout);
-}
-
 function validate(value: unknown, name: string, pattern: RegExp): string {
   if (typeof value !== "string" || !pattern.test(value.trim())) {
     throw new Error(`${name} is invalid`);
@@ -41,15 +37,15 @@ function validate(value: unknown, name: string, pattern: RegExp): string {
   return value.trim();
 }
 
-export function packageName(value: unknown): string {
+function packageName(value: unknown): string {
   return validate(value, "packageName", PACKAGE_RE);
 }
 
-export function activityName(value: unknown): string {
+function activityName(value: unknown): string {
   return validate(value, "activity", ACTIVITY_RE);
 }
 
-export function permissionName(value: unknown): string {
+function permissionName(value: unknown): string {
   return validate(value, "permission", PERMISSION_RE);
 }
 
@@ -89,7 +85,7 @@ export async function importMediaFile(serial: string, file: File): Promise<FileI
   try {
     writeFileSync(localPath, new Uint8Array(await file.arrayBuffer()));
     await adb(serial, ["shell", "mkdir", "-p", remoteDir]);
-    await adbHost(serial, ["push", localPath, remotePath], 120_000);
+    await adb(serial, ["push", localPath, remotePath], 120_000);
     await adb(serial, [
       "shell",
       "am",

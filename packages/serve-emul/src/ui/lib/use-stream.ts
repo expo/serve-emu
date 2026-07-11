@@ -103,8 +103,7 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
             ? d.lastError || d.status
             : !hasRenderedFrame && lastFrameAgeMs > 5000
               ? "waiting for video"
-              : s.status === "stream stalled" ||
-                  s.status === "metadata unavailable" ||
+              : s.status === "metadata unavailable" ||
                   s.status === "waiting for video"
                 ? "streaming"
               : s.status,

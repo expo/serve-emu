@@ -12,7 +12,6 @@ type SessionEvent = {
 
 type SessionSnapshot = {
   events: SessionEvent[];
-  recording: boolean;
   replaying: boolean;
   lastError: string | null;
 };
@@ -99,10 +98,6 @@ export function SessionPanel() {
             onChange={(e) => setMultiplier(e.currentTarget.value)}
             value={multiplier}
           />
-        </label>
-        <label>
-          Mode
-          <input readOnly value={session?.recording ? "Recording" : "Paused"} />
         </label>
       </div>
       <div className="panel-actions">

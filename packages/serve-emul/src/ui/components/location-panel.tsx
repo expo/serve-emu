@@ -3,7 +3,7 @@ import type { PointerEvent } from "react";
 
 type Point = { x: number; y: number };
 type LocationPoint = { latitude: number; longitude: number; altitude?: number };
-type Tile = { key: string; x: number; y: number; left: number; top: number; wrappedX: number };
+type Tile = { key: string; y: number; left: number; top: number; wrappedX: number };
 type RouteSnapshot = {
   status: "idle" | "running" | "paused" | "completed" | "error";
   waypointCount: number;
@@ -262,7 +262,6 @@ export function LocationPanel() {
       for (let x = startX; x <= endX; x++) {
         out.push({
           key: `${zoom}-${x}-${y}`,
-          x,
           y,
           wrappedX: normalizedTileX(x, zoom),
           left: x * TILE_SIZE - leftWorld,

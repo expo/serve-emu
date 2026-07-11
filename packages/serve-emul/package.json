@@ -1,6 +1,6 @@
 {
   "name": "serve-emul",
-  "version": "0.0.4",
+  "version": "1.0.0",
   "description": "The `npx serve` of Android devices — stream a booted emulator or attached device over a WebSocket H.264 feed decoded in the browser with WebCodecs.",
   "license": "Apache-2.0",
   "type": "module",
@@ -31,6 +31,7 @@
   "bin": {
     "serve-emul": "src/cli.ts"
   },
+  "exports": {},
   "scripts": {
     "setup": "bun run scripts/fetch-scrcpy.ts && bun run build:ui",
     "dev": "bun --watch run src/cli.ts",
@@ -39,7 +40,9 @@
     "build:ui": "vite build",
     "build": "bun run build:ui",
     "test": "bun test",
-    "check": "bun run test && bun run typecheck && bun run typecheck:ui && bun run build",
+    "test:package": "bun run scripts/package-smoke.ts",
+    "check:unused": "knip",
+    "check": "bun run test && bun run typecheck && bun run typecheck:ui && bun run build && bun run test:package && bun run check:unused",
     "release": "bun run scripts/release.ts",
     "typecheck": "tsc --noEmit",
     "typecheck:ui": "tsc -p src/ui --noEmit",
@@ -62,6 +65,7 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "knip": "6.26.0",
     "vite": "^5.4.11"
   }
 }

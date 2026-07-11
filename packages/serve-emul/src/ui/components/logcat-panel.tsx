@@ -1,15 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 
 type LogLine = {
-  id: number;
   line: string;
-  at: string;
 };
 
 const MAX_LINES = 500;
 
 export function LogcatPanel() {
-  const nextIdRef = useRef(1);
   const pausedRef = useRef(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const [lines, setLines] = useState<LogLine[]>([]);
@@ -39,9 +36,9 @@ export function LogcatPanel() {
     source.addEventListener("log", (event) => {
       if (pausedRef.current) return;
       try {
-        const data = JSON.parse((event as MessageEvent).data) as { line: string; at: string };
+        const data = JSON.parse((event as MessageEvent).data) as { line: string };
         setLines((current) =>
-          [...current, { id: nextIdRef.current++, line: data.line, at: data.at }].slice(-MAX_LINES),
+          [...current, { line: data.line }].slice(-MAX_LINES),
         );
       } catch {}
     });

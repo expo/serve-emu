@@ -5,7 +5,7 @@ import { SCRCPY_VERSION, ensureScrcpyServer } from "../scripts/fetch-scrcpy.ts";
 
 const DEVICE_JAR_PATH = "/data/local/tmp/scrcpy-server.jar";
 
-export type ScrcpyMeta = {
+type ScrcpyMeta = {
   deviceName: string;
   codecId: string;
   width: number;
@@ -62,7 +62,7 @@ export const SCRCPY_DEFAULTS = {
   repeatFrameMs: 0,
 } as const;
 
-export type VideoFrame = {
+type VideoFrame = {
   type: "frame";
   data: Buffer;
   pts: bigint;
@@ -70,11 +70,10 @@ export type VideoFrame = {
   isKey: boolean;
 };
 
-export type VideoSession = {
+type VideoSession = {
   type: "session";
   width: number;
   height: number;
-  clientResized: boolean;
 };
 
 export type VideoPacket = VideoFrame | VideoSession;
@@ -335,7 +334,7 @@ export function parseFrameHeader(
   header: Buffer,
   protocol: ScrcpyProtocol,
 ):
-  | { kind: "session"; width: number; height: number; clientResized: boolean }
+  | { kind: "session"; width: number; height: number }
   | {
       kind: "frame";
       size: number;
@@ -347,7 +346,6 @@ export function parseFrameHeader(
   if (protocol === 4 && (ptsRaw & PACKET_V4_FLAG_SESSION) !== 0n) {
     return {
       kind: "session",
-      clientResized: (header.readUInt32BE(0) & 1) !== 0,
       width: header.readUInt32BE(4),
       height: header.readUInt32BE(8),
     };
@@ -658,7 +656,6 @@ export async function readFrame(
   if (parsed.kind === "session") {
     return {
       type: "session",
-      clientResized: parsed.clientResized,
       width: parsed.width,
       height: parsed.height,
     };

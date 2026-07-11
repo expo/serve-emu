@@ -51,6 +51,20 @@ Planned:
 
 Node.js 18+ can invoke the published package through `npx`, but local development and server runtime use Bun.
 
+## Package API
+
+As of 1.0.0, `serve-emul` is intentionally a CLI-only package. The only
+supported package surface is the installed `serve-emul` executable. There are
+no supported JavaScript or TypeScript import paths: both `import "serve-emul"`
+and deep imports such as `import "serve-emul/src/adb.ts"` are blocked by the
+package export map. Files shipped for the CLI are implementation details and
+carry no import-path stability guarantee.
+
+The documented HTTP and WebSocket endpoints remain supported runtime APIs once
+the CLI is running; they are not package imports. The planned
+`serve-emul/middleware` entry point is not available yet and must not be
+imported until it is explicitly exported and documented in a future release.
+
 ## Quick Start
 
 One-off run from npm:

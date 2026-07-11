@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { execBuffer, execText } from "./exec.ts";
 
 const ADB_QUERY_TIMEOUT_MS = 2_000;
@@ -22,7 +21,7 @@ export type NightModeStatus = {
   mode: NightMode | "unknown";
   raw: string;
 };
-export type NetworkRadioStatus = "enabled" | "disabled" | "unknown";
+type NetworkRadioStatus = "enabled" | "disabled" | "unknown";
 export type NetworkStatus = {
   enabled: boolean | null;
   wifi: NetworkRadioStatus;
@@ -47,7 +46,7 @@ export async function listAllDevices(): Promise<Device[]> {
     });
 }
 
-export async function listDevices(): Promise<Device[]> {
+async function listDevices(): Promise<Device[]> {
   return (await listAllDevices()).filter((d) => d.state === "device");
 }
 
@@ -69,27 +68,6 @@ export async function screencapPng(serial: string): Promise<Buffer> {
   });
   if (r.status !== 0) throw new Error(`screencap failed: ${r.stderr}`);
   return r.stdout;
-}
-
-export async function shell(serial: string, cmd: string[]): Promise<void> {
-  const r = await execText("adb", ["-s", serial, "shell", ...cmd], {
-    timeout: ADB_MUTATION_TIMEOUT_MS,
-  });
-  if (r.status !== 0) throw new Error(`adb shell ${cmd.join(" ")} failed: ${r.stderr}`);
-}
-
-export function shellSpawn(serial: string, cmd: string[]) {
-  return spawn("adb", ["-s", serial, "shell", ...cmd]);
-}
-
-export async function getDeviceSize(serial: string): Promise<{ width: number; height: number }> {
-  const r = await execText("adb", ["-s", serial, "shell", "wm", "size"], {
-    timeout: ADB_QUERY_TIMEOUT_MS,
-  });
-  if (r.status !== 0) throw new Error(`wm size failed: ${r.stderr}`);
-  const m = r.stdout.match(/(\d+)x(\d+)/);
-  if (!m) throw new Error(`Could not parse wm size output: ${r.stdout}`);
-  return { width: Number(m[1]), height: Number(m[2]) };
 }
 
 function orientationFromRotation(mode: "free" | "lock" | "unknown", rotation: number | null): OrientationStatus["orientation"] {

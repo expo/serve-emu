@@ -30,7 +30,7 @@ export function DeviceStream({
   keyboardProxyRef,
   keyboardActive = true,
 }: Props) {
-  const activeRef = useRef<{ id: number; x: number; y: number } | null>(null);
+  const activeRef = useRef<{ id: number } | null>(null);
   const pendingMoveRef = useRef<Point | null>(null);
   const moveRafRef = useRef(0);
   const accessibilitySize = accessibilityNodes.length
@@ -94,8 +94,6 @@ export function DeviceStream({
     const next = pendingMoveRef.current;
     if (!active || !next) return;
     pendingMoveRef.current = null;
-    active.x = next.x;
-    active.y = next.y;
     sendTouch("move", next, active.id);
   };
 
@@ -115,7 +113,7 @@ export function DeviceStream({
     canvasRef.current?.setPointerCapture(e.pointerId);
     const p = norm(e);
     if (!p) return;
-    activeRef.current = { id: e.pointerId, ...p };
+    activeRef.current = { id: e.pointerId };
     pendingMoveRef.current = null;
     sendTouch("down", p, e.pointerId);
   };

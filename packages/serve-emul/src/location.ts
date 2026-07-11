@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 
 export type GeoFix = {
   latitude: number;
@@ -81,12 +81,6 @@ export function parseGeoFix(value: unknown): GeoFix {
   }
 
   return { latitude, longitude, altitude, satellites, velocity };
-}
-
-export function setEmulatorLocation(serial: string, fix: GeoFix): void {
-  const r = spawnSync("adb", geoFixArgs(serial, fix), { encoding: "utf8", timeout: 5_000 });
-  const output = `${r.stdout}${r.stderr}`.trim();
-  assertGeoFixOutput(r.status, output);
 }
 
 export function setEmulatorLocationAsync(serial: string, fix: GeoFix): Promise<void> {

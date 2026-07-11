@@ -21,7 +21,6 @@ export type RecordedEvent =
 
 export type SessionSnapshot = {
   events: RecordedEvent[];
-  recording: boolean;
   replaying: boolean;
   replayStartedAt: string | null;
   replayCompletedAt: string | null;
@@ -43,16 +42,11 @@ export class SessionRecorder {
   #events: RecordedEvent[] = [];
   #nextId = 1;
   #lastEventMs = 0;
-  #recording = true;
   #replaying = false;
   #stopReplay = false;
   #replayStartedAt: string | null = null;
   #replayCompletedAt: string | null = null;
   #lastError: string | null = null;
-
-  get isReplaying(): boolean {
-    return this.#replaying;
-  }
 
   recordGesture(gesture: Gesture, source: string): void {
     this.#record({ kind: "gesture", gesture, source });
@@ -78,7 +72,6 @@ export class SessionRecorder {
   snapshot(): SessionSnapshot {
     return {
       events: this.#events,
-      recording: this.#recording,
       replaying: this.#replaying,
       replayStartedAt: this.#replayStartedAt,
       replayCompletedAt: this.#replayCompletedAt,
@@ -127,7 +120,7 @@ export class SessionRecorder {
       | { kind: "gesture"; gesture: Gesture; source: string }
       | { kind: "location"; location: GeoFix; source: string },
   ): void {
-    if (!this.#recording || this.#replaying) return;
+    if (this.#replaying) return;
     const now = Date.now();
     const delayMs = this.#lastEventMs ? Math.max(0, now - this.#lastEventMs) : 0;
     this.#lastEventMs = now;
