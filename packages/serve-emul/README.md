@@ -265,6 +265,16 @@ curl -X POST "$BASE/api/route/control" \
 curl -X DELETE "$BASE/api/route"
 ```
 
+The browser route importer accepts GPX, KML, GeoJSON, and waypoint JSON files
+up to 2 MiB. It rejects oversized files before reading them, parses in a
+cancellable Web Worker, and enforces the 10,000-waypoint, nesting, and
+complexity limits during traversal. Playback receives the complete validated
+waypoint sequence. Map display is separate: it caches projection by route and
+zoom, simplifies the line to at most 1,024 screen-space points, and pans it with
+one CSS transform per animation frame. The interaction target is one 16.7 ms
+frame at 60 Hz. Follow route is explicit; manually panning turns it off so the
+one-second status poll does not force the map center back onto the route.
+
 ### Sessions
 
 REST and WebSocket input events are recorded by default. Add `"record":false` to supported input payloads when an event should not be saved.
