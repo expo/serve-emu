@@ -1,9 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { spawn } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
 import type { ServerWebSocket } from "bun";
-import { execText } from "./exec.ts";
 import {
   getFontScale,
   getNetworkStatus,
@@ -34,6 +32,7 @@ import {
 } from "./app-management.ts";
 import { getForegroundApp } from "./app-info.ts";
 import { FrameStatWindow } from "./frame-stat-window.ts";
+import { LogcatHub } from "./logcat.ts";
 import {
   isAbnormalExit,
   procExitDetail,
@@ -256,6 +255,7 @@ export async function startServer(opts: ServerOpts) {
     });
   let sessionRecorder = new SessionRecorder();
   let routePlayback = createRoutePlayback();
+  let logcatHub = new LogcatHub(currentSerial);
   let sessionGeneration = 0;
   let accessibilitySnapshotCache: {
     snapshot: AccessibilitySnapshot;
@@ -284,6 +284,7 @@ export async function startServer(opts: ServerOpts) {
     location: lastLocation,
     route: routePlayback.snapshot(),
     session: sessionRecorder.snapshot(),
+    logcat: logcatHub.snapshot(),
     clientsDetail: Array.from(clients, (client) => ({
       id: client.id,
       frameMeta: client.frameMeta,
@@ -379,6 +380,7 @@ export async function startServer(opts: ServerOpts) {
       terminalCleanupDone = true;
       if (watchdog) clearInterval(watchdog);
       routePlayback.close();
+      logcatHub.close(reason);
       session.close();
       closeClients(nextStatus === "error" ? 1011 : 1000, reason);
     }
@@ -485,22 +487,7 @@ export async function startServer(opts: ServerOpts) {
     return lastLocation;
   };
 
-  const resolvePackagePids = async (
-    packageName: string,
-  ): Promise<Set<string>> => {
-    if (!/^[A-Za-z0-9_.:-]+$/.test(packageName)) return new Set();
-    const r = await execText(
-      "adb",
-      ["-s", currentSerial, "shell", "pidof", packageName],
-      {
-        timeout: 2_000,
-      },
-    );
-    if (r.status !== 0) return new Set();
-    return new Set(r.stdout.trim().split(/\s+/).filter(Boolean));
-  };
-
-  const logcatStream = (url: URL) => {
+  const logcatStream = (req: Request, url: URL) => {
     const packageName = (url.searchParams.get("package") ?? "")
       .trim()
       .slice(0, MAX_LOGCAT_QUERY_BYTES);
@@ -508,97 +495,13 @@ export async function startServer(opts: ServerOpts) {
       .trim()
       .slice(0, MAX_LOGCAT_QUERY_BYTES)
       .toLowerCase();
-    const proc = spawn("adb", [
-      "-s",
-      currentSerial,
-      "logcat",
-      "-v",
-      "threadtime",
-    ]);
-    const encoder = new TextEncoder();
-    let pidSet = new Set<string>();
-    let pidTimer: ReturnType<typeof setInterval> | null = null;
-    let buffer = "";
-
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        const send = (event: string, value: unknown) => {
-          try {
-            controller.enqueue(
-              encoder.encode(
-                `event: ${event}\ndata: ${JSON.stringify(value)}\n\n`,
-              ),
-            );
-          } catch {}
-        };
-        const matches = (line: string) => {
-          if (search && !line.toLowerCase().includes(search)) return false;
-          if (!packageName) return true;
-          const parts = line.trim().split(/\s+/, 5);
-          const pid = parts[2];
-          return (pid && pidSet.has(pid)) || line.includes(packageName);
-        };
-        const consume = (chunk: Buffer) => {
-          buffer += chunk.toString("utf8");
-          const lines = buffer.split(/\r?\n/);
-          buffer = lines.pop() ?? "";
-          for (const line of lines) {
-            if (line && matches(line))
-              send("log", { line, at: new Date().toISOString() });
-          }
-        };
-
-        send("ready", {
-          serial: currentSerial,
-          package: packageName || null,
-          pids: Array.from(pidSet),
-          search: search || null,
-        });
-        if (packageName) {
-          void resolvePackagePids(packageName).then((set) => {
-            pidSet = set;
-          });
-          pidTimer = setInterval(() => {
-            void resolvePackagePids(packageName).then((set) => {
-              pidSet = set;
-            });
-          }, 5_000);
-        }
-        proc.stdout.on("data", consume);
-        proc.stderr.on("data", (chunk) => {
-          const text = chunk.toString("utf8").trim();
-          if (text) send("error", { line: text, at: new Date().toISOString() });
-        });
-        proc.once("exit", (code, signal) => {
-          send("close", { code, signal });
-          try {
-            controller.close();
-          } catch {}
-          if (pidTimer) clearInterval(pidTimer);
-        });
-        proc.once("error", (err) => {
-          send("error", { line: err.message, at: new Date().toISOString() });
-          try {
-            controller.close();
-          } catch {}
-          if (pidTimer) clearInterval(pidTimer);
-        });
+    return logcatHub.subscribe(
+      {
+        packageName,
+        search,
       },
-      cancel() {
-        if (pidTimer) clearInterval(pidTimer);
-        try {
-          proc.kill("SIGTERM");
-        } catch {}
-      },
-    });
-
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
-    });
+      req.signal,
+    );
   };
 
   const gestureEndpoint = async (
@@ -958,14 +861,24 @@ export async function startServer(opts: ServerOpts) {
       throw new Error(`${serial} is ${device.state}, not ready.`);
 
     const nextSession = await openScrcpy(serial);
+    if (stopRequested) {
+      try {
+        nextSession.close();
+      } catch {}
+      throw new Error("server is stopping");
+    }
+    const nextLogcatHub = new LogcatHub(serial);
     const previousSession = session;
+    const previousLogcatHub = logcatHub;
     sessionGeneration++;
     closeClients(1012, "device switched");
+    previousLogcatHub.close("device switched");
     try {
       previousSession.close();
     } catch {}
     currentSerial = serial;
     session = nextSession;
+    logcatHub = nextLogcatHub;
     resetSessionStats(nextSession);
     startFramePump(nextSession, sessionGeneration);
     attachSessionHandlers(nextSession, sessionGeneration);
@@ -985,6 +898,7 @@ export async function startServer(opts: ServerOpts) {
     lastError = reason;
     stoppedAt = new Date().toISOString();
     routePlayback.close();
+    logcatHub.close(reason);
     closeClients(1000, reason);
     try {
       session.close();
@@ -1440,7 +1354,10 @@ export async function startServer(opts: ServerOpts) {
       if (url.pathname === "/api/logcat") {
         if (req.method !== "GET")
           return new Response("method not allowed", { status: 405 });
-        return logcatStream(url);
+        // Logcat may legitimately be quiet for longer than Bun's default
+        // request idle timeout. The hub owns disconnect and shutdown cleanup.
+        srv.timeout(req, 0);
+        return logcatStream(req, url);
       }
 
       if (url.pathname === "/api/screenshot") {
@@ -1805,6 +1722,7 @@ export async function startServer(opts: ServerOpts) {
     closeClients(1001, "server stopping");
     if (watchdog) clearInterval(watchdog);
     routePlayback.close();
+    logcatHub.close("server stopping");
     server.stop(true);
     session.close();
   };
