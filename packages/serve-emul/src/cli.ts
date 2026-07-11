@@ -175,33 +175,63 @@ async function main() {
     }
   }
 
-  const { server, stop: stopServer } = await startServer({
+  type ActiveServer = Awaited<ReturnType<typeof startServer>>;
+  const lifecycleController = new AbortController();
+  let activeServer: ActiveServer | null = null;
+  let startupTask: Promise<ActiveServer> | null = null;
+  let stopping: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopping) return stopping;
+    lifecycleController.abort(new Error("serve-emul stopping"));
+    stopping = (async () => {
+      try {
+        const started =
+          activeServer ?? (await startupTask?.catch(() => null)) ?? null;
+        await started?.stop();
+      } finally {
+        emulatorLaunch?.stop();
+      }
+    })();
+    return stopping;
+  };
+  process.once("SIGINT", () => {
+    void stop()
+      .catch((err) => console.error("Shutdown cleanup failed:", err))
+      .finally(() => process.exit(0));
+  });
+  process.once("SIGTERM", () => {
+    void stop()
+      .catch((err) => console.error("Shutdown cleanup failed:", err))
+      .finally(() => process.exit(0));
+  });
+
+  startupTask = startServer({
     serial,
     port,
     host,
     token,
+    signal: lifecycleController.signal,
     maxFps,
     bitRate,
     maxSize,
     keyFrameInterval,
     repeatFrameMs,
-  }).catch((err) => {
+  });
+  try {
+    activeServer = await startupTask;
+  } catch (err) {
     emulatorLaunch?.stop();
+    if (lifecycleController.signal.aborted) {
+      await stop();
+      return;
+    }
     throw err;
-  });
-
-  const stop = () => {
-    stopServer();
-    emulatorLaunch?.stop();
-  };
-  process.once("SIGINT", () => {
-    stop();
-    process.exit(0);
-  });
-  process.once("SIGTERM", () => {
-    stop();
-    process.exit(0);
-  });
+  }
+  if (lifecycleController.signal.aborted) {
+    await stop();
+    return;
+  }
+  const { server } = activeServer;
 
   const base = `http://${displayHost(host)}:${server.port}`;
   if (token) {

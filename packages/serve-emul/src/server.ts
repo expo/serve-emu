@@ -47,6 +47,7 @@ import {
 } from "./shared/frame-meta.ts";
 import {
   startScrcpy,
+  type StartOpts as ScrcpyStartOpts,
   type ScrcpySession,
   type ScrcpyErrorCode,
   ScrcpyStreamError,
@@ -78,6 +79,7 @@ const UI_DIR = join(__dirname, "..", "dist", "ui");
 export type ServerOpts = {
   serial: string;
   port: number;
+  signal?: AbortSignal;
   /** Address to bind. Defaults to loopback (127.0.0.1). */
   host?: string;
   /**
@@ -91,6 +93,11 @@ export type ServerOpts = {
   maxSize?: number;
   keyFrameInterval?: number;
   repeatFrameMs?: number;
+};
+
+export type ServerDependencies = {
+  startScrcpy?: (opts: ScrcpyStartOpts) => Promise<ScrcpySession>;
+  listAllDevices?: typeof listAllDevices;
 };
 
 export const DEFAULT_HOST = "127.0.0.1";
@@ -163,10 +170,14 @@ const MAX_JSON_BODY_BYTES = 8 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_LOGCAT_QUERY_BYTES = 200;
 
-export async function startServer(opts: ServerOpts) {
-  const openScrcpy = (serial: string) =>
-    startScrcpy({
+export async function startServer(
+  opts: ServerOpts,
+  dependencies: ServerDependencies = {},
+) {
+  const openScrcpy = (serial: string, signal?: AbortSignal) =>
+    (dependencies.startScrcpy ?? startScrcpy)({
       serial,
+      signal,
       maxFps: opts.maxFps,
       bitRate: opts.bitRate,
       maxSize: opts.maxSize,
@@ -212,7 +223,7 @@ export async function startServer(opts: ServerOpts) {
   };
 
   let currentSerial = opts.serial;
-  let session: ScrcpySession = await openScrcpy(currentSerial);
+  let session: ScrcpySession = await openScrcpy(currentSerial, opts.signal);
   console.log(
     `scrcpy ready: ${session.meta.deviceName} • ${session.meta.codecId} • ${session.meta.width}×${session.meta.height}`,
   );
@@ -257,6 +268,14 @@ export async function startServer(opts: ServerOpts) {
   let sessionRecorder = new SessionRecorder();
   let routePlayback = createRoutePlayback();
   let sessionGeneration = 0;
+  let pendingSwitch: {
+    controller: AbortController;
+    task: Promise<{
+      ok: true;
+      serial: string;
+      device: string;
+    }>;
+  } | null = null;
   let accessibilitySnapshotCache: {
     snapshot: AccessibilitySnapshot;
     expiresMs: number;
@@ -377,9 +396,12 @@ export async function startServer(opts: ServerOpts) {
     stoppedAt = new Date().toISOString();
     if (!terminalCleanupDone) {
       terminalCleanupDone = true;
+      pendingSwitch?.controller.abort(new Error(reason));
       if (watchdog) clearInterval(watchdog);
       routePlayback.close();
-      session.close();
+      void session.close().catch((err) => {
+        console.error(`scrcpy cleanup failed: ${String(err)}`);
+      });
       closeClients(nextStatus === "error" ? 1011 : 1000, reason);
     }
   };
@@ -942,53 +964,115 @@ export async function startServer(opts: ServerOpts) {
     accessibilitySnapshotInFlight = null;
   };
 
-  const switchSession = async (serial: string) => {
+  const switchSession = (serial: string) => {
     if (serial === currentSerial && status === "streaming") {
-      return {
+      return Promise.resolve({
         ok: true,
         serial: currentSerial,
         device: session.meta.deviceName,
-      };
+      } as const);
     }
-    const device = (await listAllDevices()).find(
-      (candidate) => candidate.serial === serial,
+    pendingSwitch?.controller.abort(
+      new Error("scrcpy session switch superseded"),
     );
-    if (!device) throw new Error(`Unknown adb device "${serial}".`);
-    if (device.state !== "device")
-      throw new Error(`${serial} is ${device.state}, not ready.`);
+    const controller = new AbortController();
+    const abortReason = () =>
+      controller.signal.reason instanceof Error
+        ? controller.signal.reason
+        : new Error("scrcpy session switch aborted");
 
-    const nextSession = await openScrcpy(serial);
-    const previousSession = session;
-    sessionGeneration++;
-    closeClients(1012, "device switched");
-    try {
-      previousSession.close();
-    } catch {}
-    currentSerial = serial;
-    session = nextSession;
-    resetSessionStats(nextSession);
-    startFramePump(nextSession, sessionGeneration);
-    attachSessionHandlers(nextSession, sessionGeneration);
-    console.log(
-      `scrcpy ready: ${nextSession.meta.deviceName} • ${nextSession.meta.codecId} • ${nextSession.meta.width}×${nextSession.meta.height}`,
-    );
-    return {
-      ok: true,
-      serial: currentSerial,
-      device: nextSession.meta.deviceName,
-    };
+    const task = (async () => {
+      let nextSession: ScrcpySession | null = null;
+      let operationError: unknown = null;
+      try {
+        const device = (
+          await (dependencies.listAllDevices ?? listAllDevices)()
+        ).find((candidate) => candidate.serial === serial);
+        if (!device) throw new Error(`Unknown adb device "${serial}".`);
+        if (device.state !== "device") {
+          throw new Error(`${serial} is ${device.state}, not ready.`);
+        }
+        if (controller.signal.aborted || stopRequested) throw abortReason();
+
+        nextSession = await openScrcpy(serial, controller.signal);
+        if (controller.signal.aborted || stopRequested) throw abortReason();
+
+        const previousSession = session;
+        sessionGeneration++;
+        closeClients(1012, "device switched");
+        await previousSession.close();
+        if (controller.signal.aborted || stopRequested) throw abortReason();
+
+        currentSerial = serial;
+        session = nextSession;
+        nextSession = null;
+        resetSessionStats(session);
+        startFramePump(session, sessionGeneration);
+        attachSessionHandlers(session, sessionGeneration);
+        console.log(
+          `scrcpy ready: ${session.meta.deviceName} • ${session.meta.codecId} • ${session.meta.width}×${session.meta.height}`,
+        );
+        return {
+          ok: true as const,
+          serial: currentSerial,
+          device: session.meta.deviceName,
+        };
+      } catch (err) {
+        operationError = err;
+        throw err;
+      } finally {
+        let cleanupError: unknown = null;
+        if (nextSession) {
+          try {
+            await nextSession.close();
+          } catch (err) {
+            cleanupError = err;
+          }
+        }
+        if (pendingSwitch?.controller === controller) pendingSwitch = null;
+        if (cleanupError) {
+          if (operationError) {
+            const error =
+              operationError instanceof Error
+                ? operationError
+                : new Error(String(operationError));
+            throw new AggregateError(
+              [error, cleanupError],
+              error.message,
+              { cause: error },
+            );
+          }
+          throw cleanupError;
+        }
+      }
+    })();
+    pendingSwitch = { controller, task };
+    return task;
   };
 
-  const stopCurrentSession = (reason: string) => {
+  const stopCurrentSession = async (reason: string) => {
+    const pendingTask = pendingSwitch?.task;
+    const pendingAbort = new Error(reason);
+    pendingSwitch?.controller.abort(pendingAbort);
     sessionGeneration++;
     status = "stopped";
     lastError = reason;
     stoppedAt = new Date().toISOString();
     routePlayback.close();
     closeClients(1000, reason);
-    try {
-      session.close();
-    } catch {}
+    const cleanupResults = await Promise.allSettled([
+      session.close(),
+      pendingTask ?? Promise.resolve(),
+    ]);
+    const cleanupErrors = cleanupResults.flatMap((result, index) =>
+      result.status === "rejected" &&
+      !(index === 1 && result.reason === pendingAbort)
+        ? [result.reason]
+        : [],
+    );
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(cleanupErrors, "scrcpy cleanup failed");
+    }
   };
 
   startFramePump(session, sessionGeneration);
@@ -1013,7 +1097,7 @@ export async function startServer(opts: ServerOpts) {
   attachSessionHandlers(session, sessionGeneration);
 
   let nextId = 1;
-  const server = Bun.serve<WsData>({
+  const createHttpServer = () => Bun.serve<WsData>({
     port: opts.port,
     hostname: host,
     async fetch(req, srv) {
@@ -1215,7 +1299,7 @@ export async function startServer(opts: ServerOpts) {
           if (!/^emulator-\d+$/.test(serial))
             throw new Error(`${serial} is not an emulator`);
           if (serial === currentSerial)
-            stopCurrentSession("current emulator stopped");
+            await stopCurrentSession("current emulator stopped");
           await stopEmulator(serial);
           return Response.json({ ok: true, serial });
         } catch (err) {
@@ -1795,9 +1879,33 @@ export async function startServer(opts: ServerOpts) {
     },
   });
 
-  const stop = () => {
-    if (stopRequested) return;
+  let server: ReturnType<typeof createHttpServer>;
+  try {
+    server = createHttpServer();
+  } catch (err) {
     stopRequested = true;
+    if (watchdog) clearInterval(watchdog);
+    routePlayback.close();
+    try {
+      await session.close();
+    } catch (cleanupError) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      throw new AggregateError(
+        [error, cleanupError],
+        error.message,
+        { cause: error },
+      );
+    }
+    throw err;
+  }
+
+  let stopTask: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopTask) return stopTask;
+    stopRequested = true;
+    const pendingTask = pendingSwitch?.task;
+    const pendingAbort = new Error("server stopping");
+    pendingSwitch?.controller.abort(pendingAbort);
     if (status === "streaming") {
       status = "stopped";
       stoppedAt = new Date().toISOString();
@@ -1806,7 +1914,23 @@ export async function startServer(opts: ServerOpts) {
     if (watchdog) clearInterval(watchdog);
     routePlayback.close();
     server.stop(true);
-    session.close();
+    const activeClose = session.close();
+    stopTask = (async () => {
+      const cleanupResults = await Promise.allSettled([
+        activeClose,
+        pendingTask ?? Promise.resolve(),
+      ]);
+      const cleanupErrors = cleanupResults.flatMap((result, index) =>
+        result.status === "rejected" &&
+        !(index === 1 && result.reason === pendingAbort)
+          ? [result.reason]
+          : [],
+      );
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(cleanupErrors, "scrcpy cleanup failed");
+      }
+    })();
+    return stopTask;
   };
 
   return { server, session, stop };

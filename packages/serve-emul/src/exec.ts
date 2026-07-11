@@ -11,20 +11,48 @@ const MAX_CONCURRENT = 4;
 const DEFAULT_MAX_BUFFER = 8 * 1024 * 1024;
 
 let active = 0;
-const waiters: Array<() => void> = [];
+type Waiter = {
+  resolve: () => void;
+  reject: (reason: unknown) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+};
+const waiters: Waiter[] = [];
 
-function acquire(): Promise<void> {
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("command aborted");
+}
+
+function acquire(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortError(signal));
   if (active < MAX_CONCURRENT) {
     active++;
     return Promise.resolve();
   }
-  return new Promise<void>((resolve) => waiters.push(resolve));
+  return new Promise<void>((resolve, reject) => {
+    const waiter: Waiter = { resolve, reject, signal };
+    if (signal) {
+      waiter.onAbort = () => {
+        const index = waiters.indexOf(waiter);
+        if (index >= 0) waiters.splice(index, 1);
+        reject(abortError(signal));
+      };
+      signal.addEventListener("abort", waiter.onAbort, { once: true });
+    }
+    waiters.push(waiter);
+    if (signal?.aborted) waiter.onAbort?.();
+  });
 }
 
 function release(): void {
   const next = waiters.shift();
   if (next) {
-    next();
+    if (next.signal && next.onAbort) {
+      next.signal.removeEventListener("abort", next.onAbort);
+    }
+    next.resolve();
     return;
   }
   active--;
@@ -33,6 +61,7 @@ function release(): void {
 export type ExecOpts = {
   timeout?: number;
   maxBuffer?: number;
+  signal?: AbortSignal;
 };
 
 export type ExecResult<T extends string | Buffer> = {
@@ -51,14 +80,27 @@ function run<T extends string | Buffer>(
   encoding: "utf8" | "buffer",
 ): Promise<ExecResult<T>> {
   const maxBuffer = opts.maxBuffer ?? DEFAULT_MAX_BUFFER;
-  return new Promise<ExecResult<T>>((resolve) => {
+  return new Promise<ExecResult<T>>((resolve, reject) => {
+    if (opts.signal?.aborted) {
+      reject(abortError(opts.signal));
+      return;
+    }
     const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
     let outLen = 0;
     let settled = false;
     let timedOut = false;
+    let abortReason: Error | null = null;
+    let terminationError: Error | null = null;
+    let reapTimer: ReturnType<typeof setTimeout> | null = null;
 
     const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      if (reapTimer) clearTimeout(reapTimer);
+      opts.signal?.removeEventListener("abort", onAbort);
+    };
 
     const timer = opts.timeout
       ? setTimeout(() => {
@@ -66,13 +108,26 @@ function run<T extends string | Buffer>(
           try {
             child.kill("SIGKILL");
           } catch {}
+          reapTimer = setTimeout(
+            () =>
+              finish(
+                null,
+                "SIGKILL",
+                new Error("command did not exit after timeout"),
+              ),
+            1_000,
+          );
         }, opts.timeout)
       : null;
 
     const finish = (status: number | null, signal: NodeJS.Signals | null, error: Error | null) => {
       if (settled) return;
       settled = true;
-      if (timer) clearTimeout(timer);
+      cleanup();
+      if (abortReason) {
+        reject(abortReason);
+        return;
+      }
       const stdoutBuf = Buffer.concat(outChunks);
       resolve({
         status,
@@ -80,17 +135,42 @@ function run<T extends string | Buffer>(
         stdout: (encoding === "buffer" ? stdoutBuf : stdoutBuf.toString("utf8")) as T,
         stderr: Buffer.concat(errChunks).toString("utf8"),
         timedOut,
-        error,
+        error: error ?? terminationError,
       });
     };
+    const onAbort = () => {
+      if (settled || abortReason) return;
+      abortReason = abortError(opts.signal!);
+      if (timer) clearTimeout(timer);
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      // Hold the executor slot until the process is reaped. The bounded
+      // fallback prevents a broken child implementation from hanging cleanup.
+      reapTimer = setTimeout(
+        () => finish(null, "SIGKILL", abortReason),
+        1_000,
+      );
+    };
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    if (opts.signal?.aborted) {
+      onAbort();
+      return;
+    }
 
     child.stdout.on("data", (d: Buffer) => {
+      if (terminationError) return;
       outLen += d.length;
       if (outLen > maxBuffer) {
+        terminationError = new Error("maxBuffer exceeded");
+        if (timer) clearTimeout(timer);
         try {
           child.kill("SIGKILL");
         } catch {}
-        finish(null, null, new Error("maxBuffer exceeded"));
+        reapTimer = setTimeout(
+          () => finish(null, "SIGKILL", terminationError),
+          1_000,
+        );
         return;
       }
       outChunks.push(d);
@@ -107,7 +187,7 @@ async function execGated<T extends string | Buffer>(
   opts: ExecOpts,
   encoding: "utf8" | "buffer",
 ): Promise<ExecResult<T>> {
-  await acquire();
+  await acquire(opts.signal);
   try {
     return await run<T>(cmd, args, opts, encoding);
   } finally {
