@@ -1,44 +1,28 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
-import type { StreamStats } from "./stream-worker";
+import { startPoller } from "./poller";
+import {
+  INITIAL_STREAM_STATE,
+  applyStreamHealth,
+  applyWorkerEvent,
+  parseStreamHealth,
+  parseStreamWorkerEvent,
+} from "./stream-state";
 
-export type DeviceSize = { width: number; height: number };
-
-export type { StreamStats };
-
-export type StreamState = {
-  status: string;
-  fps: number;
-  deviceSize: DeviceSize | null;
-  stats: StreamStats | null;
-};
+export type {
+  DeviceSize,
+  StreamState,
+  StreamStats,
+} from "./stream-state";
 
 export type Sender = (msg: Record<string, unknown>, ack?: boolean) => void;
-
-type ApiInfo = {
-  size: DeviceSize;
-  status?: "streaming" | "stopped" | "error";
-  lastFrameAt?: string | null;
-  lastError?: string | null;
-};
-
-type WorkerEvent =
-  | { type: "status"; status: string }
-  | { type: "session"; size: DeviceSize }
-  | { type: "rendered" }
-  | { type: "stats"; stats: StreamStats };
 
 // A canvas can transfer control to an OffscreenCanvas only once, so the worker
 // that received it must be reused if the effect re-runs for the same element.
 const workerByCanvas = new WeakMap<HTMLCanvasElement, Worker>();
 
 export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
-  const [state, setState] = useState<StreamState>({
-    status: "connecting…",
-    fps: 0,
-    deviceSize: null,
-    stats: null,
-  });
+  const [state, setState] = useState(INITIAL_STREAM_STATE);
   const workerRef = useRef<Worker | null>(null);
 
   const send = useCallback<Sender>((msg, ack = true) => {
@@ -58,7 +42,6 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
 
     let cancelled = false;
     let hasRenderedFrame = false;
-    let healthTimer: ReturnType<typeof setInterval> | null = null;
 
     const setStatus = (status: string) =>
       setState((prev) => (prev.status === status ? prev : { ...prev, status }));
@@ -79,61 +62,37 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
 
     const onMessage = (e: MessageEvent) => {
       if (cancelled) return;
-      const msg = e.data as WorkerEvent;
-      if (msg.type === "status") {
-        setStatus(msg.status);
-      } else if (msg.type === "session") {
-        setState((s) => ({ ...s, deviceSize: msg.size }));
-      } else if (msg.type === "rendered") {
+      const msg = parseStreamWorkerEvent(e.data);
+      if (!msg) return;
+      if (msg.type === "rendered") {
         hasRenderedFrame = true;
       } else if (msg.type === "stats") {
         if (msg.stats.rendered) hasRenderedFrame = true;
-        setState((s) => ({ ...s, fps: msg.stats.fps, stats: msg.stats }));
       }
+      setState((current) => applyWorkerEvent(current, msg));
     };
     worker.addEventListener("message", onMessage);
 
-    const applyServerStatus = (d: ApiInfo) => {
-      const lastFrameAgeMs = d.lastFrameAt ? Date.now() - Date.parse(d.lastFrameAt) : Infinity;
-      setState((s) => ({
-        ...s,
-        deviceSize: d.size,
-        status:
-          d.status && d.status !== "streaming"
-            ? d.lastError || d.status
-            : !hasRenderedFrame && lastFrameAgeMs > 5000
-              ? "waiting for video"
-              : s.status === "stream stalled" ||
-                  s.status === "metadata unavailable" ||
-                  s.status === "waiting for video"
-                ? "streaming"
-              : s.status,
-      }));
-    };
-
-    fetch("/health")
-      .then((r) => r.json() as Promise<ApiInfo>)
-      .then((d) => {
-        if (!cancelled) applyServerStatus(d);
-      })
-      .catch(() => {
-        if (!cancelled) setStatus("metadata unavailable");
-      });
-
-    healthTimer = setInterval(() => {
-      fetch("/health")
-        .then((r) => r.json() as Promise<ApiInfo>)
-        .then((d) => {
-          if (!cancelled) applyServerStatus(d);
-        })
-        .catch(() => {
-          if (!cancelled) setStatus("metadata unavailable");
-        });
-    }, 1500);
+    const stopHealthPoller = startPoller({
+      intervalMs: 1_500,
+      request: async (signal) => {
+        const response = await fetch("/health", { signal });
+        return parseStreamHealth(await response.json());
+      },
+      onValue: (health) => {
+        setState((current) =>
+          applyStreamHealth(current, health, {
+            nowMs: Date.now(),
+            hasRenderedFrame,
+          })
+        );
+      },
+      onError: () => setStatus("metadata unavailable"),
+    });
 
     return () => {
       cancelled = true;
-      if (healthTimer) clearInterval(healthTimer);
+      stopHealthPoller();
       worker.removeEventListener("message", onMessage);
       worker.postMessage({ type: "stop" });
       workerRef.current = null;

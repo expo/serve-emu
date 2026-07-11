@@ -37,6 +37,15 @@ export type RoutePlaybackSnapshot = {
 type RoutePlaybackOpts = {
   applyLocation: (fix: GeoFix) => void | Promise<void>;
   onLocation: (fix: GeoFix & { appliedAt: string }) => void;
+  runtime?: RoutePlaybackRuntime;
+};
+
+export type RoutePlaybackTimer = object | number;
+
+export type RoutePlaybackRuntime = {
+  now: () => number;
+  setInterval: (callback: () => void, ms: number) => RoutePlaybackTimer;
+  clearInterval: (timer: RoutePlaybackTimer) => void;
 };
 
 type PreparedRoute = {
@@ -51,6 +60,13 @@ const DEFAULT_INTERVAL_MS = 1000;
 const MAX_WAYPOINTS = 10_000;
 const MIN_INTERVAL_MS = 250;
 const MAX_INTERVAL_MS = 60_000;
+
+const SYSTEM_RUNTIME: RoutePlaybackRuntime = {
+  now: () => Date.now(),
+  setInterval: (callback, ms) => globalThis.setInterval(callback, ms),
+  clearInterval: (timer) =>
+    globalThis.clearInterval(timer as ReturnType<typeof setInterval>),
+};
 
 function finiteNumber(value: unknown, name: string): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -203,8 +219,11 @@ export function parseRoutePlaybackRequest(value: unknown): RoutePlaybackRequest 
 export class RoutePlayback {
   #applyLocation: RoutePlaybackOpts["applyLocation"];
   #onLocation: RoutePlaybackOpts["onLocation"];
+  #runtime: RoutePlaybackRuntime;
   #route: PreparedRoute | null = null;
-  #timer: ReturnType<typeof setInterval> | null = null;
+  #timer: RoutePlaybackTimer | null = null;
+  #runGeneration = 0;
+  #timerGeneration = 0;
   #status: RoutePlaybackStatus = "idle";
   #speedKph = DEFAULT_SPEED_KPH;
   #multiplier = 1;
@@ -219,31 +238,36 @@ export class RoutePlayback {
   #lastError: string | null = null;
   #currentLocation: (GeoFix & { appliedAt: string }) | null = null;
   #applying = false;
-  #applyId = 0;
 
   constructor(opts: RoutePlaybackOpts) {
     this.#applyLocation = opts.applyLocation;
     this.#onLocation = opts.onLocation;
+    this.#runtime = opts.runtime ?? SYSTEM_RUNTIME;
   }
 
   async start(request: RoutePlaybackRequest): Promise<RoutePlaybackSnapshot> {
     this.stop();
+    const generation = this.#runGeneration;
     this.#route = prepareRoute(request.waypoints);
     this.#speedKph = request.speedKph ?? DEFAULT_SPEED_KPH;
     this.#multiplier = request.multiplier ?? 1;
     this.#intervalMs = request.intervalMs ?? DEFAULT_INTERVAL_MS;
     this.#loop = request.loop ?? false;
     this.#progressMeters = 0;
-    this.#lastTickMs = Date.now();
+    this.#lastTickMs = this.#runtime.now();
     this.#status = "running";
     this.#startedAt = new Date(this.#lastTickMs).toISOString();
     this.#updatedAt = this.#startedAt;
     this.#pausedAt = null;
     this.#completedAt = null;
     this.#lastError = null;
-    await this.#applyCurrentLocation();
-    if (this.#status === "running") {
-      this.#timer = setInterval(() => this.#tick(), this.#intervalMs);
+    await this.#applyCurrentLocation(generation);
+    if (
+      generation === this.#runGeneration &&
+      this.#status === "running" &&
+      this.#timer === null
+    ) {
+      this.#startTimer(generation);
     }
     return this.snapshot();
   }
@@ -251,7 +275,7 @@ export class RoutePlayback {
   pause(): RoutePlaybackSnapshot {
     if (this.#status === "running") {
       this.#status = "paused";
-      this.#pausedAt = new Date().toISOString();
+      this.#pausedAt = new Date(this.#runtime.now()).toISOString();
       this.#clearTimer();
     }
     return this.snapshot();
@@ -261,15 +285,15 @@ export class RoutePlayback {
     if (this.#status === "paused" && this.#route) {
       this.#status = "running";
       this.#pausedAt = null;
-      this.#lastTickMs = Date.now();
-      this.#timer = setInterval(() => this.#tick(), this.#intervalMs);
+      this.#lastTickMs = this.#runtime.now();
+      this.#startTimer(this.#runGeneration);
     }
     return this.snapshot();
   }
 
   stop(): RoutePlaybackSnapshot {
+    this.#runGeneration++;
     this.#clearTimer();
-    this.#applyId++;
     this.#applying = false;
     this.#route = null;
     this.#status = "idle";
@@ -302,16 +326,32 @@ export class RoutePlayback {
   }
 
   close(): void {
+    this.stop();
+  }
+
+  #startTimer(generation: number): void {
     this.#clearTimer();
+    const timerGeneration = this.#timerGeneration;
+    this.#timer = this.#runtime.setInterval(
+      () => this.#tick(generation, timerGeneration),
+      this.#intervalMs,
+    );
   }
 
-  #tick(): void {
-    void this.#tickNow();
+  #tick(generation: number, timerGeneration: number): void {
+    if (
+      generation !== this.#runGeneration ||
+      timerGeneration !== this.#timerGeneration
+    ) {
+      return;
+    }
+    void this.#tickNow(generation);
   }
 
-  async #tickNow(): Promise<void> {
+  async #tickNow(generation: number): Promise<void> {
+    if (generation !== this.#runGeneration) return;
     if (!this.#route || this.#status !== "running" || this.#applying) return;
-    const now = Date.now();
+    const now = this.#runtime.now();
     const elapsedSeconds = Math.max(0, (now - this.#lastTickMs) / 1000);
     this.#lastTickMs = now;
     this.#progressMeters += (this.#speedKph * 1000 * elapsedSeconds * this.#multiplier) / 3600;
@@ -326,34 +366,45 @@ export class RoutePlayback {
         this.#clearTimer();
       }
     }
-    await this.#applyCurrentLocation();
+    await this.#applyCurrentLocation(generation);
   }
 
-  async #applyCurrentLocation(): Promise<void> {
+  async #applyCurrentLocation(generation: number): Promise<void> {
     const route = this.#route;
-    if (!route) return;
-    const applyId = ++this.#applyId;
+    if (!route || generation !== this.#runGeneration) return;
     this.#applying = true;
     try {
       const fix = locationAt(route, this.#progressMeters);
       await this.#applyLocation(fix);
-      if (this.#route !== route || this.#applyId !== applyId) return;
-      this.#currentLocation = { ...fix, appliedAt: new Date().toISOString() };
+      if (
+        this.#route !== route ||
+        generation !== this.#runGeneration
+      ) {
+        return;
+      }
+      this.#currentLocation = {
+        ...fix,
+        appliedAt: new Date(this.#runtime.now()).toISOString(),
+      };
       this.#updatedAt = this.#currentLocation.appliedAt;
       this.#onLocation(this.#currentLocation);
     } catch (err) {
-      if (this.#route === route && this.#applyId === applyId) {
+      if (
+        this.#route === route &&
+        generation === this.#runGeneration
+      ) {
         this.#status = "error";
         this.#lastError = err instanceof Error ? err.message : String(err);
         this.#clearTimer();
       }
     } finally {
-      if (this.#applyId === applyId) this.#applying = false;
+      if (generation === this.#runGeneration) this.#applying = false;
     }
   }
 
   #clearTimer(): void {
-    if (this.#timer) clearInterval(this.#timer);
+    this.#timerGeneration++;
+    if (this.#timer !== null) this.#runtime.clearInterval(this.#timer);
     this.#timer = null;
   }
 }

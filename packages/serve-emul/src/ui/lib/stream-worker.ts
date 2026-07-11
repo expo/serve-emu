@@ -1,5 +1,6 @@
 import { buildCodecString, scanAU } from "./h264";
 import { epochNowMs, parseFramePacket } from "../../shared/frame-meta";
+import type { StreamStats } from "./stream-state";
 
 // The worker owns the whole WebSocket → decode → present pipeline so that
 // main-thread work (React renders, health polling, panels) can never stall
@@ -16,14 +17,7 @@ const FRAME_QUEUE_SIZE = 3;
 const PENDING_TIMING_LIMIT = 256;
 const STATS_INTERVAL_MS = 1000;
 
-export type StreamStats = {
-  fps: number;
-  decodeQueue: number;
-  transitMs: number | null;
-  e2eMs: number | null;
-  codec: string | null;
-  rendered: boolean;
-};
+export type { StreamStats } from "./stream-state";
 
 type WorkerCommand =
   | { type: "init"; canvas: OffscreenCanvas; url: string }

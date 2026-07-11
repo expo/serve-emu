@@ -33,22 +33,49 @@ type ReplayHandlers = {
   setLocation: (fix: GeoFix) => Promise<void> | void;
 };
 
+export type SessionRecorderRuntime = {
+  now: () => number;
+  sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+};
+
 const MAX_EVENTS = 2_000;
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const SYSTEM_RUNTIME: SessionRecorderRuntime = {
+  now: () => Date.now(),
+  sleep: (ms, signal) =>
+    new Promise<void>((resolve) => {
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(done, ms);
+      const onAbort = () => {
+        clearTimeout(timer);
+        done();
+      };
+      function done() {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }),
+};
 
 export class SessionRecorder {
+  #runtime: SessionRecorderRuntime;
   #events: RecordedEvent[] = [];
   #nextId = 1;
-  #lastEventMs = 0;
+  #lastEventMs: number | null = null;
   #recording = true;
   #replaying = false;
-  #stopReplay = false;
+  #replayController: AbortController | null = null;
   #replayStartedAt: string | null = null;
   #replayCompletedAt: string | null = null;
   #lastError: string | null = null;
+
+  constructor(runtime: SessionRecorderRuntime = SYSTEM_RUNTIME) {
+    this.#runtime = runtime;
+  }
 
   get isReplaying(): boolean {
     return this.#replaying;
@@ -64,14 +91,14 @@ export class SessionRecorder {
 
   clear(): SessionSnapshot {
     this.#events = [];
-    this.#lastEventMs = 0;
+    this.#lastEventMs = null;
     this.#lastError = null;
     this.#replayCompletedAt = null;
     return this.snapshot();
   }
 
   stopReplay(): SessionSnapshot {
-    this.#stopReplay = true;
+    this.#replayController?.abort();
     return this.snapshot();
   }
 
@@ -94,29 +121,45 @@ export class SessionRecorder {
     }
 
     const events = [...this.#events];
+    const controller = new AbortController();
+    const { signal } = controller;
     this.#replaying = true;
-    this.#stopReplay = false;
-    this.#replayStartedAt = new Date().toISOString();
+    this.#replayController = controller;
+    this.#replayStartedAt = new Date(this.#runtime.now()).toISOString();
     this.#replayCompletedAt = null;
     this.#lastError = null;
 
     try {
       for (const event of events) {
-        if (this.#stopReplay) break;
-        await sleep(Math.max(0, event.delayMs / multiplier));
+        if (signal.aborted) break;
+        try {
+          await this.#runtime.sleep(
+            Math.max(0, event.delayMs / multiplier),
+            signal,
+          );
+        } catch (err) {
+          if (signal.aborted) break;
+          throw err;
+        }
+        // stopReplay() may fire while the delay is pending. Check again before
+        // dispatch so cancellation can never leak the next event to a newly
+        // selected device/session.
+        if (signal.aborted) break;
         if (event.kind === "gesture") {
           await handlers.dispatchGesture(event.gesture);
         } else {
           await handlers.setLocation(event.location);
         }
       }
-      this.#replayCompletedAt = new Date().toISOString();
+      this.#replayCompletedAt = new Date(this.#runtime.now()).toISOString();
     } catch (err) {
       this.#lastError = err instanceof Error ? err.message : String(err);
       throw err;
     } finally {
-      this.#replaying = false;
-      this.#stopReplay = false;
+      if (this.#replayController === controller) {
+        this.#replaying = false;
+        this.#replayController = null;
+      }
     }
 
     return this.snapshot();
@@ -128,8 +171,9 @@ export class SessionRecorder {
       | { kind: "location"; location: GeoFix; source: string },
   ): void {
     if (!this.#recording || this.#replaying) return;
-    const now = Date.now();
-    const delayMs = this.#lastEventMs ? Math.max(0, now - this.#lastEventMs) : 0;
+    const now = this.#runtime.now();
+    const delayMs =
+      this.#lastEventMs === null ? 0 : Math.max(0, now - this.#lastEventMs);
     this.#lastEventMs = now;
     const base = {
       id: this.#nextId++,

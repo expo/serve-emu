@@ -1,6 +1,6 @@
 import type { Socket } from "node:net";
 
-// scrcpy v3 ControlMessage type codes
+// scrcpy 4.0 ControlMessage type codes (wire-compatible with v3 here).
 const TYPE_INJECT_KEYCODE = 0;
 const TYPE_INJECT_TEXT = 1;
 const TYPE_INJECT_TOUCH = 2;
@@ -213,22 +213,29 @@ function backOrScreenOnPacket(action: number): Buffer {
   return buf;
 }
 
-function sleep(ms: number) {
+function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+export type DispatchSleep = (ms: number) => Promise<void>;
 
 function actionCode(a: "down" | "move" | "up"): number {
   return a === "down" ? ACTION_DOWN : a === "up" ? ACTION_UP : ACTION_MOVE;
 }
 
-export async function dispatch(control: Socket, g: Gesture, screen: Screen): Promise<void> {
+export async function dispatch(
+  control: Socket,
+  g: Gesture,
+  screen: Screen,
+  sleepFor: DispatchSleep = sleep,
+): Promise<void> {
   const px = (n: number) => n * screen.width;
   const py = (n: number) => n * screen.height;
 
   switch (g.type) {
     case "tap": {
       control.write(touchPacket(ACTION_DOWN, px(g.x), py(g.y), screen));
-      await sleep(20);
+      await sleepFor(20);
       control.write(touchPacket(ACTION_UP, px(g.x), py(g.y), screen));
       return;
     }
@@ -240,10 +247,10 @@ export async function dispatch(control: Socket, g: Gesture, screen: Screen): Pro
         const t = i / steps;
         const x = px(g.x1 + (g.x2 - g.x1) * t);
         const y = py(g.y1 + (g.y2 - g.y1) * t);
-        await sleep(dur / steps);
+        await sleepFor(dur / steps);
         control.write(touchPacket(ACTION_MOVE, x, y, screen));
       }
-      await sleep(dur / steps);
+      await sleepFor(dur / steps);
       control.write(touchPacket(ACTION_UP, px(g.x2), py(g.y2), screen));
       return;
     }
