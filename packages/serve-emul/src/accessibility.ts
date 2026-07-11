@@ -196,8 +196,13 @@ async function dumpXml(serial: string): Promise<string> {
     const dump = await execText("adb", ["-s", serial, "shell", "uiautomator", "dump", path], {
       timeout: 8_000,
     });
-    if (dump.status !== 0) {
-      lastError = (dump.stderr || dump.stdout || `uiautomator dump failed with status ${dump.status}`).trim();
+    if (dump.status !== 0 || dump.error) {
+      lastError = (
+        dump.stderr ||
+        dump.error?.message ||
+        dump.stdout ||
+        `uiautomator dump failed with status ${dump.status}`
+      ).trim();
       await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
       continue;
     }
@@ -206,8 +211,13 @@ async function dumpXml(serial: string): Promise<string> {
       timeout: 8_000,
     });
     void execText("adb", ["-s", serial, "shell", "rm", path], { timeout: 2_000 });
-    if (result.status === 0) return result.stdout;
-    lastError = (result.stderr || result.stdout || "uiautomator dump read failed").trim();
+    if (result.status === 0 && !result.error) return result.stdout;
+    lastError = (
+      result.stderr ||
+      result.error?.message ||
+      result.stdout ||
+      "uiautomator dump read failed"
+    ).trim();
     await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
   }
   void execText("adb", ["-s", serial, "shell", "rm", path], { timeout: 2_000 });

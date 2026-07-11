@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execText } from "./exec.ts";
+import { execText, type ExecLane } from "./exec.ts";
 
 export type AppActionResult = {
   ok: true;
@@ -21,17 +21,33 @@ function output(stdout: string, stderr: string): string {
   return `${stdout}${stderr}`.trim();
 }
 
-async function adb(serial: string, args: string[], timeout = 30_000): Promise<AppActionResult> {
-  const result = await execText("adb", ["-s", serial, ...args], { timeout });
+async function adb(
+  serial: string,
+  args: string[],
+  timeout = 30_000,
+  lane: ExecLane = "default",
+): Promise<AppActionResult> {
+  const result = await execText("adb", ["-s", serial, ...args], {
+    timeout,
+    lane,
+  });
   const text = output(result.stdout, result.stderr);
-  if (result.status !== 0) {
-    throw new Error(text || `adb ${args.join(" ")} failed`);
+  if (result.status !== 0 || result.error) {
+    throw new Error(
+      result.error?.message || text || `adb ${args.join(" ")} failed`,
+      { cause: result.error ?? undefined },
+    );
   }
   return { ok: true, output: text };
 }
 
-function adbHost(serial: string, args: string[], timeout = 30_000): Promise<AppActionResult> {
-  return adb(serial, args, timeout);
+function adbHost(
+  serial: string,
+  args: string[],
+  timeout = 30_000,
+  lane: ExecLane = "default",
+): Promise<AppActionResult> {
+  return adb(serial, args, timeout, lane);
 }
 
 function validate(value: unknown, name: string, pattern: RegExp): string {
@@ -59,7 +75,12 @@ export async function installApk(serial: string, file: File): Promise<AppActionR
   const path = join(dir, "upload.apk");
   try {
     writeFileSync(path, new Uint8Array(await file.arrayBuffer()));
-    return await adb(serial, ["install", "-r", path], 120_000);
+    return await adb(
+      serial,
+      ["install", "-r", path],
+      120_000,
+      "background",
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -88,17 +109,32 @@ export async function importMediaFile(serial: string, file: File): Promise<FileI
   const remotePath = `${remoteDir}/${safeFileName(file.name)}`;
   try {
     writeFileSync(localPath, new Uint8Array(await file.arrayBuffer()));
-    await adb(serial, ["shell", "mkdir", "-p", remoteDir]);
-    await adbHost(serial, ["push", localPath, remotePath], 120_000);
-    await adb(serial, [
-      "shell",
-      "am",
-      "broadcast",
-      "-a",
-      "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
-      "-d",
-      `file://${remotePath}`,
-    ]);
+    await adb(
+      serial,
+      ["shell", "mkdir", "-p", remoteDir],
+      30_000,
+      "background",
+    );
+    await adbHost(
+      serial,
+      ["push", localPath, remotePath],
+      120_000,
+      "background",
+    );
+    await adb(
+      serial,
+      [
+        "shell",
+        "am",
+        "broadcast",
+        "-a",
+        "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+        "-d",
+        `file://${remotePath}`,
+      ],
+      30_000,
+      "background",
+    );
     return { ok: true, output: `Imported ${file.name} to ${remotePath}`, path: remotePath, kind };
   } finally {
     rmSync(dir, { recursive: true, force: true });

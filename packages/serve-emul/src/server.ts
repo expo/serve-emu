@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
 import type { ServerWebSocket } from "bun";
-import { execText } from "./exec.ts";
+import { execText, getExecSnapshot } from "./exec.ts";
 import {
   getFontScale,
   getNetworkStatus,
@@ -34,6 +34,7 @@ import {
 } from "./app-management.ts";
 import { getForegroundApp } from "./app-info.ts";
 import { FrameStatWindow } from "./frame-stat-window.ts";
+import { loadDeviceGrid } from "./device-grid.ts";
 import {
   isAbnormalExit,
   procExitDetail,
@@ -52,7 +53,6 @@ import {
   ScrcpyStreamError,
 } from "./scrcpy.ts";
 import {
-  listAvds,
   listRunningAvds,
   startEmulator,
   stopEmulator,
@@ -116,28 +116,6 @@ function parseCookies(header: string | null): Record<string, string> {
   }
   return out;
 }
-
-type GridDeviceKind = "physical" | "emulator" | "avd";
-
-type GridDevice = {
-  id: string;
-  kind: GridDeviceKind;
-  serial: string | null;
-  avd: string | null;
-  name: string;
-  state: string;
-  current: boolean;
-  canSelect: boolean;
-  canStart: boolean;
-  canStop: boolean;
-};
-
-type DeviceGridResponse = {
-  ok: true;
-  currentSerial: string;
-  sessionStatus: SessionStatus;
-  devices: GridDevice[];
-};
 
 type WsData = { id: number; frameMeta: boolean; handle?: Client };
 
@@ -284,6 +262,7 @@ export async function startServer(opts: ServerOpts) {
     location: lastLocation,
     route: routePlayback.snapshot(),
     session: sessionRecorder.snapshot(),
+    executor: getExecSnapshot(),
     clientsDetail: Array.from(clients, (client) => ({
       id: client.id,
       frameMeta: client.frameMeta,
@@ -308,58 +287,6 @@ export async function startServer(opts: ServerOpts) {
       } catch {}
     }
     clients.clear();
-  };
-
-  const deviceGrid = async (): Promise<DeviceGridResponse> => {
-    const [adbDevices, runningAvds, avds] = await Promise.all([
-      listAllDevices(),
-      listRunningAvds(),
-      listAvds(),
-    ]);
-    const runningBySerial = new Map(
-      runningAvds.map((running) => [running.serial, running]),
-    );
-    const runningByAvd = new Map(
-      runningAvds.map((running) => [running.avd, running]),
-    );
-    const rows: GridDevice[] = adbDevices.map((device) => {
-      const running = runningBySerial.get(device.serial);
-      const isEmulator = /^emulator-\d+$/.test(device.serial);
-      return {
-        id: device.serial,
-        kind: isEmulator ? "emulator" : "physical",
-        serial: device.serial,
-        avd: running?.avd ?? null,
-        name: running?.avd ?? device.serial,
-        state: device.state,
-        current: device.serial === currentSerial,
-        canSelect: device.state === "device",
-        canStart: false,
-        canStop: isEmulator,
-      };
-    });
-
-    const knownAvdSerials = new Set(
-      runningAvds.map((running) => running.serial),
-    );
-    for (const avd of avds) {
-      const running = runningByAvd.get(avd);
-      if (running && knownAvdSerials.has(running.serial)) continue;
-      rows.push({
-        id: `avd:${avd}`,
-        kind: "avd",
-        serial: running?.serial ?? null,
-        avd,
-        name: avd,
-        state: running?.state ?? "stopped",
-        current: running?.serial === currentSerial,
-        canSelect: running?.state === "device",
-        canStart: !running,
-        canStop: Boolean(running),
-      });
-    }
-
-    return { ok: true, currentSerial, sessionStatus: status, devices: rows };
   };
 
   const markTerminal = (
@@ -1113,7 +1040,7 @@ export async function startServer(opts: ServerOpts) {
         if (req.method !== "GET")
           return new Response("method not allowed", { status: 405 });
         try {
-          return Response.json(await deviceGrid());
+          return Response.json(await loadDeviceGrid(currentSerial, status));
         } catch (err) {
           return Response.json(
             {
