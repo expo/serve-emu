@@ -89,38 +89,62 @@ export function setEmulatorLocation(serial: string, fix: GeoFix): void {
   assertGeoFixOutput(r.status, output);
 }
 
-export function setEmulatorLocationAsync(serial: string, fix: GeoFix): Promise<void> {
+export function setEmulatorLocationAsync(
+  serial: string,
+  fix: GeoFix,
+  signal?: AbortSignal,
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn("adb", geoFixArgs(serial, fix), {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    let child: ReturnType<typeof spawn> | null = null;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
     let output = "";
     let settled = false;
-    const timeout = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {}
-      reject(new Error("adb emu geo fix timed out"));
-    }, 5_000);
     const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeout);
+      if (timeout) clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
       fn();
     };
+    const abort = () =>
+      finish(() => {
+        try {
+          child?.kill("SIGKILL");
+        } catch {}
+        reject(
+          signal?.reason instanceof Error
+            ? signal.reason
+            : new Error("location operation aborted"),
+        );
+      });
 
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+
+    const spawned = spawn("adb", geoFixArgs(serial, fix), {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child = spawned;
+    timeout = setTimeout(() => {
+      finish(() => {
+        try {
+          child?.kill("SIGKILL");
+        } catch {}
+        reject(new Error("adb emu geo fix timed out"));
+      });
+    }, 5_000);
+    spawned.stdout.setEncoding("utf8");
+    spawned.stderr.setEncoding("utf8");
+    spawned.stdout.on("data", (chunk: string) => {
       output += chunk;
     });
-    child.stderr.on("data", (chunk: string) => {
+    spawned.stderr.on("data", (chunk: string) => {
       output += chunk;
     });
-    child.once("error", (err) => finish(() => reject(err)));
-    child.once("exit", (status) =>
+    spawned.once("error", (err) => finish(() => reject(err)));
+    spawned.once("exit", (status) =>
       finish(() => {
         const text = output.trim();
         try {
@@ -131,5 +155,7 @@ export function setEmulatorLocationAsync(serial: string, fix: GeoFix): Promise<v
         }
       }),
     );
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
   });
 }
