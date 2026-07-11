@@ -1,16 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  AccessibilityNode,
+  AccessibilitySelector,
+} from "../../shared/api-contracts";
+import { apiRequest } from "../lib/api-client";
 
-export type AccessibilityNode = {
-  id: string;
-  text: string;
-  contentDescription: string;
-  resourceId: string;
-  className: string;
-  packageName: string;
-  clickable: boolean;
-  enabled: boolean;
-  bounds: { left: number; top: number; right: number; bottom: number };
-};
+export type { AccessibilityNode } from "../../shared/api-contracts";
 
 type Props = {
   enabled: boolean;
@@ -20,13 +15,6 @@ type Props = {
   onNodesChange: (nodes: AccessibilityNode[]) => void;
   onHighlight: (id: string | null) => void;
 };
-
-type AccessibilitySelector = Partial<
-  Pick<
-    AccessibilityNode,
-    "id" | "text" | "contentDescription" | "resourceId" | "className" | "packageName" | "clickable" | "enabled"
-  >
-> & { index?: number };
 
 function nodeLabel(node: AccessibilityNode): string {
   return node.text || node.contentDescription || node.resourceId || node.className || "Unlabeled";
@@ -90,12 +78,7 @@ export function AccessibilityPanel({
     refreshInFlightRef.current = true;
     setStatus("Reading...");
     try {
-      const res = await fetch("/api/accessibility", { cache: "no-store" });
-      const json = await res.json() as { ok?: boolean; nodes?: AccessibilityNode[]; error?: string };
-      if (!json.ok || !json.nodes) {
-        setStatus(json.error || "AX unavailable");
-        return;
-      }
+      const json = await apiRequest("/api/accessibility", { method: "GET", cache: "no-store" });
       onNodesChange(json.nodes);
       setStatus(`${json.nodes.length} nodes`);
     } catch (err) {
@@ -120,16 +103,10 @@ export function AccessibilityPanel({
   const tapNode = async (node: AccessibilityNode) => {
     setStatus("Tapping...");
     try {
-      const res = await fetch("/api/accessibility/tap", {
+      await apiRequest("/api/accessibility/tap", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ selector: selectorForNode(node, nodes) }),
+        body: { selector: selectorForNode(node, nodes) },
       });
-      const json = await res.json() as { ok?: boolean; error?: string };
-      if (!res.ok || !json.ok) {
-        setStatus(json.error || "Tap failed");
-        return;
-      }
       setStatus("Tapped");
     } catch (err) {
       setStatus(err instanceof Error ? err.message : String(err));

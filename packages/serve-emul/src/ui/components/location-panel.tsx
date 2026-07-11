@@ -1,20 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent } from "react";
+import type {
+  LocationPoint,
+  RoutePlaybackSnapshot,
+} from "../../shared/api-contracts";
+import { apiRequest } from "../lib/api-client";
 
 type Point = { x: number; y: number };
-type LocationPoint = { latitude: number; longitude: number; altitude?: number };
 type Tile = { key: string; x: number; y: number; left: number; top: number; wrappedX: number };
-type RouteSnapshot = {
-  status: "idle" | "running" | "paused" | "completed" | "error";
-  waypointCount: number;
-  totalMeters: number;
-  progressMeters: number;
-  speedKph: number;
-  multiplier: number;
-  loop: boolean;
-  lastError: string | null;
-  currentLocation: (LocationPoint & { appliedAt: string }) | null;
-};
 
 const TILE_SIZE = 256;
 const MIN_ZOOM = 2;
@@ -184,7 +177,7 @@ export function LocationPanel() {
   const [lngText, setLngText] = useState(formatCoord(DEFAULT_LOCATION.longitude));
   const [status, setStatus] = useState("Ready");
   const [routePoints, setRoutePoints] = useState<LocationPoint[]>([]);
-  const [routeStatus, setRouteStatus] = useState<RouteSnapshot | null>(null);
+  const [routeStatus, setRouteStatus] = useState<RoutePlaybackSnapshot | null>(null);
   const [speedKph, setSpeedKph] = useState("30");
   const [multiplier, setMultiplier] = useState("1");
   const [loop, setLoop] = useState(false);
@@ -217,19 +210,20 @@ export function LocationPanel() {
   }, []);
 
   useEffect(() => {
-    fetch("/api/location")
-      .then((r) => r.json())
-      .then((data: { location?: LocationPoint | null }) => {
+    const controller = new AbortController();
+    apiRequest("/api/location", { method: "GET", signal: controller.signal })
+      .then((data) => {
         if (data.location) syncDraft(data.location, true);
       })
       .catch(() => {});
+    return () => controller.abort();
   }, [syncDraft]);
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
     const syncRoute = () => {
-      fetch("/api/route")
-        .then((r) => r.json() as Promise<RouteSnapshot>)
+      apiRequest("/api/route", { method: "GET", signal: controller.signal })
         .then((route) => {
           if (cancelled) return;
           setRouteStatus(route);
@@ -242,6 +236,7 @@ export function LocationPanel() {
     const timer = setInterval(syncRoute, 1000);
     return () => {
       cancelled = true;
+      controller.abort();
       clearInterval(timer);
     };
   }, [syncDraft]);
@@ -306,16 +301,13 @@ export function LocationPanel() {
   const applyLocation = async (location = draft) => {
     setStatus("Setting...");
     try {
-      const res = await fetch("/api/location", {
+      await apiRequest("/api/location", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        body: {
           latitude: location.latitude,
           longitude: location.longitude,
-        }),
+        },
       });
-      const data = (await res.json()) as { ok?: boolean; error?: string };
-      if (!res.ok || !data.ok) throw new Error(data.error || "location update failed");
       setStatus(`Applied ${formatCoord(location.latitude)}, ${formatCoord(location.longitude)}`);
     } catch (err) {
       setStatus(err instanceof Error ? err.message : String(err));
@@ -370,19 +362,16 @@ export function LocationPanel() {
     }
     setStatus("Starting route...");
     try {
-      const res = await fetch("/api/route", {
+      const data = await apiRequest("/api/route", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        body: {
           waypoints: routePoints,
           speedKph: speed,
           multiplier: rate,
           intervalMs: 1000,
           loop,
-        }),
+        },
       });
-      const data = (await res.json()) as { ok?: boolean; error?: string; route?: RouteSnapshot };
-      if (!res.ok || !data.ok || !data.route) throw new Error(data.error || "route start failed");
       setRouteStatus(data.route);
       setStatus("Route running");
     } catch (err) {
@@ -392,13 +381,10 @@ export function LocationPanel() {
 
   const controlRoute = async (action: "pause" | "resume" | "stop") => {
     try {
-      const res = await fetch("/api/route/control", {
+      const data = await apiRequest("/api/route/control", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action }),
+        body: { action },
       });
-      const data = (await res.json()) as { ok?: boolean; error?: string; route?: RouteSnapshot };
-      if (!res.ok || !data.ok || !data.route) throw new Error(data.error || "route control failed");
       setRouteStatus(data.route);
       setStatus(action === "stop" ? "Route stopped" : `Route ${data.route.status}`);
     } catch (err) {

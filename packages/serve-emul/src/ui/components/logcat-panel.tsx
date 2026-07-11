@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { parseLogcatEventJson } from "../../shared/api-contracts";
 
 type LogLine = {
   id: number;
@@ -35,17 +36,51 @@ export function LogcatPanel() {
     eventSourceRef.current = source;
     setEnabled(true);
     setStatus("Connecting");
-    source.addEventListener("ready", () => setStatus("Streaming"));
+    source.addEventListener("ready", (event) => {
+      try {
+        if (!(event instanceof MessageEvent) || typeof event.data !== "string") {
+          throw new TypeError("invalid logcat ready event");
+        }
+        parseLogcatEventJson("ready", event.data);
+        setStatus("Streaming");
+      } catch {
+        setStatus("Invalid stream event");
+      }
+    });
     source.addEventListener("log", (event) => {
       if (pausedRef.current) return;
       try {
-        const data = JSON.parse((event as MessageEvent).data) as { line: string; at: string };
+        if (!(event instanceof MessageEvent) || typeof event.data !== "string") {
+          throw new TypeError("invalid logcat event");
+        }
+        const data = parseLogcatEventJson("log", event.data);
         setLines((current) =>
           [...current, { id: nextIdRef.current++, line: data.line, at: data.at }].slice(-MAX_LINES),
         );
       } catch {}
     });
-    source.addEventListener("error", () => setStatus("Error"));
+    source.addEventListener("error", (event) => {
+      if (event instanceof MessageEvent && typeof event.data === "string") {
+        try {
+          const data = parseLogcatEventJson("error", event.data);
+          setStatus(data.line || "Error");
+          return;
+        } catch {}
+      }
+      setStatus("Error");
+    });
+    source.addEventListener("close", (event) => {
+      try {
+        if (event instanceof MessageEvent && typeof event.data === "string") {
+          parseLogcatEventJson("close", event.data);
+        }
+      } finally {
+        source.close();
+        if (eventSourceRef.current === source) eventSourceRef.current = null;
+        setEnabled(false);
+        setStatus("Closed");
+      }
+    });
   };
 
   useEffect(() => {

@@ -1,21 +1,8 @@
 import { useEffect, useState } from "react";
+import type { SessionSnapshot } from "../../shared/api-contracts";
+import { apiRequest } from "../lib/api-client";
 
-type SessionEvent = {
-  id: number;
-  at: string;
-  delayMs: number;
-  source: string;
-  kind: "gesture" | "location";
-  gesture?: { type: string };
-  location?: { latitude: number; longitude: number };
-};
-
-type SessionSnapshot = {
-  events: SessionEvent[];
-  recording: boolean;
-  replaying: boolean;
-  lastError: string | null;
-};
+type SessionEvent = SessionSnapshot["events"][number];
 
 function labelForEvent(event: SessionEvent): string {
   if (event.kind === "gesture") return `${event.gesture?.type ?? "gesture"} • ${event.source}`;
@@ -29,17 +16,23 @@ export function SessionPanel() {
   const [multiplier, setMultiplier] = useState("1");
   const [status, setStatus] = useState("Ready");
 
-  const refresh = () => {
-    fetch("/api/session")
-      .then((r) => r.json() as Promise<SessionSnapshot>)
+  const refresh = (signal?: AbortSignal) => {
+    apiRequest("/api/session", { method: "GET", signal })
       .then(setSession)
-      .catch(() => setStatus("Session unavailable"));
+      .catch(() => {
+        if (!signal?.aborted) setStatus("Session unavailable");
+      });
   };
 
   useEffect(() => {
-    refresh();
-    const timer = setInterval(refresh, 1000);
-    return () => clearInterval(timer);
+    const controller = new AbortController();
+    const sync = () => refresh(controller.signal);
+    sync();
+    const timer = setInterval(sync, 1000);
+    return () => {
+      controller.abort();
+      clearInterval(timer);
+    };
   }, []);
 
   const replay = async () => {
@@ -48,32 +41,36 @@ export function SessionPanel() {
       setStatus("Rate must be positive");
       return;
     }
-    const res = await fetch("/api/session/replay", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ multiplier: rate }),
-    });
-    const data = await res.json() as { ok?: boolean; error?: string; session?: SessionSnapshot };
-    if (!res.ok || !data.ok) {
-      setStatus(data.error ?? "Replay failed");
-      return;
+    try {
+      const data = await apiRequest("/api/session/replay", {
+        method: "POST",
+        body: { multiplier: rate },
+      });
+      setSession(data.session);
+      setStatus("Replaying");
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
     }
-    setSession(data.session ?? null);
-    setStatus("Replaying");
   };
 
   const stopReplay = async () => {
-    const res = await fetch("/api/session/replay/stop", { method: "POST" });
-    const data = await res.json() as { session?: SessionSnapshot };
-    setSession(data.session ?? null);
-    setStatus("Replay stopped");
+    try {
+      const data = await apiRequest("/api/session/replay/stop", { method: "POST" });
+      setSession(data.session);
+      setStatus("Replay stopped");
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+    }
   };
 
   const clear = async () => {
-    const res = await fetch("/api/session", { method: "DELETE" });
-    const data = await res.json() as { session?: SessionSnapshot };
-    setSession(data.session ?? null);
-    setStatus("Cleared");
+    try {
+      const data = await apiRequest("/api/session", { method: "DELETE" });
+      setSession(data.session);
+      setStatus("Cleared");
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+    }
   };
 
   const copy = async () => {

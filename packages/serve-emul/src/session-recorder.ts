@@ -1,32 +1,11 @@
-import type { Gesture } from "./input.ts";
-import type { GeoFix } from "./location.ts";
+import type { Gesture } from "./shared/control-contracts.ts";
+import type {
+  GeoFix,
+  RecordedEvent,
+  SessionSnapshot,
+} from "./shared/api-contracts.ts";
 
-export type RecordedEvent =
-  | {
-      id: number;
-      at: string;
-      delayMs: number;
-      source: string;
-      kind: "gesture";
-      gesture: Gesture;
-    }
-  | {
-      id: number;
-      at: string;
-      delayMs: number;
-      source: string;
-      kind: "location";
-      location: GeoFix;
-    };
-
-export type SessionSnapshot = {
-  events: RecordedEvent[];
-  recording: boolean;
-  replaying: boolean;
-  replayStartedAt: string | null;
-  replayCompletedAt: string | null;
-  lastError: string | null;
-};
+export type { RecordedEvent, SessionSnapshot } from "./shared/api-contracts.ts";
 
 type ReplayHandlers = {
   dispatchGesture: (gesture: Gesture) => Promise<void>;

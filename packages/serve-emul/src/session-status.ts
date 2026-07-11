@@ -1,4 +1,6 @@
-export type SessionStatus = "streaming" | "stopped" | "error";
+import type { SessionStatus } from "./shared/api-contracts.ts";
+
+export type { SessionStatus } from "./shared/api-contracts.ts";
 
 // Terminal status precedence. The first transition out of "streaming" normally
 // wins, but a later abnormal scrcpy exit ("error") may escalate a clean-eof

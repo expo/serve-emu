@@ -2,16 +2,13 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execText } from "./exec.ts";
+import type {
+  AppActionResponse,
+  FileImportResponse,
+} from "./shared/api-contracts.ts";
 
-export type AppActionResult = {
-  ok: true;
-  output: string;
-};
-
-export type FileImportResult = AppActionResult & {
-  path: string;
-  kind: "image" | "video" | "file";
-};
+export type AppActionResult = AppActionResponse;
+export type FileImportResult = FileImportResponse;
 
 const PACKAGE_RE = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/;
 const PERMISSION_RE = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/;

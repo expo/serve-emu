@@ -1,37 +1,30 @@
 import { spawn } from "node:child_process";
 import { execBuffer, execText } from "./exec.ts";
+import type {
+  Device,
+  FontScaleStatus,
+  NetworkRadioStatus,
+  NetworkStatus,
+  NightMode,
+  NightModeStatus,
+  OrientationMode,
+  OrientationStatus,
+} from "./shared/api-contracts.ts";
+
+export type {
+  Device,
+  FontScaleStatus,
+  NetworkRadioStatus,
+  NetworkStatus,
+  NightMode,
+  NightModeStatus,
+  OrientationMode,
+  OrientationStatus,
+} from "./shared/api-contracts.ts";
 
 const ADB_QUERY_TIMEOUT_MS = 2_000;
 const ADB_MUTATION_TIMEOUT_MS = 5_000;
 const ADB_SCREENSHOT_TIMEOUT_MS = 8_000;
-
-export type Device = { serial: string; state: string };
-export type OrientationMode = "auto" | "portrait" | "landscape";
-export type NightMode = "auto" | "dark" | "light";
-export type OrientationStatus = {
-  mode: "free" | "lock" | "unknown";
-  rotation: number | null;
-  orientation: OrientationMode | "unknown";
-  raw: string;
-};
-export type FontScaleStatus = {
-  scale: number;
-  raw: string;
-};
-export type NightModeStatus = {
-  mode: NightMode | "unknown";
-  raw: string;
-};
-export type NetworkRadioStatus = "enabled" | "disabled" | "unknown";
-export type NetworkStatus = {
-  enabled: boolean | null;
-  wifi: NetworkRadioStatus;
-  mobileData: NetworkRadioStatus;
-  raw: {
-    wifi: string;
-    mobileData: string;
-  };
-};
 
 export async function listAllDevices(): Promise<Device[]> {
   const r = await execText("adb", ["devices"], { timeout: ADB_QUERY_TIMEOUT_MS });

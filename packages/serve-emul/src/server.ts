@@ -15,13 +15,11 @@ import {
   setNetworkEnabled,
   setNightMode,
   setUserRotation,
-  type NightMode,
-  type OrientationMode,
 } from "./adb.ts";
 import {
   findAccessibilityNode,
   getAccessibilitySnapshot,
-  parseAccessibilitySelector,
+  type AccessibilitySelector,
   type AccessibilitySnapshot,
 } from "./accessibility.ts";
 import {
@@ -45,10 +43,19 @@ import {
   epochNowMs,
   writeFrameMetaHeader,
 } from "./shared/frame-meta.ts";
+import type {
+  DeviceGridResponse,
+  GridDevice,
+  HealthResponse,
+  LogcatEventMap,
+} from "./shared/api-contracts.ts";
+import {
+  parseWsClientJson,
+  type WsServerMessage,
+} from "./shared/websocket-contracts.ts";
 import {
   startScrcpy,
   type ScrcpySession,
-  type ScrcpyErrorCode,
   ScrcpyStreamError,
 } from "./scrcpy.ts";
 import {
@@ -59,18 +66,20 @@ import {
 } from "./emulator.ts";
 import {
   dispatch,
-  parseGesture,
   resetVideoPacket,
   type Gesture,
   type Screen,
 } from "./input.ts";
 import {
-  parseGeoFix,
   setEmulatorLocationAsync,
   type GeoFix,
 } from "./location.ts";
-import { parseRoutePlaybackRequest, RoutePlayback } from "./route-playback.ts";
+import { RoutePlayback } from "./route-playback.ts";
 import { SessionRecorder } from "./session-recorder.ts";
+import { ApiError, apiErrorResponse } from "./api/api-error.ts";
+import { createApiRouter } from "./api/router.ts";
+import { createApiRoutes } from "./api/routes/index.ts";
+import type { ApiDependencies } from "./api/dependencies.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -117,28 +126,6 @@ function parseCookies(header: string | null): Record<string, string> {
   return out;
 }
 
-type GridDeviceKind = "physical" | "emulator" | "avd";
-
-type GridDevice = {
-  id: string;
-  kind: GridDeviceKind;
-  serial: string | null;
-  avd: string | null;
-  name: string;
-  state: string;
-  current: boolean;
-  canSelect: boolean;
-  canStart: boolean;
-  canStop: boolean;
-};
-
-type DeviceGridResponse = {
-  ok: true;
-  currentSerial: string;
-  sessionStatus: SessionStatus;
-  devices: GridDevice[];
-};
-
 type WsData = { id: number; frameMeta: boolean; handle?: Client };
 
 type Client = {
@@ -159,8 +146,6 @@ const FRAME_STAT_WINDOW = 240;
 const VIDEO_RESET_COOLDOWN_MS = 500;
 const FIRST_FRAME_RESET_MS = 5000;
 const AWAITING_KEYFRAME_RESET_MS = 2500;
-const MAX_JSON_BODY_BYTES = 8 * 1024;
-const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_LOGCAT_QUERY_BYTES = 200;
 
 export async function startServer(opts: ServerOpts) {
@@ -264,7 +249,7 @@ export async function startServer(opts: ServerOpts) {
   let accessibilitySnapshotInFlight: Promise<AccessibilitySnapshot> | null =
     null;
 
-  const health = () => ({
+  const health = (): HealthResponse => ({
     ok: status === "streaming",
     status,
     serial: currentSerial,
@@ -384,7 +369,10 @@ export async function startServer(opts: ServerOpts) {
     }
   };
 
-  const sendJson = (ws: ServerWebSocket<WsData>, value: unknown) => {
+  const sendJson = (
+    ws: ServerWebSocket<WsData>,
+    value: WsServerMessage,
+  ) => {
     try {
       ws.send(JSON.stringify(value));
     } catch {}
@@ -417,33 +405,6 @@ export async function startServer(opts: ServerOpts) {
     return out;
   };
 
-  const wantsAck = (value: unknown) => {
-    if (typeof value !== "object" || value === null || Array.isArray(value))
-      return true;
-    return (value as Record<string, unknown>).ack !== false;
-  };
-
-  const isResetVideoRequest = (value: unknown) =>
-    typeof value === "object" &&
-    value !== null &&
-    !Array.isArray(value) &&
-    (value as Record<string, unknown>).type === "reset-video";
-
-  const readJsonBody = async (
-    req: Request,
-    maxBytes = MAX_JSON_BODY_BYTES,
-  ): Promise<unknown> => {
-    const contentLength = Number(req.headers.get("content-length") ?? "0");
-    if (contentLength > maxBytes) throw new Error("request body too large");
-    return req.json();
-  };
-
-  const shouldRecord = (value: unknown) =>
-    typeof value !== "object" ||
-    value === null ||
-    Array.isArray(value) ||
-    (value as Record<string, unknown>).record !== false;
-
   const readAccessibilitySnapshot = async (cacheMs = 2_500) => {
     const now = Date.now();
     if (
@@ -472,7 +433,13 @@ export async function startServer(opts: ServerOpts) {
     source: string,
     record = true,
   ) => {
-    if (status !== "streaming") throw new Error(`session is ${status}`);
+    if (status !== "streaming") {
+      throw new ApiError(
+        503,
+        "service_unavailable",
+        `session is ${status}`,
+      );
+    }
     await dispatch(session.controlSocket, gesture, screen);
     if (record) sessionRecorder.recordGesture(gesture, source);
   };
@@ -522,7 +489,10 @@ export async function startServer(opts: ServerOpts) {
 
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
-        const send = (event: string, value: unknown) => {
+        const send = <Event extends keyof LogcatEventMap>(
+          event: Event,
+          value: LogcatEventMap[Event],
+        ) => {
           try {
             controller.enqueue(
               encoder.encode(
@@ -601,162 +571,50 @@ export async function startServer(opts: ServerOpts) {
     });
   };
 
-  const gestureEndpoint = async (
-    req: Request,
-    type: Gesture["type"],
-    source: string,
+  const tapAccessibility = async (
+    selector: AccessibilitySelector,
+    record: boolean,
   ) => {
+    const snapshot = await readAccessibilitySnapshot(1_000);
+    let node;
     try {
-      const payload = await readJsonBody(req);
-      const gesture = parseGesture(
-        typeof payload === "object" &&
-          payload !== null &&
-          !Array.isArray(payload)
-          ? { ...payload, type }
-          : payload,
-      );
-      await dispatchGesture(gesture, source, shouldRecord(payload));
-      return Response.json({ ok: true });
-    } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
+      node = findAccessibilityNode(snapshot.nodes, selector);
+    } catch (error) {
+      throw new ApiError(
+        404,
+        "not_found",
+        error instanceof Error ? error.message : "accessibility node not found",
+        { cause: error },
       );
     }
-  };
-
-  const keyEndpoint = async (req: Request) => {
-    try {
-      const payload = await readJsonBody(req);
-      if (
-        typeof payload !== "object" ||
-        payload === null ||
-        Array.isArray(payload)
-      ) {
-        throw new Error("key payload must be an object");
-      }
-      const key = (payload as Record<string, unknown>).key;
-      const gesture =
-        key === "back" || key === "home" || key === "recents" || key === "power"
-          ? parseGesture({ type: key })
-          : parseGesture({ ...payload, type: "key" });
-      await dispatchGesture(gesture, "rest:key", shouldRecord(payload));
-      return Response.json({ ok: true });
-    } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
+    const centerX = (node.bounds.left + node.bounds.right) / 2;
+    const centerY = (node.bounds.top + node.bounds.bottom) / 2;
+    const accessibilityWidth = Math.max(
+      ...snapshot.nodes.map((candidate) => candidate.bounds.right),
+      screen.width,
+    );
+    const accessibilityHeight = Math.max(
+      ...snapshot.nodes.map((candidate) => candidate.bounds.bottom),
+      screen.height,
+    );
+    const x = centerX / accessibilityWidth;
+    const y = centerY / accessibilityHeight;
+    if (
+      !Number.isFinite(x) ||
+      !Number.isFinite(y) ||
+      x < 0 ||
+      x > 1 ||
+      y < 0 ||
+      y > 1
+    ) {
+      throw new ApiError(
+        409,
+        "conflict",
+        "matched accessibility node is outside the current stream bounds",
       );
     }
-  };
-
-  const accessibilityTapEndpoint = async (req: Request) => {
-    try {
-      const payload = await readJsonBody(req);
-      if (
-        typeof payload !== "object" ||
-        payload === null ||
-        Array.isArray(payload)
-      ) {
-        throw new Error("accessibility tap payload must be an object");
-      }
-      const body = payload as Record<string, unknown>;
-      const selector = parseAccessibilitySelector(body.selector ?? body);
-      const snapshot = await readAccessibilitySnapshot(1_000);
-      const node = findAccessibilityNode(snapshot.nodes, selector);
-      const centerX = (node.bounds.left + node.bounds.right) / 2;
-      const centerY = (node.bounds.top + node.bounds.bottom) / 2;
-      const accessibilityWidth = Math.max(
-        ...snapshot.nodes.map((n) => n.bounds.right),
-        screen.width,
-      );
-      const accessibilityHeight = Math.max(
-        ...snapshot.nodes.map((n) => n.bounds.bottom),
-        screen.height,
-      );
-      const x = centerX / accessibilityWidth;
-      const y = centerY / accessibilityHeight;
-      if (
-        !Number.isFinite(x) ||
-        !Number.isFinite(y) ||
-        x < 0 ||
-        x > 1 ||
-        y < 0 ||
-        y > 1
-      ) {
-        throw new Error(
-          "matched accessibility node is outside the current stream bounds",
-        );
-      }
-      await dispatchGesture(
-        {
-          type: "tap",
-          x,
-          y,
-        },
-        "accessibility:tap",
-        shouldRecord(payload),
-      );
-      return Response.json({ ok: true, node, capturedAt: snapshot.capturedAt });
-    } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
-    }
-  };
-
-  const appJsonEndpoint = async (
-    req: Request,
-    action: (payload: Record<string, unknown>) => unknown | Promise<unknown>,
-  ) => {
-    try {
-      const payload = await readJsonBody(req);
-      if (
-        typeof payload !== "object" ||
-        payload === null ||
-        Array.isArray(payload)
-      ) {
-        throw new Error("payload must be an object");
-      }
-      const result = await action(payload as Record<string, unknown>);
-      return Response.json(result);
-    } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
-    }
-  };
-
-  const installEndpoint = async (req: Request) => {
-    try {
-      const form = await req.formData();
-      const file = form.get("apk");
-      if (!(file instanceof File))
-        throw new Error("multipart field apk must be a file");
-      return Response.json(await installApk(currentSerial, file));
-    } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
-    }
-  };
-
-  const fileImportEndpoint = async (req: Request) => {
-    try {
-      const form = await req.formData();
-      const file = form.get("file");
-      if (!(file instanceof File))
-        throw new Error("multipart field file must be a file");
-      return Response.json(await importMediaFile(currentSerial, file));
-    } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
-    }
+    await dispatchGesture({ type: "tap", x, y }, "accessibility:tap", record);
+    return { ok: true as const, node, capturedAt: snapshot.capturedAt };
   };
 
   const requestVideoReset = (reason: string) => {
@@ -945,7 +803,7 @@ export async function startServer(opts: ServerOpts) {
   const switchSession = async (serial: string) => {
     if (serial === currentSerial && status === "streaming") {
       return {
-        ok: true,
+        ok: true as const,
         serial: currentSerial,
         device: session.meta.deviceName,
       };
@@ -953,9 +811,16 @@ export async function startServer(opts: ServerOpts) {
     const device = (await listAllDevices()).find(
       (candidate) => candidate.serial === serial,
     );
-    if (!device) throw new Error(`Unknown adb device "${serial}".`);
-    if (device.state !== "device")
-      throw new Error(`${serial} is ${device.state}, not ready.`);
+    if (!device) {
+      throw new ApiError(404, "not_found", `Unknown adb device "${serial}".`);
+    }
+    if (device.state !== "device") {
+      throw new ApiError(
+        409,
+        "conflict",
+        `${serial} is ${device.state}, not ready.`,
+      );
+    }
 
     const nextSession = await openScrcpy(serial);
     const previousSession = session;
@@ -973,7 +838,7 @@ export async function startServer(opts: ServerOpts) {
       `scrcpy ready: ${nextSession.meta.deviceName} • ${nextSession.meta.codecId} • ${nextSession.meta.width}×${nextSession.meta.height}`,
     );
     return {
-      ok: true,
+      ok: true as const,
       serial: currentSerial,
       device: nextSession.meta.deviceName,
     };
@@ -1012,6 +877,132 @@ export async function startServer(opts: ServerOpts) {
 
   attachSessionHandlers(session, sessionGeneration);
 
+  const apiRouter = createApiRouter(createApiRoutes());
+  const apiDependencies: ApiDependencies = {
+    getInfo: () => ({
+      serial: currentSerial,
+      device: session.meta.deviceName,
+      codec: session.meta.codecId,
+      size: { width: screen.width, height: screen.height },
+      status,
+      clients: clients.size,
+    }),
+    listDevices: async () => ({
+      ok: true,
+      currentSerial,
+      devices: (await listAllDevices()).map((device) => ({
+        ...device,
+        current: device.serial === currentSerial,
+      })),
+    }),
+    getDeviceGrid: deviceGrid,
+    selectDevice: switchSession,
+    startAvd: async (avd, select) => {
+      const avdName = avd.startsWith("@") ? avd.slice(1) : avd;
+      if (!(await listAvds()).includes(avdName)) {
+        throw new ApiError(404, "not_found", `Unknown AVD "${avd}".`);
+      }
+      const launch = await startEmulator({ avd });
+      if (select) {
+        const switched = await switchSession(launch.serial);
+        return { ...switched, avd };
+      }
+      return { ok: true, serial: launch.serial, avd };
+    },
+    stopAvd: async ({ serial: requestedSerial, avd }) => {
+      let serial = requestedSerial ?? "";
+      if (!serial && avd) {
+        serial = (await listRunningAvds()).find(
+          (running) => running.avd === avd,
+        )?.serial ?? "";
+      }
+      if (!serial) {
+        throw new ApiError(404, "not_found", "running emulator was not found");
+      }
+      if (!(await listAllDevices()).some((device) => device.serial === serial)) {
+        throw new ApiError(404, "not_found", `Unknown emulator "${serial}".`);
+      }
+      if (serial === currentSerial) {
+        stopCurrentSession("current emulator stopped");
+      }
+      await stopEmulator(serial);
+      return { ok: true, serial };
+    },
+    getOrientation: () => getUserRotation(currentSerial),
+    setOrientation: (orientation) => setUserRotation(currentSerial, orientation),
+    getNightMode: () => getNightMode(currentSerial),
+    setNightMode: (mode) => setNightMode(currentSerial, mode),
+    getFontScale: () => getFontScale(currentSerial),
+    setFontScale: (scale) => setFontScale(currentSerial, scale),
+    getNetwork: () => getNetworkStatus(currentSerial),
+    setNetwork: (enabled) => setNetworkEnabled(currentSerial, enabled),
+    openLogcat: logcatStream,
+    takeScreenshot: () => screencapPng(currentSerial),
+    getForegroundApp: () => getForegroundApp(currentSerial),
+    getAccessibility: () => readAccessibilitySnapshot(),
+    tapAccessibility,
+    dispatchGesture,
+    getSession: () => sessionRecorder.snapshot(),
+    clearSession: () => sessionRecorder.clear(),
+    replaySession: (multiplier) => {
+      const snapshot = sessionRecorder.snapshot();
+      if (snapshot.replaying) {
+        throw new ApiError(
+          409,
+          "conflict",
+          "session replay is already running",
+        );
+      }
+      if (snapshot.events.length === 0) {
+        throw new ApiError(409, "conflict", "session has no recorded events");
+      }
+      const replay = sessionRecorder.replay(
+        {
+          dispatchGesture: (gesture) =>
+            dispatchGesture(gesture, "session:replay", false),
+          setLocation: async (fix) => {
+            await applyLocation(fix, "session:replay", false);
+          },
+        },
+        multiplier,
+      );
+      void replay.catch(() => {});
+      return sessionRecorder.snapshot();
+    },
+    stopSessionReplay: () => sessionRecorder.stopReplay(),
+    installApk: (file) => installApk(currentSerial, file),
+    importFile: (file) => importMediaFile(currentSerial, file),
+    launchApp: (packageName, activity) =>
+      launchApp(currentSerial, packageName, activity),
+    clearApp: (packageName) => clearAppData(currentSerial, packageName),
+    forceStopApp: (packageName) => forceStopApp(currentSerial, packageName),
+    grantPermission: (packageName, permission) =>
+      grantPermission(currentSerial, packageName, permission),
+    getLocation: () => ({
+      serial: currentSerial,
+      emulator: /^emulator-\d+$/.test(currentSerial),
+      location: lastLocation,
+    }),
+    setLocation: (fix) => {
+      if (!/^emulator-\d+$/.test(currentSerial)) {
+        throw new ApiError(
+          409,
+          "conflict",
+          "location control requires an Android Emulator",
+        );
+      }
+      return applyLocation(fix, "rest:location");
+    },
+    getRoute: () => routePlayback.snapshot(),
+    startRoute: (route) => routePlayback.start(route),
+    stopRoute: () => routePlayback.stop(),
+    controlRoute: (action) => {
+      if (action === "pause") return routePlayback.pause();
+      if (action === "resume") return routePlayback.resume();
+      return routePlayback.stop();
+    },
+  };
+
   let nextId = 1;
   const server = Bun.serve<WsData>({
     port: opts.port,
@@ -1045,15 +1036,10 @@ export async function startServer(opts: ServerOpts) {
       }
 
       if (!tokenValid(req, url)) {
-        return new Response(
-          JSON.stringify({ ok: false, error: "unauthorized" }),
-          {
-            status: 401,
-            headers: {
-              "Content-Type": "application/json; charset=utf-8",
-              "WWW-Authenticate": "Bearer",
-            },
-          },
+        return apiErrorResponse(
+          new ApiError(401, "unauthorized", "Unauthorized", {
+            headers: { "WWW-Authenticate": "Bearer" },
+          }),
         );
       }
 
@@ -1065,370 +1051,10 @@ export async function startServer(opts: ServerOpts) {
         (req.method !== "GET" && req.method !== "HEAD")
       ) {
         if (!originAllowed(req)) {
-          return new Response(
-            JSON.stringify({ ok: false, error: "forbidden origin" }),
-            {
-              status: 403,
-              headers: { "Content-Type": "application/json; charset=utf-8" },
-            },
+          return apiErrorResponse(
+            new ApiError(403, "forbidden", "Forbidden origin"),
           );
         }
-      }
-
-      if (url.pathname === "/api") {
-        return Response.json({
-          serial: currentSerial,
-          device: session.meta.deviceName,
-          codec: session.meta.codecId,
-          size: { width: screen.width, height: screen.height },
-          status,
-          clients: clients.size,
-        });
-      }
-
-      if (url.pathname === "/api/devices") {
-        if (req.method !== "GET")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          return Response.json({
-            ok: true,
-            currentSerial,
-            devices: (await listAllDevices()).map((device) => ({
-              ...device,
-              current: device.serial === currentSerial,
-            })),
-          });
-        } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
-        }
-      }
-
-      if (url.pathname === "/api/device-grid") {
-        if (req.method !== "GET")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          return Response.json(await deviceGrid());
-        } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
-        }
-      }
-
-      if (url.pathname === "/api/devices/select") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          const payload = await readJsonBody(req);
-          if (
-            typeof payload !== "object" ||
-            payload === null ||
-            Array.isArray(payload)
-          ) {
-            throw new Error("select payload must be an object");
-          }
-          const serial = (payload as Record<string, unknown>).serial;
-          if (typeof serial !== "string" || !serial.trim()) {
-            throw new Error("serial is required");
-          }
-          return Response.json(await switchSession(serial.trim()));
-        } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
-        }
-      }
-
-      if (url.pathname === "/api/avds/start") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          const payload = await readJsonBody(req);
-          if (
-            typeof payload !== "object" ||
-            payload === null ||
-            Array.isArray(payload)
-          ) {
-            throw new Error("start payload must be an object");
-          }
-          const avd = (payload as Record<string, unknown>).avd;
-          if (typeof avd !== "string" || !avd.trim())
-            throw new Error("avd is required");
-          const launch = await startEmulator({ avd: avd.trim() });
-          const select = (payload as Record<string, unknown>).select !== false;
-          if (select) {
-            const switched = await switchSession(launch.serial);
-            return Response.json({ ...switched, avd: avd.trim() });
-          }
-          return Response.json({
-            ok: true,
-            serial: launch.serial,
-            avd: avd.trim(),
-          });
-        } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
-        }
-      }
-
-      if (url.pathname === "/api/avds/stop") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          const payload = await readJsonBody(req);
-          if (
-            typeof payload !== "object" ||
-            payload === null ||
-            Array.isArray(payload)
-          ) {
-            throw new Error("stop payload must be an object");
-          }
-          const body = payload as Record<string, unknown>;
-          let serial =
-            typeof body.serial === "string" ? body.serial.trim() : "";
-          if (!serial && typeof body.avd === "string" && body.avd.trim()) {
-            serial =
-              (await listRunningAvds()).find(
-                (running) => running.avd === body.avd,
-              )?.serial ?? "";
-          }
-          if (!serial) throw new Error("serial or running avd is required");
-          if (!/^emulator-\d+$/.test(serial))
-            throw new Error(`${serial} is not an emulator`);
-          if (serial === currentSerial)
-            stopCurrentSession("current emulator stopped");
-          await stopEmulator(serial);
-          return Response.json({ ok: true, serial });
-        } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
-        }
-      }
-
-      if (url.pathname === "/api/orientation") {
-        if (req.method === "GET") {
-          try {
-            return Response.json({
-              ok: true,
-              orientation: await getUserRotation(currentSerial),
-            });
-          } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
-          }
-        }
-        if (req.method === "POST") {
-          try {
-            const payload = await readJsonBody(req);
-            if (
-              typeof payload !== "object" ||
-              payload === null ||
-              Array.isArray(payload)
-            ) {
-              throw new Error("orientation payload must be an object");
-            }
-            const orientation = (payload as Record<string, unknown>)
-              .orientation;
-            if (
-              orientation !== "auto" &&
-              orientation !== "portrait" &&
-              orientation !== "landscape"
-            ) {
-              throw new Error(
-                "orientation must be auto, portrait, or landscape",
-              );
-            }
-            return Response.json({
-              ok: true,
-              orientation: await setUserRotation(
-                currentSerial,
-                orientation as OrientationMode,
-              ),
-            });
-          } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
-          }
-        }
-        return new Response("method not allowed", { status: 405 });
-      }
-
-      if (url.pathname === "/api/night-mode") {
-        if (req.method === "GET") {
-          try {
-            return Response.json({
-              ok: true,
-              nightMode: await getNightMode(currentSerial),
-            });
-          } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
-          }
-        }
-        if (req.method === "POST") {
-          try {
-            const payload = await readJsonBody(req);
-            if (
-              typeof payload !== "object" ||
-              payload === null ||
-              Array.isArray(payload)
-            ) {
-              throw new Error("night mode payload must be an object");
-            }
-            const mode = (payload as Record<string, unknown>).mode;
-            if (mode !== "dark" && mode !== "light" && mode !== "auto") {
-              throw new Error("mode must be dark, light, or auto");
-            }
-            return Response.json({
-              ok: true,
-              nightMode: await setNightMode(currentSerial, mode as NightMode),
-            });
-          } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
-          }
-        }
-        return new Response("method not allowed", { status: 405 });
-      }
-
-      if (url.pathname === "/api/font-scale") {
-        if (req.method === "GET") {
-          try {
-            return Response.json({
-              ok: true,
-              fontScale: await getFontScale(currentSerial),
-            });
-          } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
-          }
-        }
-        if (req.method === "POST") {
-          try {
-            const payload = await readJsonBody(req);
-            if (
-              typeof payload !== "object" ||
-              payload === null ||
-              Array.isArray(payload)
-            ) {
-              throw new Error("font scale payload must be an object");
-            }
-            const scale = Number((payload as Record<string, unknown>).scale);
-            if (!Number.isFinite(scale) || scale < 0.7 || scale > 2) {
-              throw new Error("scale must be a number between 0.7 and 2.0");
-            }
-            return Response.json({
-              ok: true,
-              fontScale: await setFontScale(currentSerial, scale),
-            });
-          } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
-          }
-        }
-        return new Response("method not allowed", { status: 405 });
-      }
-
-      if (url.pathname === "/api/network") {
-        if (req.method === "GET") {
-          try {
-            return Response.json({
-              ok: true,
-              network: await getNetworkStatus(currentSerial),
-            });
-          } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
-          }
-        }
-        if (req.method === "POST") {
-          try {
-            const payload = await readJsonBody(req);
-            if (
-              typeof payload !== "object" ||
-              payload === null ||
-              Array.isArray(payload)
-            ) {
-              throw new Error("network payload must be an object");
-            }
-            const enabled = (payload as Record<string, unknown>).enabled;
-            if (typeof enabled !== "boolean") {
-              throw new Error("enabled must be a boolean");
-            }
-            return Response.json({
-              ok: true,
-              network: await setNetworkEnabled(currentSerial, enabled),
-            });
-          } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
-          }
-        }
-        return new Response("method not allowed", { status: 405 });
       }
 
       if (url.pathname === "/health") {
@@ -1437,297 +1063,8 @@ export async function startServer(opts: ServerOpts) {
         });
       }
 
-      if (url.pathname === "/api/logcat") {
-        if (req.method !== "GET")
-          return new Response("method not allowed", { status: 405 });
-        return logcatStream(url);
-      }
-
-      if (url.pathname === "/api/screenshot") {
-        if (req.method !== "GET" && req.method !== "POST") {
-          return new Response("method not allowed", { status: 405 });
-        }
-        try {
-          const png = await screencapPng(currentSerial);
-          if (url.searchParams.get("format") === "base64") {
-            return Response.json({
-              ok: true,
-              mimeType: "image/png",
-              data: png.toString("base64"),
-            });
-          }
-          return new Response(new Uint8Array(png), {
-            headers: { "Content-Type": "image/png" },
-          });
-        } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
-        }
-      }
-
-      if (url.pathname === "/api/foreground") {
-        if (req.method !== "GET")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          return Response.json({
-            ok: true,
-            app: await getForegroundApp(currentSerial),
-          });
-        } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
-        }
-      }
-
-      if (url.pathname === "/api/accessibility") {
-        if (req.method !== "GET")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          return Response.json(await readAccessibilitySnapshot());
-        } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
-        }
-      }
-
-      if (url.pathname === "/api/accessibility/tap") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        return accessibilityTapEndpoint(req);
-      }
-
-      if (url.pathname === "/api/tap") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        return gestureEndpoint(req, "tap", "rest:tap");
-      }
-
-      if (url.pathname === "/api/swipe") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        return gestureEndpoint(req, "swipe", "rest:swipe");
-      }
-
-      if (url.pathname === "/api/text") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        return gestureEndpoint(req, "text", "rest:text");
-      }
-
-      if (url.pathname === "/api/key") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        return keyEndpoint(req);
-      }
-
-      if (url.pathname === "/api/session") {
-        if (req.method === "GET")
-          return Response.json(sessionRecorder.snapshot());
-        if (req.method === "DELETE")
-          return Response.json({ ok: true, session: sessionRecorder.clear() });
-        return new Response("method not allowed", { status: 405 });
-      }
-
-      if (url.pathname === "/api/session/replay") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          const payload = await readJsonBody(req);
-          const multiplier =
-            typeof payload === "object" &&
-            payload !== null &&
-            !Array.isArray(payload)
-              ? Number((payload as Record<string, unknown>).multiplier ?? 1)
-              : 1;
-          const replay = sessionRecorder.replay(
-            {
-              dispatchGesture: (gesture) =>
-                dispatchGesture(gesture, "session:replay", false),
-              setLocation: async (fix) => {
-                await applyLocation(fix, "session:replay", false);
-              },
-            },
-            multiplier,
-          );
-          void replay.catch(() => {});
-          return Response.json({
-            ok: true,
-            session: sessionRecorder.snapshot(),
-          });
-        } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
-        }
-      }
-
-      if (url.pathname === "/api/session/replay/stop") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        return Response.json({
-          ok: true,
-          session: sessionRecorder.stopReplay(),
-        });
-      }
-
-      if (url.pathname === "/api/apps/install") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        return installEndpoint(req);
-      }
-
-      if (url.pathname === "/api/files/import") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        return fileImportEndpoint(req);
-      }
-
-      if (url.pathname === "/api/apps/launch") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        return appJsonEndpoint(req, (payload) =>
-          launchApp(
-            currentSerial,
-            String(payload.packageName ?? ""),
-            typeof payload.activity === "string" && payload.activity.trim()
-              ? payload.activity
-              : undefined,
-          ),
-        );
-      }
-
-      if (url.pathname === "/api/apps/clear") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        return appJsonEndpoint(req, (payload) =>
-          clearAppData(currentSerial, String(payload.packageName ?? "")),
-        );
-      }
-
-      if (url.pathname === "/api/apps/force-stop") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        return appJsonEndpoint(req, (payload) =>
-          forceStopApp(currentSerial, String(payload.packageName ?? "")),
-        );
-      }
-
-      if (url.pathname === "/api/apps/grant") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        return appJsonEndpoint(req, (payload) =>
-          grantPermission(
-            currentSerial,
-            String(payload.packageName ?? ""),
-            String(payload.permission ?? ""),
-          ),
-        );
-      }
-
-      if (url.pathname === "/api/location") {
-        if (req.method === "GET") {
-          return Response.json({
-            serial: currentSerial,
-            emulator: /^emulator-\d+$/.test(currentSerial),
-            location: lastLocation,
-          });
-        }
-        if (req.method === "POST") {
-          try {
-            const fix = parseGeoFix(await readJsonBody(req));
-            lastLocation = await applyLocation(fix, "rest:location");
-            return Response.json({ ok: true, location: lastLocation });
-          } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
-          }
-        }
-        return new Response("method not allowed", { status: 405 });
-      }
-
-      if (url.pathname === "/api/route") {
-        if (req.method === "GET") {
-          return Response.json(routePlayback.snapshot());
-        }
-        if (req.method === "POST") {
-          try {
-            const route = parseRoutePlaybackRequest(
-              await readJsonBody(req, MAX_ROUTE_BODY_BYTES),
-            );
-            return Response.json({
-              ok: true,
-              route: await routePlayback.start(route),
-            });
-          } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
-          }
-        }
-        if (req.method === "DELETE") {
-          return Response.json({ ok: true, route: routePlayback.stop() });
-        }
-        return new Response("method not allowed", { status: 405 });
-      }
-
-      if (url.pathname === "/api/route/control") {
-        if (req.method !== "POST")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          const payload = await readJsonBody(req);
-          if (
-            typeof payload !== "object" ||
-            payload === null ||
-            Array.isArray(payload)
-          ) {
-            throw new Error("control payload must be an object");
-          }
-          const action = (payload as Record<string, unknown>).action;
-          if (action === "pause")
-            return Response.json({ ok: true, route: routePlayback.pause() });
-          if (action === "resume")
-            return Response.json({ ok: true, route: routePlayback.resume() });
-          if (action === "stop")
-            return Response.json({ ok: true, route: routePlayback.stop() });
-          throw new Error("action must be pause, resume, or stop");
-        } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
-        }
-      }
+      const apiResponse = await apiRouter.handle(req, apiDependencies);
+      if (apiResponse) return apiResponse;
 
       if (url.pathname === "/ws") {
         if (status !== "streaming") {
@@ -1766,21 +1103,20 @@ export async function startServer(opts: ServerOpts) {
       },
       message(ws, raw) {
         if (typeof raw !== "string") return;
-        if (raw.length > MAX_WS_MESSAGE_BYTES) {
+        if (Buffer.byteLength(raw, "utf8") > MAX_WS_MESSAGE_BYTES) {
           ws.close(1009, "message too large");
           return;
         }
         try {
           if (status !== "streaming") throw new Error(`session is ${status}`);
-          const payload = JSON.parse(raw);
-          const acknowledge = wantsAck(payload);
-          if (isResetVideoRequest(payload)) {
+          const message = parseWsClientJson(raw);
+          const acknowledge = message.ack !== false;
+          if (message.type === "reset-video") {
             requestVideoReset("client requested keyframe");
             if (acknowledge) sendJson(ws, { ok: true });
             return;
           }
-          const msg = parseGesture(payload);
-          void dispatchGesture(msg, "ws", shouldRecord(payload))
+          void dispatchGesture(message, "ws", message.record !== false)
             .then(() => {
               if (acknowledge) sendJson(ws, { ok: true });
             })

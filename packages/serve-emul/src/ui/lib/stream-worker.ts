@@ -1,5 +1,17 @@
 import { buildCodecString, scanAU } from "./h264";
 import { epochNowMs, parseFramePacket } from "../../shared/frame-meta";
+import {
+  parseWsServerJson,
+  type WsClientMessage,
+} from "../../shared/websocket-contracts";
+import {
+  parseWorkerCommand,
+  type StreamStats,
+  type WorkerCommand,
+  type WorkerEvent,
+} from "../../shared/worker-contracts";
+
+export type { StreamStats } from "../../shared/worker-contracts";
 
 // The worker owns the whole WebSocket → decode → present pipeline so that
 // main-thread work (React renders, health polling, panels) can never stall
@@ -16,25 +28,10 @@ const FRAME_QUEUE_SIZE = 3;
 const PENDING_TIMING_LIMIT = 256;
 const STATS_INTERVAL_MS = 1000;
 
-export type StreamStats = {
-  fps: number;
-  decodeQueue: number;
-  transitMs: number | null;
-  e2eMs: number | null;
-  codec: string | null;
-  rendered: boolean;
-};
-
-type WorkerCommand =
-  | { type: "init"; canvas: OffscreenCanvas; url: string }
-  | { type: "connect" }
-  | { type: "send"; text: string }
-  | { type: "stop" };
-
 // Typed against the worker global's message surface only, to avoid pulling the
 // whole WebWorker lib into the DOM-flavored UI tsconfig.
 const workerPort = self as unknown as {
-  postMessage(message: unknown): void;
+  postMessage(message: WorkerEvent): void;
   addEventListener(type: "message", listener: (e: MessageEvent) => void): void;
 };
 
@@ -134,7 +131,8 @@ const requestKeyframe = () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   if (now - lastKeyframeRequestAt < KEYFRAME_REQUEST_COOLDOWN_MS) return;
   lastKeyframeRequestAt = now;
-  ws.send(JSON.stringify({ type: "reset-video", ack: false }));
+  const message: WsClientMessage = { type: "reset-video", ack: false };
+  ws.send(JSON.stringify(message));
 };
 
 // Soft recovery: the pipeline fell behind but the decoder is still healthy.
@@ -345,19 +343,14 @@ const connect = () => {
   sock.onmessage = (e) => {
     if (typeof e.data === "string") {
       try {
-        const msg = JSON.parse(e.data) as { type?: string; size?: { width: number; height: number } };
-        if (
-          msg.type === "video-session" &&
-          msg.size &&
-          Number.isFinite(msg.size.width) &&
-          Number.isFinite(msg.size.height)
-        ) {
+        const message = parseWsServerJson(e.data);
+        if ("type" in message && message.type === "video-session") {
           closeDecoder();
           clearFrameQueue();
           frameIdx = 0;
           sawKeyframe = false;
           droppingUntilKeyframe = true;
-          workerPort.postMessage({ type: "session", size: msg.size });
+          workerPort.postMessage({ type: "session", size: message.size });
           requestKeyframe();
         }
       } catch {}
@@ -393,7 +386,17 @@ const stop = () => {
 };
 
 workerPort.addEventListener("message", (e: MessageEvent) => {
-  const msg = e.data as WorkerCommand;
+  let msg: WorkerCommand<OffscreenCanvas>;
+  try {
+    msg = parseWorkerCommand<OffscreenCanvas>(
+      e.data,
+      (value): value is OffscreenCanvas =>
+        typeof OffscreenCanvas === "function" && value instanceof OffscreenCanvas,
+    );
+  } catch {
+    postStatus("invalid worker command");
+    return;
+  }
   switch (msg.type) {
     case "init": {
       if (typeof VideoDecoder === "undefined" || typeof EncodedVideoChunk === "undefined") {

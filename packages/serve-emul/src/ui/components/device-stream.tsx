@@ -85,7 +85,7 @@ export function DeviceStream({
   };
 
   const sendTouch = (action: "down" | "move" | "up", p: Point, pointerId: number) => {
-    send({ type: "touch", action, x: p.x, y: p.y, pointerId }, false);
+    send({ type: "touch", action, x: p.x, y: p.y, pointerId, ack: false });
   };
 
   const flushMove = () => {

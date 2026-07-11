@@ -1,57 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import type {
+  DeviceGridResponse,
+  NightMode,
+  NetworkResponse,
+  OrientationMode,
+} from "../../shared/api-contracts";
+import { apiRequest } from "../lib/api-client";
 
-type GridDeviceKind = "physical" | "emulator" | "avd";
-
-type GridDevice = {
-  id: string;
-  kind: GridDeviceKind;
-  serial: string | null;
-  avd: string | null;
-  name: string;
-  state: string;
-  current: boolean;
-  canSelect: boolean;
-  canStart: boolean;
-  canStop: boolean;
-};
-
-type DeviceGridResponse = {
-  ok?: boolean;
-  currentSerial?: string;
-  sessionStatus?: "streaming" | "stopped" | "error";
-  devices?: GridDevice[];
-  error?: string;
-};
-
-type Orientation = "auto" | "portrait" | "landscape";
-type OrientationResponse = {
-  ok?: boolean;
-  orientation?: { orientation?: Orientation | "unknown"; raw?: string };
-  error?: string;
-};
-
-type NightMode = "auto" | "dark" | "light";
-type NightModeResponse = {
-  ok?: boolean;
-  nightMode?: { mode?: NightMode | "unknown"; raw?: string };
-  error?: string;
-};
-
-type FontScaleResponse = {
-  ok?: boolean;
-  fontScale?: { scale?: number; raw?: string };
-  error?: string;
-};
-
-type NetworkResponse = {
-  ok?: boolean;
-  network?: {
-    enabled?: boolean | null;
-    wifi?: "enabled" | "disabled" | "unknown";
-    mobileData?: "enabled" | "disabled" | "unknown";
-  };
-  error?: string;
-};
+type GridDevice = DeviceGridResponse["devices"][number];
 
 type BusyAction = "select" | "start" | "stop";
 const FONT_SCALE_PRESETS = [0.85, 1, 1.15, 1.3, 1.5] as const;
@@ -65,15 +21,9 @@ export function DevicePanel() {
 
   const refresh = useCallback(async () => {
     try {
-      const res = await fetch("/api/device-grid", { cache: "no-store" });
-      const json = await res.json() as DeviceGridResponse;
-      if (!json.ok || !json.devices) {
-        setDevices([]);
-        setStatus(json.error || "Unavailable");
-        return;
-      }
+      const json = await apiRequest("/api/device-grid", { method: "GET", cache: "no-store" });
       setDevices(json.devices);
-      setSessionStatus(json.sessionStatus ?? "streaming");
+      setSessionStatus(json.sessionStatus);
       const running = json.devices.filter((device) => device.serial && device.state === "device").length;
       setStatus(`${running}/${json.devices.length} ready`);
     } catch (err) {
@@ -87,25 +37,23 @@ export function DevicePanel() {
       setBusy((current) => ({ ...current, [device.id]: action }));
       setStatus(action === "select" ? "Switching..." : action === "start" ? "Starting..." : "Stopping...");
       try {
-        const endpoint =
-          action === "select"
-            ? "/api/devices/select"
-            : action === "start"
-              ? "/api/avds/start"
-              : "/api/avds/stop";
-        const body =
-          action === "select"
-            ? { serial: device.serial }
-            : action === "start"
-              ? { avd: device.avd ?? device.name }
-              : { serial: device.serial, avd: device.avd ?? undefined };
-        const res = await fetch(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const json = await res.json() as { ok?: boolean; error?: string };
-        if (!json.ok) throw new Error(json.error || "Action failed");
+        if (action === "select") {
+          if (!device.serial) throw new Error("Device serial is unavailable");
+          await apiRequest("/api/devices/select", {
+            method: "POST",
+            body: { serial: device.serial },
+          });
+        } else if (action === "start") {
+          await apiRequest("/api/avds/start", {
+            method: "POST",
+            body: { avd: device.avd ?? device.name },
+          });
+        } else {
+          await apiRequest("/api/avds/stop", {
+            method: "POST",
+            body: { serial: device.serial ?? undefined, avd: device.avd ?? undefined },
+          });
+        }
         await refresh();
       } catch (err) {
         setStatus(err instanceof Error ? err.message : String(err));
@@ -175,19 +123,13 @@ export function DevicePanel() {
 }
 
 export function OrientationPanel() {
-  const [orientation, setOrientation] = useState<Orientation | "unknown">("unknown");
+  const [orientation, setOrientation] = useState<OrientationMode | "unknown">("unknown");
   const [orientationStatus, setOrientationStatus] = useState("Loading...");
 
   const refreshOrientation = useCallback(async () => {
     try {
-      const res = await fetch("/api/orientation", { cache: "no-store" });
-      const json = await res.json() as OrientationResponse;
-      if (!json.ok || !json.orientation) {
-        setOrientation("unknown");
-        setOrientationStatus(json.error || "Unavailable");
-        return;
-      }
-      const next = json.orientation.orientation ?? "unknown";
+      const json = await apiRequest("/api/orientation", { method: "GET", cache: "no-store" });
+      const next = json.orientation.orientation;
       setOrientation(next);
       setOrientationStatus(next === "unknown" ? json.orientation.raw || "Unknown" : next);
     } catch (err) {
@@ -196,20 +138,14 @@ export function OrientationPanel() {
     }
   }, []);
 
-  const setDeviceOrientation = useCallback(async (next: Orientation) => {
+  const setDeviceOrientation = useCallback(async (next: OrientationMode) => {
     setOrientationStatus("Applying...");
     try {
-      const res = await fetch("/api/orientation", {
+      const json = await apiRequest("/api/orientation", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ orientation: next }),
+        body: { orientation: next },
       });
-      const json = await res.json() as OrientationResponse;
-      if (!json.ok || !json.orientation) {
-        setOrientationStatus(json.error || "Failed");
-        return;
-      }
-      const applied = json.orientation.orientation ?? "unknown";
+      const applied = json.orientation.orientation;
       setOrientation(applied);
       setOrientationStatus(applied === "unknown" ? json.orientation.raw || "Unknown" : applied);
     } catch (err) {
@@ -257,14 +193,8 @@ export function NightModePanel() {
 
   const refreshNightMode = useCallback(async () => {
     try {
-      const res = await fetch("/api/night-mode", { cache: "no-store" });
-      const json = await res.json() as NightModeResponse;
-      if (!json.ok || !json.nightMode) {
-        setNightMode("unknown");
-        setNightModeStatus(json.error || "Unavailable");
-        return;
-      }
-      const next = json.nightMode.mode ?? "unknown";
+      const json = await apiRequest("/api/night-mode", { method: "GET", cache: "no-store" });
+      const next = json.nightMode.mode;
       setNightMode(next);
       setNightModeStatus(next === "unknown" ? json.nightMode.raw || "Unknown" : next);
     } catch (err) {
@@ -276,17 +206,11 @@ export function NightModePanel() {
   const setDeviceNightMode = useCallback(async (next: NightMode) => {
     setNightModeStatus("Applying...");
     try {
-      const res = await fetch("/api/night-mode", {
+      const json = await apiRequest("/api/night-mode", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: next }),
+        body: { mode: next },
       });
-      const json = await res.json() as NightModeResponse;
-      if (!json.ok || !json.nightMode) {
-        setNightModeStatus(json.error || "Failed");
-        return;
-      }
-      const applied = json.nightMode.mode ?? "unknown";
+      const applied = json.nightMode.mode;
       setNightMode(applied);
       setNightModeStatus(applied === "unknown" ? json.nightMode.raw || "Unknown" : applied);
     } catch (err) {
@@ -334,13 +258,7 @@ export function FontScalePanel() {
 
   const refreshFontScale = useCallback(async () => {
     try {
-      const res = await fetch("/api/font-scale", { cache: "no-store" });
-      const json = await res.json() as FontScaleResponse;
-      if (!json.ok || !json.fontScale || typeof json.fontScale.scale !== "number") {
-        setFontScale(null);
-        setFontScaleStatus(json.error || "Unavailable");
-        return;
-      }
+      const json = await apiRequest("/api/font-scale", { method: "GET", cache: "no-store" });
       setFontScale(json.fontScale.scale);
       setFontScaleStatus(`${Math.round(json.fontScale.scale * 100)}%`);
     } catch (err) {
@@ -352,16 +270,10 @@ export function FontScalePanel() {
   const setDeviceFontScale = useCallback(async (next: number) => {
     setFontScaleStatus("Applying...");
     try {
-      const res = await fetch("/api/font-scale", {
+      const json = await apiRequest("/api/font-scale", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ scale: next }),
+        body: { scale: next },
       });
-      const json = await res.json() as FontScaleResponse;
-      if (!json.ok || !json.fontScale || typeof json.fontScale.scale !== "number") {
-        setFontScaleStatus(json.error || "Failed");
-        return;
-      }
       setFontScale(json.fontScale.scale);
       setFontScaleStatus(`${Math.round(json.fontScale.scale * 100)}%`);
     } catch (err) {
@@ -394,7 +306,7 @@ export function FontScalePanel() {
   );
 }
 
-function networkLabel(network: NonNullable<NetworkResponse["network"]>): string {
+function networkLabel(network: NetworkResponse["network"]): string {
   const state = network.enabled === true ? "on" : network.enabled === false ? "off" : "unknown";
   const wifi = network.wifi && network.wifi !== "unknown" ? `wifi ${network.wifi}` : "wifi ?";
   const mobileData =
@@ -408,13 +320,7 @@ export function NetworkPanel() {
 
   const refreshNetwork = useCallback(async () => {
     try {
-      const res = await fetch("/api/network", { cache: "no-store" });
-      const json = await res.json() as NetworkResponse;
-      if (!json.ok || !json.network) {
-        setEnabled(null);
-        setNetworkStatus(json.error || "Unavailable");
-        return;
-      }
+      const json = await apiRequest("/api/network", { method: "GET", cache: "no-store" });
       setEnabled(json.network.enabled ?? null);
       setNetworkStatus(networkLabel(json.network));
     } catch (err) {
@@ -426,16 +332,10 @@ export function NetworkPanel() {
   const setDeviceNetwork = useCallback(async (next: boolean) => {
     setNetworkStatus("Applying...");
     try {
-      const res = await fetch("/api/network", {
+      const json = await apiRequest("/api/network", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: next }),
+        body: { enabled: next },
       });
-      const json = await res.json() as NetworkResponse;
-      if (!json.ok || !json.network) {
-        setNetworkStatus(json.error || "Failed");
-        return;
-      }
       setEnabled(json.network.enabled ?? null);
       setNetworkStatus(networkLabel(json.network));
     } catch (err) {

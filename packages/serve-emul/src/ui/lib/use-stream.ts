@@ -1,10 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
-import type { StreamStats } from "./stream-worker";
+import {
+  parseHealthResponse,
+  type DeviceSize,
+  type HealthResponse,
+} from "../../shared/api-contracts";
+import type { WsClientMessage } from "../../shared/websocket-contracts";
+import {
+  parseWorkerEvent,
+  type StreamStats,
+  type WorkerCommand,
+} from "../../shared/worker-contracts";
 
-export type DeviceSize = { width: number; height: number };
-
-export type { StreamStats };
+export type { DeviceSize, StreamStats };
 
 export type StreamState = {
   status: string;
@@ -13,20 +21,7 @@ export type StreamState = {
   stats: StreamStats | null;
 };
 
-export type Sender = (msg: Record<string, unknown>, ack?: boolean) => void;
-
-type ApiInfo = {
-  size: DeviceSize;
-  status?: "streaming" | "stopped" | "error";
-  lastFrameAt?: string | null;
-  lastError?: string | null;
-};
-
-type WorkerEvent =
-  | { type: "status"; status: string }
-  | { type: "session"; size: DeviceSize }
-  | { type: "rendered" }
-  | { type: "stats"; stats: StreamStats };
+export type Sender = (message: WsClientMessage) => void;
 
 // A canvas can transfer control to an OffscreenCanvas only once, so the worker
 // that received it must be reused if the effect re-runs for the same element.
@@ -41,11 +36,12 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
   });
   const workerRef = useRef<Worker | null>(null);
 
-  const send = useCallback<Sender>((msg, ack = true) => {
-    workerRef.current?.postMessage({
+  const send = useCallback<Sender>((message) => {
+    const command: WorkerCommand = {
       type: "send",
-      text: JSON.stringify(ack ? msg : { ...msg, ack: false }),
-    });
+      text: JSON.stringify(message),
+    };
+    workerRef.current?.postMessage(command);
   }, []);
 
   useEffect(() => {
@@ -71,29 +67,47 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
       worker = new Worker(new URL("./stream-worker.ts", import.meta.url), { type: "module" });
       workerByCanvas.set(canvas, worker);
       const offscreen = canvas.transferControlToOffscreen();
-      worker.postMessage({ type: "init", canvas: offscreen, url }, [offscreen]);
+      const command: WorkerCommand<OffscreenCanvas> = {
+        type: "init",
+        canvas: offscreen,
+        url,
+      };
+      worker.postMessage(command, [offscreen]);
     } else {
-      worker.postMessage({ type: "connect" });
+      worker.postMessage({ type: "connect" } satisfies WorkerCommand);
     }
     workerRef.current = worker;
 
     const onMessage = (e: MessageEvent) => {
       if (cancelled) return;
-      const msg = e.data as WorkerEvent;
-      if (msg.type === "status") {
-        setStatus(msg.status);
-      } else if (msg.type === "session") {
-        setState((s) => ({ ...s, deviceSize: msg.size }));
-      } else if (msg.type === "rendered") {
-        hasRenderedFrame = true;
-      } else if (msg.type === "stats") {
-        if (msg.stats.rendered) hasRenderedFrame = true;
-        setState((s) => ({ ...s, fps: msg.stats.fps, stats: msg.stats }));
+      try {
+        const message = parseWorkerEvent(e.data);
+        switch (message.type) {
+          case "status":
+            setStatus(message.status);
+            break;
+          case "session":
+            setState((state) => ({ ...state, deviceSize: message.size }));
+            break;
+          case "rendered":
+            hasRenderedFrame = true;
+            break;
+          case "stats":
+            if (message.stats.rendered) hasRenderedFrame = true;
+            setState((state) => ({
+              ...state,
+              fps: message.stats.fps,
+              stats: message.stats,
+            }));
+            break;
+        }
+      } catch {
+        setStatus("invalid worker message");
       }
     };
     worker.addEventListener("message", onMessage);
 
-    const applyServerStatus = (d: ApiInfo) => {
+    const applyServerStatus = (d: HealthResponse) => {
       const lastFrameAgeMs = d.lastFrameAt ? Date.now() - Date.parse(d.lastFrameAt) : Infinity;
       setState((s) => ({
         ...s,
@@ -112,7 +126,8 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
     };
 
     fetch("/health")
-      .then((r) => r.json() as Promise<ApiInfo>)
+      .then((response) => response.json())
+      .then(parseHealthResponse)
       .then((d) => {
         if (!cancelled) applyServerStatus(d);
       })
@@ -122,7 +137,8 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
 
     healthTimer = setInterval(() => {
       fetch("/health")
-        .then((r) => r.json() as Promise<ApiInfo>)
+        .then((response) => response.json())
+        .then(parseHealthResponse)
         .then((d) => {
           if (!cancelled) applyServerStatus(d);
         })
@@ -135,7 +151,7 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
       cancelled = true;
       if (healthTimer) clearInterval(healthTimer);
       worker.removeEventListener("message", onMessage);
-      worker.postMessage({ type: "stop" });
+      worker.postMessage({ type: "stop" } satisfies WorkerCommand);
       workerRef.current = null;
     };
   }, [canvasRef]);

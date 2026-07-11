@@ -1,37 +1,15 @@
 import { execText } from "./exec.ts";
+import type {
+  AccessibilityNode,
+  AccessibilitySelector,
+  AccessibilitySnapshot,
+} from "./shared/api-contracts.ts";
 
-export type AccessibilityNode = {
-  id: string;
-  text: string;
-  contentDescription: string;
-  resourceId: string;
-  className: string;
-  packageName: string;
-  clickable: boolean;
-  enabled: boolean;
-  bounds: { left: number; top: number; right: number; bottom: number };
-};
-
-export type AccessibilitySnapshot = {
-  ok: true;
-  capturedAt: string;
-  nodes: AccessibilityNode[];
-};
-
-export type AccessibilitySelector = {
-  id?: string;
-  text?: string;
-  textContains?: string;
-  contentDescription?: string;
-  contentDescriptionContains?: string;
-  resourceId?: string;
-  resourceIdContains?: string;
-  className?: string;
-  packageName?: string;
-  clickable?: boolean;
-  enabled?: boolean;
-  index?: number;
-};
+export type {
+  AccessibilityNode,
+  AccessibilitySelector,
+  AccessibilitySnapshot,
+} from "./shared/api-contracts.ts";
 
 const SELECTOR_STRING_FIELDS = [
   "id",
