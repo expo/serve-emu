@@ -129,6 +129,15 @@ Open `http://localhost:3300` after starting the CLI. The UI streams the device i
 - Orientation, night mode, font scale, network, GPS location, and route playback
 - Logcat filtering, pause/copy controls, app management, file import, and session replay
 
+The browser decoder treats every WebSocket reconnect, device video session, and
+hard decoder recovery as a new stream generation. Codec, latency, frame counts,
+and rendered state are cleared at each boundary; the UI reports `streaming`
+only after a frame from the current generation reaches the canvas. A connected
+session with no frame becomes `waiting for video`, while fresh packets that do
+not produce frames become `stream stalled`. Late events from older generations
+are ignored. Input sent while the video WebSocket is disconnected is dropped
+instead of being replayed against a later device session.
+
 ## HTTP API
 
 All examples assume the default port:
