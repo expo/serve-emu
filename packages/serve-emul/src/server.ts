@@ -70,7 +70,19 @@ import {
   type GeoFix,
 } from "./location.ts";
 import { parseRoutePlaybackRequest, RoutePlayback } from "./route-playback.ts";
-import { SessionRecorder } from "./session-recorder.ts";
+import {
+  parseSessionReplayMultiplier,
+  SessionRecorder,
+  SessionReplayConflictError,
+} from "./session-recorder.ts";
+import {
+  clearSessionReplayResponse,
+  sessionReplayErrorResponse,
+  startSessionReplayResponse,
+  stopSessionReplayResponse,
+} from "./session-replay-api.ts";
+import { createSessionReplayHandlers } from "./session-replay-session.ts";
+import { disposeReplayBefore } from "./session-replay-lifecycle.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -377,10 +389,20 @@ export async function startServer(opts: ServerOpts) {
     stoppedAt = new Date().toISOString();
     if (!terminalCleanupDone) {
       terminalCleanupDone = true;
+      const terminalRecorder = sessionRecorder;
+      const terminalRoute = routePlayback;
+      const terminalSession = session;
       if (watchdog) clearInterval(watchdog);
-      routePlayback.close();
-      session.close();
       closeClients(nextStatus === "error" ? 1011 : 1000, reason);
+      void disposeReplayBefore({
+        recorder: terminalRecorder,
+        stopRoute: () => terminalRoute.close(),
+        afterReplayStopped: () => {
+          try {
+            terminalSession.close();
+          } catch {}
+        },
+      });
     }
   };
 
@@ -958,37 +980,53 @@ export async function startServer(opts: ServerOpts) {
       throw new Error(`${serial} is ${device.state}, not ready.`);
 
     const nextSession = await openScrcpy(serial);
+    const previousRecorder = sessionRecorder;
+    const previousRoute = routePlayback;
     const previousSession = session;
-    sessionGeneration++;
-    closeClients(1012, "device switched");
-    try {
-      previousSession.close();
-    } catch {}
-    currentSerial = serial;
-    session = nextSession;
-    resetSessionStats(nextSession);
-    startFramePump(nextSession, sessionGeneration);
-    attachSessionHandlers(nextSession, sessionGeneration);
-    console.log(
-      `scrcpy ready: ${nextSession.meta.deviceName} • ${nextSession.meta.codecId} • ${nextSession.meta.width}×${nextSession.meta.height}`,
-    );
-    return {
-      ok: true,
-      serial: currentSerial,
-      device: nextSession.meta.deviceName,
-    };
+    return disposeReplayBefore({
+      recorder: previousRecorder,
+      stopRoute: () => previousRoute.close(),
+      afterReplayStopped: () => {
+        sessionGeneration++;
+        closeClients(1012, "device switched");
+        try {
+          previousSession.close();
+        } catch {}
+        currentSerial = serial;
+        session = nextSession;
+        resetSessionStats(nextSession);
+        startFramePump(nextSession, sessionGeneration);
+        attachSessionHandlers(nextSession, sessionGeneration);
+        console.log(
+          `scrcpy ready: ${nextSession.meta.deviceName} • ${nextSession.meta.codecId} • ${nextSession.meta.width}×${nextSession.meta.height}`,
+        );
+        return {
+          ok: true,
+          serial: currentSerial,
+          device: nextSession.meta.deviceName,
+        };
+      },
+    });
   };
 
-  const stopCurrentSession = (reason: string) => {
-    sessionGeneration++;
+  const stopCurrentSession = async (reason: string) => {
+    const stoppedRecorder = sessionRecorder;
+    const stoppedRoute = routePlayback;
+    const stoppedSession = session;
     status = "stopped";
     lastError = reason;
     stoppedAt = new Date().toISOString();
-    routePlayback.close();
     closeClients(1000, reason);
-    try {
-      session.close();
-    } catch {}
+    await disposeReplayBefore({
+      recorder: stoppedRecorder,
+      stopRoute: () => stoppedRoute.close(),
+      afterReplayStopped: () => {
+        sessionGeneration++;
+        try {
+          stoppedSession.close();
+        } catch {}
+      },
+    });
   };
 
   startFramePump(session, sessionGeneration);
@@ -1215,7 +1253,7 @@ export async function startServer(opts: ServerOpts) {
           if (!/^emulator-\d+$/.test(serial))
             throw new Error(`${serial} is not an emulator`);
           if (serial === currentSerial)
-            stopCurrentSession("current emulator stopped");
+            await stopCurrentSession("current emulator stopped");
           await stopEmulator(serial);
           return Response.json({ ok: true, serial });
         } catch (err) {
@@ -1539,54 +1577,78 @@ export async function startServer(opts: ServerOpts) {
         if (req.method === "GET")
           return Response.json(sessionRecorder.snapshot());
         if (req.method === "DELETE")
-          return Response.json({ ok: true, session: sessionRecorder.clear() });
+          return clearSessionReplayResponse(sessionRecorder);
         return new Response("method not allowed", { status: 405 });
       }
 
       if (url.pathname === "/api/session/replay") {
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
+        const replayRecorder = sessionRecorder;
+        const replayAdmissionEpoch = replayRecorder.replayAdmissionEpoch;
+        const replayGeneration = sessionGeneration;
+        const replaySession = session;
+        const replayScreen = { ...screen };
+        const replaySerial = currentSerial;
+        const replayRoute = routePlayback;
+        let multiplier: number;
         try {
           const payload = await readJsonBody(req);
-          const multiplier =
-            typeof payload === "object" &&
-            payload !== null &&
-            !Array.isArray(payload)
-              ? Number((payload as Record<string, unknown>).multiplier ?? 1)
-              : 1;
-          const replay = sessionRecorder.replay(
-            {
-              dispatchGesture: (gesture) =>
-                dispatchGesture(gesture, "session:replay", false),
-              setLocation: async (fix) => {
-                await applyLocation(fix, "session:replay", false);
-              },
-            },
-            multiplier,
-          );
-          void replay.catch(() => {});
-          return Response.json({
-            ok: true,
-            session: sessionRecorder.snapshot(),
-          });
+          multiplier = parseSessionReplayMultiplier(payload);
         } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
+          return sessionReplayErrorResponse(err, 400);
         }
+        const isCurrentReplaySession = () =>
+          replayAdmissionEpoch === replayRecorder.replayAdmissionEpoch &&
+          replayGeneration === sessionGeneration &&
+          replayRecorder === sessionRecorder &&
+          replaySession === session;
+        const handlers = createSessionReplayHandlers({
+          generation: replayGeneration,
+          getGeneration: () => sessionGeneration,
+          dispatchGesture: (gesture) =>
+            dispatch(replaySession.controlSocket, gesture, replayScreen),
+          setLocation: async (fix, signal) => {
+            replayRoute.stop();
+            await setEmulatorLocationAsync(replaySerial, fix);
+            if (signal.aborted) {
+              throw signal.reason instanceof Error
+                ? signal.reason
+                : new DOMException("session replay cancelled", "AbortError");
+            }
+            if (!isCurrentReplaySession()) {
+              throw new SessionReplayConflictError(
+                "device session changed during session replay",
+              );
+            }
+            lastLocation = { ...fix, appliedAt: new Date().toISOString() };
+          },
+        });
+        return startSessionReplayResponse(
+          replayRecorder,
+          handlers,
+          multiplier,
+          isCurrentReplaySession,
+        );
       }
 
       if (url.pathname === "/api/session/replay/stop") {
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
-        return Response.json({
-          ok: true,
-          session: sessionRecorder.stopReplay(),
-        });
+        const stoppedRecorder = sessionRecorder;
+        const stoppedGeneration = sessionGeneration;
+        const response = await stopSessionReplayResponse(stoppedRecorder);
+        if (
+          stoppedGeneration !== sessionGeneration ||
+          stoppedRecorder !== sessionRecorder
+        ) {
+          return sessionReplayErrorResponse(
+            new SessionReplayConflictError(
+              "device session changed while stopping session replay",
+            ),
+          );
+        }
+        return response;
       }
 
       if (url.pathname === "/api/apps/install") {
@@ -1795,18 +1857,30 @@ export async function startServer(opts: ServerOpts) {
     },
   });
 
-  const stop = () => {
-    if (stopRequested) return;
+  let stopTask: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopTask) return stopTask;
     stopRequested = true;
+    const stoppedRecorder = sessionRecorder;
+    const stoppedRoute = routePlayback;
+    const stoppedSession = session;
     if (status === "streaming") {
       status = "stopped";
       stoppedAt = new Date().toISOString();
     }
     closeClients(1001, "server stopping");
     if (watchdog) clearInterval(watchdog);
-    routePlayback.close();
     server.stop(true);
-    session.close();
+    stopTask = disposeReplayBefore({
+      recorder: stoppedRecorder,
+      stopRoute: () => stoppedRoute.close(),
+      afterReplayStopped: () => {
+        try {
+          stoppedSession.close();
+        } catch {}
+      },
+    });
+    return stopTask;
   };
 
   return { server, session, stop };

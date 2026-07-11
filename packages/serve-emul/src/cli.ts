@@ -190,17 +190,18 @@ async function main() {
     throw err;
   });
 
-  const stop = () => {
-    stopServer();
-    emulatorLaunch?.stop();
+  const stop = async () => {
+    try {
+      await stopServer();
+    } finally {
+      emulatorLaunch?.stop();
+    }
   };
   process.once("SIGINT", () => {
-    stop();
-    process.exit(0);
+    void stop().finally(() => process.exit(0));
   });
   process.once("SIGTERM", () => {
-    stop();
-    process.exit(0);
+    void stop().finally(() => process.exit(0));
   });
 
   const base = `http://${displayHost(host)}:${server.port}`;
