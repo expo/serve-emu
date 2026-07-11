@@ -71,6 +71,11 @@ import {
 } from "./location.ts";
 import { parseRoutePlaybackRequest, RoutePlayback } from "./route-playback.ts";
 import { SessionRecorder } from "./session-recorder.ts";
+import {
+  SessionRecoveryWatchdog,
+  SYSTEM_RECOVERY_WATCHDOG_CLOCK,
+  type RecoveryWatchdogClock,
+} from "./session-recovery-watchdog.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -139,7 +144,13 @@ type DeviceGridResponse = {
   devices: GridDevice[];
 };
 
-type WsData = { id: number; frameMeta: boolean; handle?: Client };
+type WsData = {
+  id: number;
+  frameMeta: boolean;
+  generation: number;
+  recovery: SessionRecoveryWatchdog<Client>;
+  handle?: Client;
+};
 
 type Client = {
   id: number;
@@ -149,6 +160,9 @@ type Client = {
   droppedFrames: number;
   backpressureEvents: number;
   awaitingKeyFrame: boolean;
+  awaitingKeyFrameSinceMs: number | null;
+  lastKeyFrameRequestMs: number | null;
+  recovery: SessionRecoveryWatchdog<Client>;
 };
 
 const MAX_WS_MESSAGE_BYTES = 16 * 1024;
@@ -158,14 +172,30 @@ const CLOSE_CLIENT_BUFFERED_BYTES = 16 * 1024 * 1024;
 const FRAME_STAT_WINDOW = 240;
 const VIDEO_RESET_COOLDOWN_MS = 500;
 const FIRST_FRAME_RESET_MS = 5000;
+const SOURCE_STALL_RESET_MS = 2500;
 const AWAITING_KEYFRAME_RESET_MS = 2500;
 const MAX_JSON_BODY_BYTES = 8 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_LOGCAT_QUERY_BYTES = 200;
 
-export async function startServer(opts: ServerOpts) {
+export type ServerDependencies = {
+  startScrcpy?: typeof startScrcpy;
+  listAllDevices?: typeof listAllDevices;
+  serve?: typeof Bun.serve;
+  recoveryClock?: RecoveryWatchdogClock;
+};
+
+export async function startServer(
+  opts: ServerOpts,
+  dependencies: ServerDependencies = {},
+) {
+  const startScrcpySession = dependencies.startScrcpy ?? startScrcpy;
+  const loadDevices = dependencies.listAllDevices ?? listAllDevices;
+  const serve = dependencies.serve ?? Bun.serve;
+  const recoveryClock =
+    dependencies.recoveryClock ?? SYSTEM_RECOVERY_WATCHDOG_CLOCK;
   const openScrcpy = (serial: string) =>
-    startScrcpy({
+    startScrcpySession({
       serial,
       maxFps: opts.maxFps,
       bitRate: opts.bitRate,
@@ -222,7 +252,7 @@ export async function startServer(opts: ServerOpts) {
     width: session.meta.width,
     height: session.meta.height,
   };
-  let startedMs = Date.now();
+  let startedMs = recoveryClock.now();
   let startedAt = new Date(startedMs).toISOString();
   let status: SessionStatus = "streaming";
   let lastError: string | null = null;
@@ -235,17 +265,13 @@ export async function startServer(opts: ServerOpts) {
   let stopRequested = false;
   let frameCount = 0;
   let configPacketCount = 0;
-  let lastFrameMs = 0;
   let totalDroppedFrames = 0;
   let totalBackpressureEvents = 0;
-  let sourceFps = 0;
-  let lastFpsFrameCount = 0;
   const frameStats = new FrameStatWindow(FRAME_STAT_WINDOW);
   let videoResetRequests = 0;
   let lastVideoResetAt: string | null = null;
   let lastVideoResetReason: string | null = null;
-  let lastVideoResetMs = 0;
-  let watchdog: ReturnType<typeof setInterval> | null = null;
+  let recovery: SessionRecoveryWatchdog<Client> | null = null;
   let lastLocation: (GeoFix & { appliedAt: string }) | null = null;
   const createRoutePlayback = () =>
     new RoutePlayback({
@@ -264,42 +290,77 @@ export async function startServer(opts: ServerOpts) {
   let accessibilitySnapshotInFlight: Promise<AccessibilitySnapshot> | null =
     null;
 
-  const health = () => ({
-    ok: status === "streaming",
-    status,
-    serial: currentSerial,
-    device: session.meta.deviceName,
-    codec: session.meta.codecId,
-    size: { width: screen.width, height: screen.height },
-    clients: clients.size,
-    frames: frameCount,
-    sourceFps,
-    frameStats: frameStats.summary(),
-    configPackets: configPacketCount,
-    droppedFrames: totalDroppedFrames,
-    backpressureEvents: totalBackpressureEvents,
-    videoResetRequests,
-    lastVideoResetAt,
-    lastVideoResetReason,
-    location: lastLocation,
-    route: routePlayback.snapshot(),
-    session: sessionRecorder.snapshot(),
-    clientsDetail: Array.from(clients, (client) => ({
-      id: client.id,
-      frameMeta: client.frameMeta,
-      sentFrames: client.sentFrames,
-      droppedFrames: client.droppedFrames,
-      backpressureEvents: client.backpressureEvents,
-      bufferedBytes: client.ws.getBufferedAmount(),
-      awaitingKeyFrame: client.awaitingKeyFrame,
-    })),
-    startedAt,
-    stoppedAt,
-    lastFrameAt: lastFrameMs > 0 ? new Date(lastFrameMs).toISOString() : null,
-    lastError,
-    lastErrorCode,
-    lastErrorMeta,
-  });
+  const health = () => {
+    const now = recoveryClock.now();
+    const recoverySnapshot = recovery?.snapshot(now) ?? {
+      sourceFps: 0,
+      lastFrameMs: null,
+      sourceFrameAgeMs: Math.max(0, now - startedMs),
+      awaitingClients: 0,
+      oldestAwaitingAgeMs: null,
+      lastResetAttemptMs: null,
+    };
+    return {
+      ok: status === "streaming",
+      status,
+      serial: currentSerial,
+      device: session.meta.deviceName,
+      codec: session.meta.codecId,
+      size: { width: screen.width, height: screen.height },
+      clients: clients.size,
+      frames: frameCount,
+      sourceFps: recoverySnapshot.sourceFps,
+      sourceFrameAgeMs: recoverySnapshot.sourceFrameAgeMs,
+      keyFrameRecovery: {
+        awaitingClients: recoverySnapshot.awaitingClients,
+        oldestAwaitingAgeMs: recoverySnapshot.oldestAwaitingAgeMs,
+        lastResetAttemptAt:
+          recoverySnapshot.lastResetAttemptMs === null
+            ? null
+            : new Date(recoverySnapshot.lastResetAttemptMs).toISOString(),
+      },
+      frameStats: frameStats.summary(),
+      configPackets: configPacketCount,
+      droppedFrames: totalDroppedFrames,
+      backpressureEvents: totalBackpressureEvents,
+      videoResetRequests,
+      lastVideoResetAt,
+      lastVideoResetReason,
+      location: lastLocation,
+      route: routePlayback.snapshot(),
+      session: sessionRecorder.snapshot(),
+      clientsDetail: Array.from(clients, (client) => ({
+        id: client.id,
+        frameMeta: client.frameMeta,
+        sentFrames: client.sentFrames,
+        droppedFrames: client.droppedFrames,
+        backpressureEvents: client.backpressureEvents,
+        bufferedBytes: client.ws.getBufferedAmount(),
+        awaitingKeyFrame: client.awaitingKeyFrame,
+        awaitingKeyFrameSinceAt:
+          client.awaitingKeyFrameSinceMs === null
+            ? null
+            : new Date(client.awaitingKeyFrameSinceMs).toISOString(),
+        awaitingKeyFrameAgeMs:
+          client.awaitingKeyFrameSinceMs === null
+            ? null
+            : Math.max(0, now - client.awaitingKeyFrameSinceMs),
+        lastKeyFrameRequestAt:
+          client.lastKeyFrameRequestMs === null
+            ? null
+            : new Date(client.lastKeyFrameRequestMs).toISOString(),
+      })),
+      startedAt,
+      stoppedAt,
+      lastFrameAt:
+        recoverySnapshot.lastFrameMs === null
+          ? null
+          : new Date(recoverySnapshot.lastFrameMs).toISOString(),
+      lastError,
+      lastErrorCode,
+      lastErrorMeta,
+    };
+  };
 
   const closeClients = (code: number, reason: string) => {
     for (const c of clients) {
@@ -312,7 +373,7 @@ export async function startServer(opts: ServerOpts) {
 
   const deviceGrid = async (): Promise<DeviceGridResponse> => {
     const [adbDevices, runningAvds, avds] = await Promise.all([
-      listAllDevices(),
+      loadDevices(),
       listRunningAvds(),
       listAvds(),
     ]);
@@ -374,10 +435,10 @@ export async function startServer(opts: ServerOpts) {
     lastError = reason;
     lastErrorCode = detail?.code ?? null;
     lastErrorMeta = detail?.meta ?? null;
-    stoppedAt = new Date().toISOString();
+    stoppedAt = new Date(recoveryClock.now()).toISOString();
     if (!terminalCleanupDone) {
       terminalCleanupDone = true;
-      if (watchdog) clearInterval(watchdog);
+      recovery?.stop();
       routePlayback.close();
       session.close();
       closeClients(nextStatus === "error" ? 1011 : 1000, reason);
@@ -759,23 +820,47 @@ export async function startServer(opts: ServerOpts) {
     }
   };
 
-  const requestVideoReset = (reason: string) => {
-    const now = Date.now();
-    if (now - lastVideoResetMs < VIDEO_RESET_COOLDOWN_MS) return;
-    lastVideoResetMs = now;
-    videoResetRequests++;
-    lastVideoResetAt = new Date(now).toISOString();
-    lastVideoResetReason = reason;
-    try {
-      session.controlSocket.write(resetVideoPacket());
-    } catch {}
-  };
+  const createRecovery = (
+    activeSession: ScrcpySession,
+    generation: number,
+  ) =>
+    new SessionRecoveryWatchdog<Client>({
+      clock: recoveryClock,
+      clients: () => clients,
+      startedMs,
+      intervalMs: 1_000,
+      sessionResetCooldownMs: VIDEO_RESET_COOLDOWN_MS,
+      firstFrameResetMs: FIRST_FRAME_RESET_MS,
+      sourceStallResetMs: SOURCE_STALL_RESET_MS,
+      awaitingKeyFrameResetMs: AWAITING_KEYFRAME_RESET_MS,
+      requestReset: (reason, now) => {
+        if (
+          stopRequested ||
+          status !== "streaming" ||
+          generation !== sessionGeneration ||
+          activeSession !== session
+        ) {
+          return false;
+        }
+        try {
+          // A false return means the socket applied backpressure, but the bytes
+          // were still admitted to its write queue.
+          activeSession.controlSocket.write(resetVideoPacket());
+        } catch {
+          return false;
+        }
+        videoResetRequests++;
+        lastVideoResetAt = new Date(now).toISOString();
+        lastVideoResetReason = reason;
+        return true;
+      },
+    });
 
   const dropUntilKeyFrame = (client: Client) => {
     client.droppedFrames++;
     totalDroppedFrames++;
-    client.awaitingKeyFrame = true;
-    requestVideoReset("client backpressure");
+    client.recovery.markAwaiting(client);
+    client.recovery.requestVideoReset("client backpressure");
   };
 
   const sendFrame = (client: Client, data: Buffer, isKeyFrame: boolean) => {
@@ -785,7 +870,6 @@ export async function startServer(opts: ServerOpts) {
         totalDroppedFrames++;
         return;
       }
-      client.awaitingKeyFrame = false;
     }
 
     const buffered = client.ws.getBufferedAmount();
@@ -800,7 +884,16 @@ export async function startServer(opts: ServerOpts) {
       dropUntilKeyFrame(client);
       return;
     }
-    const sent = client.ws.send(data);
+    let sent: number;
+    try {
+      sent = client.ws.send(data);
+    } catch {
+      clients.delete(client);
+      try {
+        client.ws.close(1011, "frame send failed");
+      } catch {}
+      return;
+    }
     if (sent === -1) {
       client.backpressureEvents++;
       totalBackpressureEvents++;
@@ -812,13 +905,18 @@ export async function startServer(opts: ServerOpts) {
       return;
     }
     client.sentFrames++;
+    if (isKeyFrame) client.recovery.keyFrameAccepted(client);
   };
   // Cache the SPS+PPS bytes that scrcpy emits as a standalone "config" packet
   // and inline them in front of every keyframe so each WS message is a
   // self-contained Access Unit the browser can hand straight to WebCodecs.
   let cachedConfig: Buffer | null = null;
 
-  const startFramePump = (activeSession: ScrcpySession, generation: number) => {
+  const startFramePump = (
+    activeSession: ScrcpySession,
+    generation: number,
+    activeRecovery: SessionRecoveryWatchdog<Client>,
+  ) => {
     cachedConfig = null;
     void (async () => {
       try {
@@ -836,13 +934,13 @@ export async function startServer(opts: ServerOpts) {
               screen.height = f.height;
               cachedConfig = null;
               for (const c of clients) {
-                c.awaitingKeyFrame = true;
+                c.recovery.markAwaiting(c);
                 sendJson(c.ws, {
                   type: "video-session",
                   size: { width: f.width, height: f.height },
                 });
               }
-              requestVideoReset(
+              activeRecovery.requestVideoReset(
                 `video session resized to ${f.width}×${f.height}`,
               );
             }
@@ -854,7 +952,7 @@ export async function startServer(opts: ServerOpts) {
             continue;
           }
           frameCount++;
-          lastFrameMs = Date.now();
+          activeRecovery.recordFrame();
           frameStats.record(f.data.length, f.isKey);
           const config = f.isKey ? cachedConfig : null;
           let rawOut: Buffer | null = null;
@@ -914,7 +1012,7 @@ export async function startServer(opts: ServerOpts) {
   const resetSessionStats = (nextSession: ScrcpySession) => {
     screen.width = nextSession.meta.width;
     screen.height = nextSession.meta.height;
-    startedMs = Date.now();
+    startedMs = recoveryClock.now();
     startedAt = new Date(startedMs).toISOString();
     status = "streaming";
     lastError = null;
@@ -924,16 +1022,12 @@ export async function startServer(opts: ServerOpts) {
     stoppedAt = null;
     frameCount = 0;
     configPacketCount = 0;
-    lastFrameMs = 0;
     totalDroppedFrames = 0;
     totalBackpressureEvents = 0;
-    sourceFps = 0;
-    lastFpsFrameCount = 0;
     frameStats.reset();
     videoResetRequests = 0;
     lastVideoResetAt = null;
     lastVideoResetReason = null;
-    lastVideoResetMs = 0;
     lastLocation = null;
     sessionRecorder = new SessionRecorder();
     routePlayback.close();
@@ -950,7 +1044,7 @@ export async function startServer(opts: ServerOpts) {
         device: session.meta.deviceName,
       };
     }
-    const device = (await listAllDevices()).find(
+    const device = (await loadDevices()).find(
       (candidate) => candidate.serial === serial,
     );
     if (!device) throw new Error(`Unknown adb device "${serial}".`);
@@ -958,8 +1052,16 @@ export async function startServer(opts: ServerOpts) {
       throw new Error(`${serial} is ${device.state}, not ready.`);
 
     const nextSession = await openScrcpy(serial);
+    if (stopRequested) {
+      try {
+        nextSession.close();
+      } catch {}
+      throw new Error("server is stopping");
+    }
     const previousSession = session;
+    const previousRecovery = recovery;
     sessionGeneration++;
+    previousRecovery?.stop();
     closeClients(1012, "device switched");
     try {
       previousSession.close();
@@ -967,8 +1069,11 @@ export async function startServer(opts: ServerOpts) {
     currentSerial = serial;
     session = nextSession;
     resetSessionStats(nextSession);
-    startFramePump(nextSession, sessionGeneration);
+    const nextRecovery = createRecovery(nextSession, sessionGeneration);
+    recovery = nextRecovery;
+    startFramePump(nextSession, sessionGeneration, nextRecovery);
     attachSessionHandlers(nextSession, sessionGeneration);
+    nextRecovery.start();
     console.log(
       `scrcpy ready: ${nextSession.meta.deviceName} • ${nextSession.meta.codecId} • ${nextSession.meta.width}×${nextSession.meta.height}`,
     );
@@ -981,9 +1086,10 @@ export async function startServer(opts: ServerOpts) {
 
   const stopCurrentSession = (reason: string) => {
     sessionGeneration++;
+    recovery?.stop();
     status = "stopped";
     lastError = reason;
-    stoppedAt = new Date().toISOString();
+    stoppedAt = new Date(recoveryClock.now()).toISOString();
     routePlayback.close();
     closeClients(1000, reason);
     try {
@@ -991,29 +1097,14 @@ export async function startServer(opts: ServerOpts) {
     } catch {}
   };
 
-  startFramePump(session, sessionGeneration);
-
-  watchdog = setInterval(() => {
-    sourceFps = frameCount - lastFpsFrameCount;
-    lastFpsFrameCount = frameCount;
-    if (status !== "streaming" || clients.size === 0) return;
-    const now = Date.now();
-    if (frameCount === 0 && now - startedMs > FIRST_FRAME_RESET_MS) {
-      requestVideoReset("first video frame not received");
-      return;
-    }
-    if (
-      Array.from(clients).some((client) => client.awaitingKeyFrame) &&
-      now - (lastFrameMs || startedMs) > AWAITING_KEYFRAME_RESET_MS
-    ) {
-      requestVideoReset("client awaiting keyframe");
-    }
-  }, 1000);
+  recovery = createRecovery(session, sessionGeneration);
+  startFramePump(session, sessionGeneration, recovery);
+  recovery.start();
 
   attachSessionHandlers(session, sessionGeneration);
 
   let nextId = 1;
-  const server = Bun.serve<WsData>({
+  const server = serve<WsData>({
     port: opts.port,
     hostname: host,
     async fetch(req, srv) {
@@ -1093,7 +1184,7 @@ export async function startServer(opts: ServerOpts) {
           return Response.json({
             ok: true,
             currentSerial,
-            devices: (await listAllDevices()).map((device) => ({
+            devices: (await loadDevices()).map((device) => ({
               ...device,
               current: device.serial === currentSerial,
             })),
@@ -1730,14 +1821,26 @@ export async function startServer(opts: ServerOpts) {
       }
 
       if (url.pathname === "/ws") {
-        if (status !== "streaming") {
+        const upgradeRecovery = recovery;
+        if (
+          status !== "streaming" ||
+          !upgradeRecovery ||
+          !upgradeRecovery.running
+        ) {
           return new Response(JSON.stringify(health()), {
             status: 503,
             headers: { "Content-Type": "application/json; charset=utf-8" },
           });
         }
         const frameMeta = url.searchParams.get("frame-meta") === "1";
-        const ok = srv.upgrade(req, { data: { id: nextId++, frameMeta } });
+        const ok = srv.upgrade(req, {
+          data: {
+            id: nextId++,
+            frameMeta,
+            generation: sessionGeneration,
+            recovery: upgradeRecovery,
+          },
+        });
         if (ok) return undefined as unknown as Response;
         return new Response("upgrade failed", { status: 400 });
       }
@@ -1751,6 +1854,15 @@ export async function startServer(opts: ServerOpts) {
     },
     websocket: {
       open(ws) {
+        const activeRecovery = ws.data.recovery;
+        if (
+          activeRecovery !== recovery ||
+          ws.data.generation !== sessionGeneration ||
+          !activeRecovery.running
+        ) {
+          ws.close(1012, "device session changed");
+          return;
+        }
         const handle: Client = {
           id: ws.data.id,
           ws,
@@ -1758,11 +1870,15 @@ export async function startServer(opts: ServerOpts) {
           sentFrames: 0,
           droppedFrames: 0,
           backpressureEvents: 0,
-          awaitingKeyFrame: true,
+          awaitingKeyFrame: false,
+          awaitingKeyFrameSinceMs: null,
+          lastKeyFrameRequestMs: null,
+          recovery: activeRecovery,
         };
         clients.add(handle);
         ws.data.handle = handle;
-        requestVideoReset("client opened");
+        activeRecovery.markAwaiting(handle);
+        activeRecovery.requestVideoReset("client opened");
       },
       message(ws, raw) {
         if (typeof raw !== "string") return;
@@ -1771,11 +1887,18 @@ export async function startServer(opts: ServerOpts) {
           return;
         }
         try {
+          if (
+            ws.data.generation !== sessionGeneration ||
+            ws.data.recovery !== recovery ||
+            !ws.data.recovery.running
+          ) {
+            throw new Error("device session changed");
+          }
           if (status !== "streaming") throw new Error(`session is ${status}`);
           const payload = JSON.parse(raw);
           const acknowledge = wantsAck(payload);
           if (isResetVideoRequest(payload)) {
-            requestVideoReset("client requested keyframe");
+            ws.data.recovery.requestVideoReset("client requested keyframe");
             if (acknowledge) sendJson(ws, { ok: true });
             return;
           }
@@ -1800,10 +1923,10 @@ export async function startServer(opts: ServerOpts) {
     stopRequested = true;
     if (status === "streaming") {
       status = "stopped";
-      stoppedAt = new Date().toISOString();
+      stoppedAt = new Date(recoveryClock.now()).toISOString();
     }
     closeClients(1001, "server stopping");
-    if (watchdog) clearInterval(watchdog);
+    recovery?.stop();
     routePlayback.close();
     server.stop(true);
     session.close();
