@@ -267,16 +267,32 @@ curl -X DELETE "$BASE/api/route"
 
 ### Sessions
 
-REST and WebSocket input events are recorded by default. Add `"record":false` to supported input payloads when an event should not be saved.
+REST and WebSocket input events are recorded by default. Add `"record":false`
+to supported input payloads when an event should not be saved. History uses a
+2,000-event, 1 MiB circular retention budget; `/health` contains only its
+compact count/byte/replay summary. Text is normalized to scrcpy's 300-byte
+UTF-8 control limit before both dispatch and recording.
 
 ```sh
-curl "$BASE/api/session"
+curl "$BASE/api/session?limit=6"
+curl "$BASE/api/session?limit=50&before=1200"
+curl "$BASE/api/session/export"
 curl -X POST "$BASE/api/session/replay" \
   -H 'Content-Type: application/json' \
   -d '{"multiplier":2}'
 curl -X POST "$BASE/api/session/replay/stop"
 curl -X DELETE "$BASE/api/session"
 ```
+
+Session pages are returned in chronological order with an exclusive
+`nextBefore` cursor and `hasMore` flag. The bounded full history is serialized
+only by the explicit export endpoint (and by the UI's Copy action), rather than
+on every poll. The UI requests only its six visible recent events and pauses
+polling while the Session panel or browser tab is hidden. `/health` exposes the
+last/max UTF-8 response bytes and JSON serialization time for health, session
+page, and export responses under `responseMetrics`. The health entry describes
+the previous completed `/health` response because the current body is measured
+after it is serialized.
 
 ### Apps And Files
 

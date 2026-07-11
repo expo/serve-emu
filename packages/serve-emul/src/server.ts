@@ -34,6 +34,7 @@ import {
 } from "./app-management.ts";
 import { getForegroundApp } from "./app-info.ts";
 import { FrameStatWindow } from "./frame-stat-window.ts";
+import { JsonResponseTracker } from "./json-response.ts";
 import {
   isAbnormalExit,
   procExitDetail,
@@ -70,6 +71,7 @@ import {
   type GeoFix,
 } from "./location.ts";
 import { parseRoutePlaybackRequest, RoutePlayback } from "./route-playback.ts";
+import { parseSessionPageQuery } from "./session-api.ts";
 import { SessionRecorder } from "./session-recorder.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -256,6 +258,9 @@ export async function startServer(opts: ServerOpts) {
     });
   let sessionRecorder = new SessionRecorder();
   let routePlayback = createRoutePlayback();
+  const responseMetrics = new JsonResponseTracker(
+    ["health", "sessionPage", "sessionExport"] as const,
+  );
   let sessionGeneration = 0;
   let accessibilitySnapshotCache: {
     snapshot: AccessibilitySnapshot;
@@ -283,7 +288,8 @@ export async function startServer(opts: ServerOpts) {
     lastVideoResetReason,
     location: lastLocation,
     route: routePlayback.snapshot(),
-    session: sessionRecorder.snapshot(),
+    session: sessionRecorder.summary(),
+    responseMetrics: responseMetrics.snapshot(),
     clientsDetail: Array.from(clients, (client) => ({
       id: client.id,
       frameMeta: client.frameMeta,
@@ -1432,7 +1438,9 @@ export async function startServer(opts: ServerOpts) {
       }
 
       if (url.pathname === "/health") {
-        return Response.json(health(), {
+        // Health includes the preceding response metrics; this response is
+        // measured immediately after serialization to avoid recursive sizing.
+        return responseMetrics.response("health", health(), {
           status: status === "streaming" ? 200 : 503,
         });
       }
@@ -1536,11 +1544,36 @@ export async function startServer(opts: ServerOpts) {
       }
 
       if (url.pathname === "/api/session") {
-        if (req.method === "GET")
-          return Response.json(sessionRecorder.snapshot());
-        if (req.method === "DELETE")
+        if (req.method === "GET") {
+          try {
+            return responseMetrics.response(
+              "sessionPage",
+              sessionRecorder.page(parseSessionPageQuery(url.searchParams)),
+            );
+          } catch (err) {
+            return Response.json(
+              {
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              },
+              { status: 400 },
+            );
+          }
+        }
+        if (req.method === "DELETE") {
           return Response.json({ ok: true, session: sessionRecorder.clear() });
+        }
         return new Response("method not allowed", { status: 405 });
+      }
+
+      if (url.pathname === "/api/session/export") {
+        if (req.method !== "GET") {
+          return new Response("method not allowed", { status: 405 });
+        }
+        return responseMetrics.response(
+          "sessionExport",
+          sessionRecorder.export(),
+        );
       }
 
       if (url.pathname === "/api/session/replay") {
@@ -1567,7 +1600,7 @@ export async function startServer(opts: ServerOpts) {
           void replay.catch(() => {});
           return Response.json({
             ok: true,
-            session: sessionRecorder.snapshot(),
+            session: sessionRecorder.summary(),
           });
         } catch (err) {
           return Response.json(

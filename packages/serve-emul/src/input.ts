@@ -43,7 +43,7 @@ export type Gesture =
 
 export type Screen = { width: number; height: number };
 
-const MAX_TEXT_BYTES = 300;
+export const MAX_TEXT_BYTES = 300;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -102,7 +102,7 @@ function optionalMetaState(value: unknown): number | undefined {
   return n;
 }
 
-function textBytes(text: string): Buffer {
+export function normalizeTextForControl(text: string): string {
   const out: string[] = [];
   let total = 0;
   for (const char of text) {
@@ -111,7 +111,9 @@ function textBytes(text: string): Buffer {
     out.push(char);
     total += bytes;
   }
-  return Buffer.from(out.join(""), "utf8");
+  // Round-trip through UTF-8 so lone UTF-16 surrogates become the same
+  // replacement code point that Buffer writes to scrcpy's control socket.
+  return Buffer.from(out.join(""), "utf8").toString("utf8");
 }
 
 export function parseGesture(value: unknown): Gesture {
@@ -152,7 +154,7 @@ export function parseGesture(value: unknown): Gesture {
       };
     case "text":
       if (typeof value.text !== "string") throw new Error("text must be a string");
-      return { type: "text", text: value.text };
+      return { type: "text", text: normalizeTextForControl(value.text) };
     case "back":
     case "home":
     case "recents":
@@ -197,7 +199,7 @@ function keyPacket(action: number, keycode: number, metaState = 0): Buffer {
 }
 
 function textPacket(text: string): Buffer {
-  const bytes = textBytes(text);
+  const bytes = Buffer.from(normalizeTextForControl(text), "utf8");
   const len = bytes.length;
   const buf = Buffer.allocUnsafe(5 + len);
   buf.writeUInt8(TYPE_INJECT_TEXT, 0);
@@ -264,7 +266,7 @@ export async function dispatch(control: Socket, g: Gesture, screen: Screen): Pro
       return;
     }
     case "text":
-      control.write(textPacket(g.text));
+      control.write(textPacket(normalizeTextForControl(g.text)));
       return;
     case "back":
       control.write(backOrScreenOnPacket(ACTION_DOWN));
