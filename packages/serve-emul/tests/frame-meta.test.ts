@@ -7,6 +7,21 @@ import {
   parseFramePacket,
   writeFrameMetaHeader,
 } from "../src/shared/frame-meta.ts";
+import {
+  PROTOCOL_GOLDEN_HEX,
+  goldenBytes,
+} from "./fixtures/protocol-golden.ts";
+
+function hex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function withPayload(header: Uint8Array, payload: Uint8Array): Uint8Array {
+  const packet = new Uint8Array(header.length + payload.length);
+  packet.set(header);
+  packet.set(payload, header.length);
+  return packet;
+}
 
 function packetWithHeader(
   meta: { isKey: boolean; pts: bigint; serverTsMs: number },
@@ -19,6 +34,37 @@ function packetWithHeader(
 }
 
 describe("frame-meta wire format", () => {
+  test("parses the exact documented SEMU v1 header", () => {
+    const payload = Uint8Array.from([0, 0, 0, 1, 0x65]);
+    const parsed = parseFramePacket(
+      withPayload(goldenBytes("semu-v1"), payload),
+    );
+    expect(parsed).toEqual({
+      data: payload,
+      isKey: true,
+      timestamp: 42,
+      serverTsMs: null,
+    });
+  });
+
+  test("writes and parses the exact documented SEMU v2 header", () => {
+    const header = new Uint8Array(FRAME_META_HEADER_BYTES);
+    writeFrameMetaHeader(header, {
+      isKey: true,
+      pts: 42n,
+      serverTsMs: 1_000,
+    });
+    expect(hex(header)).toBe(PROTOCOL_GOLDEN_HEX["semu-v2"]);
+
+    const payload = Uint8Array.from([0, 0, 0, 1, 0x65]);
+    expect(parseFramePacket(withPayload(header, payload))).toEqual({
+      data: payload,
+      isKey: true,
+      timestamp: 42,
+      serverTsMs: 1_000,
+    });
+  });
+
   test("v2 header round-trips key frame fields and payload", () => {
     const payload = Uint8Array.from([0, 0, 0, 1, 0x65, 1, 2, 3]);
     const serverTsMs = 1_750_000_000_123.456;

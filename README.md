@@ -354,6 +354,8 @@ Connect to `/ws` for the raw Annex-B H.264 stream. Send JSON control messages ov
 
 Use `/ws?frame-meta=1` to receive a 24-byte `SEMU` v2 frame metadata header before each H.264 access unit: magic `SEMU` (4B), version=2 (1B), flags (1B, bit 0 = keyframe), reserved (2B), PTS (8B BE, µs), and the server send time (8B BE, epoch µs). Same-host clients can compare the send time against their own clock to measure transit and glass-to-glass latency. The bundled UI uses this mode to avoid per-frame NAL scans and to track PTS/keyframe/latency state.
 
+See the [protocol reference](packages/serve-emul/docs/protocol.md) for the complete scrcpy v3/v4 framing, control packet, and `SEMU` v1/v2 wire formats.
+
 ## How It Works
 
 ```text
@@ -380,6 +382,32 @@ bun run --filter serve-emul dev
 bun run --filter serve-emul typecheck
 bun run --filter serve-emul typecheck:ui
 bun run --filter serve-emul build
+bun run check
+```
+
+`dev:ui` proxies `/api`, `/health`, and `/ws` to
+`http://localhost:3300` by default. To run the backend on another port while
+keeping the Vite UI on its normal development origin, start the two processes
+like this:
+
+```sh
+# terminal 1: backend on a non-default port
+bun run packages/serve-emul/src/cli.ts --port 4319
+
+# terminal 2: UI with API, health, and WebSocket proxying to that backend
+SERVE_EMUL_BACKEND_ORIGIN=http://localhost:4319 bun run --filter serve-emul dev:ui
+```
+
+`SERVE_EMUL_BACKEND_ORIGIN` only selects the Vite development proxy target. It
+does not disable the backend's token or same-origin protections; use the normal
+CLI access-control flags when exposing the backend beyond loopback.
+
+The repository-root `README.md` is the authoritative product documentation.
+After editing it, regenerate and verify the package copy:
+
+```sh
+bun run docs:sync
+bun run docs:check
 ```
 
 For runtime or protocol changes, test with a booted emulator or device:

@@ -3,6 +3,7 @@ import { createConnection, type Socket } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import { SCRCPY_VERSION, ensureScrcpyServer } from "../scripts/fetch-scrcpy.ts";
 
+// Canonical scrcpy wire layouts and upgrade checklist: ../docs/protocol.md
 const DEVICE_JAR_PATH = "/data/local/tmp/scrcpy-server.jar";
 
 export type ScrcpyMeta = {

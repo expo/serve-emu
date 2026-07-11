@@ -6,6 +6,8 @@
     "dev": "bun run --filter serve-emul dev",
     "build": "bun run --filter serve-emul build",
     "test": "bun run --filter serve-emul test",
+    "docs:sync": "bun run --filter serve-emul docs:sync",
+    "docs:check": "bun run --filter serve-emul docs:check",
     "check": "bun run --filter serve-emul check",
     "release": "bun run --filter serve-emul release"
   },
