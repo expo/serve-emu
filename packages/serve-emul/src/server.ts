@@ -35,6 +35,10 @@ import {
 import { getForegroundApp } from "./app-info.ts";
 import { FrameStatWindow } from "./frame-stat-window.ts";
 import {
+  ControlInputError,
+  ControlInputQueue,
+} from "./control-input-queue.ts";
+import {
   isAbnormalExit,
   procExitDetail,
   terminalTransitionAllowed,
@@ -58,7 +62,6 @@ import {
   stopEmulator,
 } from "./emulator.ts";
 import {
-  dispatch,
   parseGesture,
   resetVideoPacket,
   type Gesture,
@@ -91,6 +94,13 @@ export type ServerOpts = {
   maxSize?: number;
   keyFrameInterval?: number;
   repeatFrameMs?: number;
+};
+
+export type ServerDependencies = {
+  startScrcpy?: typeof startScrcpy;
+  listAllDevices?: typeof listAllDevices;
+  serve?: typeof Bun.serve;
+  createInputQueue?: (session: ScrcpySession) => ControlInputQueue;
 };
 
 export const DEFAULT_HOST = "127.0.0.1";
@@ -139,7 +149,18 @@ type DeviceGridResponse = {
   devices: GridDevice[];
 };
 
-type WsData = { id: number; frameMeta: boolean; handle?: Client };
+type InputTarget = {
+  generation: number;
+  queue: ControlInputQueue;
+  recorder: SessionRecorder;
+};
+
+type WsData = {
+  id: number;
+  frameMeta: boolean;
+  inputTarget: InputTarget;
+  handle?: Client;
+};
 
 type Client = {
   id: number;
@@ -149,6 +170,7 @@ type Client = {
   droppedFrames: number;
   backpressureEvents: number;
   awaitingKeyFrame: boolean;
+  inputTarget: InputTarget;
 };
 
 const MAX_WS_MESSAGE_BYTES = 16 * 1024;
@@ -163,9 +185,19 @@ const MAX_JSON_BODY_BYTES = 8 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_LOGCAT_QUERY_BYTES = 200;
 
-export async function startServer(opts: ServerOpts) {
+export async function startServer(
+  opts: ServerOpts,
+  dependencies: ServerDependencies = {},
+) {
+  const startScrcpySession = dependencies.startScrcpy ?? startScrcpy;
+  const loadDevices = dependencies.listAllDevices ?? listAllDevices;
+  const serve = dependencies.serve ?? Bun.serve;
+  const createInputQueue =
+    dependencies.createInputQueue ??
+    ((activeSession: ScrcpySession) =>
+      new ControlInputQueue({ socket: activeSession.controlSocket }));
   const openScrcpy = (serial: string) =>
-    startScrcpy({
+    startScrcpySession({
       serial,
       maxFps: opts.maxFps,
       bitRate: opts.bitRate,
@@ -257,6 +289,11 @@ export async function startServer(opts: ServerOpts) {
   let sessionRecorder = new SessionRecorder();
   let routePlayback = createRoutePlayback();
   let sessionGeneration = 0;
+  let inputTarget: InputTarget = {
+    generation: sessionGeneration,
+    queue: createInputQueue(session),
+    recorder: sessionRecorder,
+  };
   let accessibilitySnapshotCache: {
     snapshot: AccessibilitySnapshot;
     expiresMs: number;
@@ -312,7 +349,7 @@ export async function startServer(opts: ServerOpts) {
 
   const deviceGrid = async (): Promise<DeviceGridResponse> => {
     const [adbDevices, runningAvds, avds] = await Promise.all([
-      listAllDevices(),
+      loadDevices(),
       listRunningAvds(),
       listAvds(),
     ]);
@@ -377,6 +414,7 @@ export async function startServer(opts: ServerOpts) {
     stoppedAt = new Date().toISOString();
     if (!terminalCleanupDone) {
       terminalCleanupDone = true;
+      inputTarget.queue.close(new Error(reason));
       if (watchdog) clearInterval(watchdog);
       routePlayback.close();
       session.close();
@@ -423,6 +461,29 @@ export async function startServer(opts: ServerOpts) {
     return (value as Record<string, unknown>).ack !== false;
   };
 
+  const inputErrorPayload = (
+    err: unknown,
+    outcome: "rejected" | "failed",
+  ) => ({
+    ok: false as const,
+    status: outcome,
+    ...(err instanceof ControlInputError ? { code: err.code } : {}),
+    error: err instanceof Error ? err.message : String(err),
+  });
+
+  const inputErrorStatus = (err: unknown) => {
+    if (!(err instanceof ControlInputError)) return 400;
+    return err.code === "control-queue-overloaded" ? 429 : 503;
+  };
+
+  const inputErrorResponse = (
+    err: unknown,
+    outcome: "rejected" | "failed" = "rejected",
+  ) =>
+    Response.json(inputErrorPayload(err, outcome), {
+      status: inputErrorStatus(err),
+    });
+
   const isResetVideoRequest = (value: unknown) =>
     typeof value === "object" &&
     value !== null &&
@@ -467,15 +528,42 @@ export async function startServer(opts: ServerOpts) {
     return accessibilitySnapshotInFlight;
   };
 
-  const dispatchGesture = async (
+  const assertInputTarget = (target: InputTarget) => {
+    if (
+      target !== inputTarget ||
+      target.generation !== sessionGeneration
+    ) {
+      throw new ControlInputError(
+        "control-queue-closed",
+        "device session changed",
+      );
+    }
+    if (status !== "streaming") {
+      throw new ControlInputError(
+        "control-queue-closed",
+        `session is ${status}`,
+      );
+    }
+  };
+
+  const enqueueGesture = (
+    target: InputTarget,
     gesture: Gesture,
     source: string,
     record = true,
   ) => {
-    if (status !== "streaming") throw new Error(`session is ${status}`);
-    await dispatch(session.controlSocket, gesture, screen);
-    if (record) sessionRecorder.recordGesture(gesture, source);
+    assertInputTarget(target);
+    const accepted = target.queue.enqueue(gesture, { ...screen });
+    if (record) target.recorder.recordGesture(accepted.gesture, source);
+    return accepted;
   };
+
+  const dispatchGesture = (
+    target: InputTarget,
+    gesture: Gesture,
+    source: string,
+    record = true,
+  ) => enqueueGesture(target, gesture, source, record).completion;
 
   const applyLocation = async (fix: GeoFix, source: string, record = true) => {
     routePlayback.stop();
@@ -602,6 +690,7 @@ export async function startServer(opts: ServerOpts) {
   };
 
   const gestureEndpoint = async (
+    target: InputTarget,
     req: Request,
     type: Gesture["type"],
     source: string,
@@ -615,17 +704,25 @@ export async function startServer(opts: ServerOpts) {
           ? { ...payload, type }
           : payload,
       );
-      await dispatchGesture(gesture, source, shouldRecord(payload));
-      return Response.json({ ok: true });
-    } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
+      const accepted = enqueueGesture(
+        target,
+        gesture,
+        source,
+        shouldRecord(payload),
       );
+      let result;
+      try {
+        result = await accepted.completion;
+      } catch (err) {
+        return inputErrorResponse(err, "failed");
+      }
+      return Response.json({ ok: true, status: result.status });
+    } catch (err) {
+      return inputErrorResponse(err);
     }
   };
 
-  const keyEndpoint = async (req: Request) => {
+  const keyEndpoint = async (target: InputTarget, req: Request) => {
     try {
       const payload = await readJsonBody(req);
       if (
@@ -640,17 +737,28 @@ export async function startServer(opts: ServerOpts) {
         key === "back" || key === "home" || key === "recents" || key === "power"
           ? parseGesture({ type: key })
           : parseGesture({ ...payload, type: "key" });
-      await dispatchGesture(gesture, "rest:key", shouldRecord(payload));
-      return Response.json({ ok: true });
-    } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
+      const accepted = enqueueGesture(
+        target,
+        gesture,
+        "rest:key",
+        shouldRecord(payload),
       );
+      let result;
+      try {
+        result = await accepted.completion;
+      } catch (err) {
+        return inputErrorResponse(err, "failed");
+      }
+      return Response.json({ ok: true, status: result.status });
+    } catch (err) {
+      return inputErrorResponse(err);
     }
   };
 
-  const accessibilityTapEndpoint = async (req: Request) => {
+  const accessibilityTapEndpoint = async (
+    target: InputTarget,
+    req: Request,
+  ) => {
     try {
       const payload = await readJsonBody(req);
       if (
@@ -688,7 +796,8 @@ export async function startServer(opts: ServerOpts) {
           "matched accessibility node is outside the current stream bounds",
         );
       }
-      await dispatchGesture(
+      const accepted = enqueueGesture(
+        target,
         {
           type: "tap",
           x,
@@ -697,12 +806,20 @@ export async function startServer(opts: ServerOpts) {
         "accessibility:tap",
         shouldRecord(payload),
       );
-      return Response.json({ ok: true, node, capturedAt: snapshot.capturedAt });
+      let result;
+      try {
+        result = await accepted.completion;
+      } catch (err) {
+        return inputErrorResponse(err, "failed");
+      }
+      return Response.json({
+        ok: true,
+        status: result.status,
+        node,
+        capturedAt: snapshot.capturedAt,
+      });
     } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
+      return inputErrorResponse(err);
     }
   };
 
@@ -759,23 +876,40 @@ export async function startServer(opts: ServerOpts) {
     }
   };
 
-  const requestVideoReset = (reason: string) => {
+  const enqueueVideoReset = (target: InputTarget, reason: string) => {
+    assertInputTarget(target);
+    target.queue.assertOpen();
     const now = Date.now();
-    if (now - lastVideoResetMs < VIDEO_RESET_COOLDOWN_MS) return;
+    if (now - lastVideoResetMs < VIDEO_RESET_COOLDOWN_MS) {
+      return {
+        completion: Promise.resolve({ status: "coalesced" as const }),
+      };
+    }
+    const accepted = target.queue.enqueuePacket(resetVideoPacket(), {
+      coalesceKey: "reset-video",
+    });
     lastVideoResetMs = now;
     videoResetRequests++;
     lastVideoResetAt = new Date(now).toISOString();
     lastVideoResetReason = reason;
+    return accepted;
+  };
+
+  const requestVideoReset = (target: InputTarget, reason: string) => {
     try {
-      session.controlSocket.write(resetVideoPacket());
-    } catch {}
+      return enqueueVideoReset(target, reason).completion;
+    } catch (err) {
+      return Promise.reject(err);
+    }
   };
 
   const dropUntilKeyFrame = (client: Client) => {
     client.droppedFrames++;
     totalDroppedFrames++;
     client.awaitingKeyFrame = true;
-    requestVideoReset("client backpressure");
+    void requestVideoReset(client.inputTarget, "client backpressure").catch(
+      () => {},
+    );
   };
 
   const sendFrame = (client: Client, data: Buffer, isKeyFrame: boolean) => {
@@ -818,7 +952,11 @@ export async function startServer(opts: ServerOpts) {
   // self-contained Access Unit the browser can hand straight to WebCodecs.
   let cachedConfig: Buffer | null = null;
 
-  const startFramePump = (activeSession: ScrcpySession, generation: number) => {
+  const startFramePump = (
+    activeSession: ScrcpySession,
+    generation: number,
+    target: InputTarget,
+  ) => {
     cachedConfig = null;
     void (async () => {
       try {
@@ -842,9 +980,10 @@ export async function startServer(opts: ServerOpts) {
                   size: { width: f.width, height: f.height },
                 });
               }
-              requestVideoReset(
+              void requestVideoReset(
+                target,
                 `video session resized to ${f.width}×${f.height}`,
-              );
+              ).catch(() => {});
             }
             continue;
           }
@@ -950,7 +1089,7 @@ export async function startServer(opts: ServerOpts) {
         device: session.meta.deviceName,
       };
     }
-    const device = (await listAllDevices()).find(
+    const device = (await loadDevices()).find(
       (candidate) => candidate.serial === serial,
     );
     if (!device) throw new Error(`Unknown adb device "${serial}".`);
@@ -958,8 +1097,11 @@ export async function startServer(opts: ServerOpts) {
       throw new Error(`${serial} is ${device.state}, not ready.`);
 
     const nextSession = await openScrcpy(serial);
+    const nextQueue = createInputQueue(nextSession);
     const previousSession = session;
+    const previousInputTarget = inputTarget;
     sessionGeneration++;
+    previousInputTarget.queue.close(new Error("device switched"));
     closeClients(1012, "device switched");
     try {
       previousSession.close();
@@ -967,7 +1109,12 @@ export async function startServer(opts: ServerOpts) {
     currentSerial = serial;
     session = nextSession;
     resetSessionStats(nextSession);
-    startFramePump(nextSession, sessionGeneration);
+    inputTarget = {
+      generation: sessionGeneration,
+      queue: nextQueue,
+      recorder: sessionRecorder,
+    };
+    startFramePump(nextSession, sessionGeneration, inputTarget);
     attachSessionHandlers(nextSession, sessionGeneration);
     console.log(
       `scrcpy ready: ${nextSession.meta.deviceName} • ${nextSession.meta.codecId} • ${nextSession.meta.width}×${nextSession.meta.height}`,
@@ -981,6 +1128,7 @@ export async function startServer(opts: ServerOpts) {
 
   const stopCurrentSession = (reason: string) => {
     sessionGeneration++;
+    inputTarget.queue.close(new Error(reason));
     status = "stopped";
     lastError = reason;
     stoppedAt = new Date().toISOString();
@@ -991,7 +1139,7 @@ export async function startServer(opts: ServerOpts) {
     } catch {}
   };
 
-  startFramePump(session, sessionGeneration);
+  startFramePump(session, sessionGeneration, inputTarget);
 
   watchdog = setInterval(() => {
     sourceFps = frameCount - lastFpsFrameCount;
@@ -999,25 +1147,31 @@ export async function startServer(opts: ServerOpts) {
     if (status !== "streaming" || clients.size === 0) return;
     const now = Date.now();
     if (frameCount === 0 && now - startedMs > FIRST_FRAME_RESET_MS) {
-      requestVideoReset("first video frame not received");
+      void requestVideoReset(
+        inputTarget,
+        "first video frame not received",
+      ).catch(() => {});
       return;
     }
     if (
       Array.from(clients).some((client) => client.awaitingKeyFrame) &&
       now - (lastFrameMs || startedMs) > AWAITING_KEYFRAME_RESET_MS
     ) {
-      requestVideoReset("client awaiting keyframe");
+      void requestVideoReset(inputTarget, "client awaiting keyframe").catch(
+        () => {},
+      );
     }
   }, 1000);
 
   attachSessionHandlers(session, sessionGeneration);
 
   let nextId = 1;
-  const server = Bun.serve<WsData>({
+  const server = serve<WsData>({
     port: opts.port,
     hostname: host,
     async fetch(req, srv) {
       const url = new URL(req.url);
+      const requestInputTarget = inputTarget;
 
       // Bootstrap: exchange a valid one-time URL token for an HttpOnly cookie,
       // then redirect to a clean URL so the secret never lingers in the address
@@ -1093,7 +1247,7 @@ export async function startServer(opts: ServerOpts) {
           return Response.json({
             ok: true,
             currentSerial,
-            devices: (await listAllDevices()).map((device) => ({
+            devices: (await loadDevices()).map((device) => ({
               ...device,
               current: device.serial === currentSerial,
             })),
@@ -1508,31 +1662,36 @@ export async function startServer(opts: ServerOpts) {
       if (url.pathname === "/api/accessibility/tap") {
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
-        return accessibilityTapEndpoint(req);
+        return accessibilityTapEndpoint(requestInputTarget, req);
       }
 
       if (url.pathname === "/api/tap") {
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
-        return gestureEndpoint(req, "tap", "rest:tap");
+        return gestureEndpoint(requestInputTarget, req, "tap", "rest:tap");
       }
 
       if (url.pathname === "/api/swipe") {
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
-        return gestureEndpoint(req, "swipe", "rest:swipe");
+        return gestureEndpoint(
+          requestInputTarget,
+          req,
+          "swipe",
+          "rest:swipe",
+        );
       }
 
       if (url.pathname === "/api/text") {
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
-        return gestureEndpoint(req, "text", "rest:text");
+        return gestureEndpoint(requestInputTarget, req, "text", "rest:text");
       }
 
       if (url.pathname === "/api/key") {
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
-        return keyEndpoint(req);
+        return keyEndpoint(requestInputTarget, req);
       }
 
       if (url.pathname === "/api/session") {
@@ -1554,10 +1713,16 @@ export async function startServer(opts: ServerOpts) {
             !Array.isArray(payload)
               ? Number((payload as Record<string, unknown>).multiplier ?? 1)
               : 1;
-          const replay = sessionRecorder.replay(
+          assertInputTarget(requestInputTarget);
+          const replay = requestInputTarget.recorder.replay(
             {
               dispatchGesture: (gesture) =>
-                dispatchGesture(gesture, "session:replay", false),
+                dispatchGesture(
+                  requestInputTarget,
+                  gesture,
+                  "session:replay",
+                  false,
+                ).then(() => {}),
               setLocation: async (fix) => {
                 await applyLocation(fix, "session:replay", false);
               },
@@ -1567,7 +1732,7 @@ export async function startServer(opts: ServerOpts) {
           void replay.catch(() => {});
           return Response.json({
             ok: true,
-            session: sessionRecorder.snapshot(),
+            session: requestInputTarget.recorder.snapshot(),
           });
         } catch (err) {
           return Response.json(
@@ -1737,7 +1902,13 @@ export async function startServer(opts: ServerOpts) {
           });
         }
         const frameMeta = url.searchParams.get("frame-meta") === "1";
-        const ok = srv.upgrade(req, { data: { id: nextId++, frameMeta } });
+        const ok = srv.upgrade(req, {
+          data: {
+            id: nextId++,
+            frameMeta,
+            inputTarget: requestInputTarget,
+          },
+        });
         if (ok) return undefined as unknown as Response;
         return new Response("upgrade failed", { status: 400 });
       }
@@ -1751,6 +1922,14 @@ export async function startServer(opts: ServerOpts) {
     },
     websocket: {
       open(ws) {
+        const target = ws.data.inputTarget;
+        if (
+          target !== inputTarget ||
+          target.generation !== sessionGeneration
+        ) {
+          ws.close(1012, "device session changed");
+          return;
+        }
         const handle: Client = {
           id: ws.data.id,
           ws,
@@ -1759,10 +1938,11 @@ export async function startServer(opts: ServerOpts) {
           droppedFrames: 0,
           backpressureEvents: 0,
           awaitingKeyFrame: true,
+          inputTarget: target,
         };
         clients.add(handle);
         ws.data.handle = handle;
-        requestVideoReset("client opened");
+        void requestVideoReset(target, "client opened").catch(() => {});
       },
       message(ws, raw) {
         if (typeof raw !== "string") return;
@@ -1770,23 +1950,50 @@ export async function startServer(opts: ServerOpts) {
           ws.close(1009, "message too large");
           return;
         }
+        let acknowledge = true;
         try {
-          if (status !== "streaming") throw new Error(`session is ${status}`);
           const payload = JSON.parse(raw);
-          const acknowledge = wantsAck(payload);
+          acknowledge = wantsAck(payload);
+          const target = ws.data.inputTarget;
+          assertInputTarget(target);
           if (isResetVideoRequest(payload)) {
-            requestVideoReset("client requested keyframe");
-            if (acknowledge) sendJson(ws, { ok: true });
+            const accepted = enqueueVideoReset(
+              target,
+              "client requested keyframe",
+            );
+            void accepted.completion
+              .then((result) => {
+                if (acknowledge)
+                  sendJson(ws, {
+                    ok: true,
+                    status: result.status,
+                  });
+              })
+              .catch((err) => {
+                if (acknowledge)
+                  sendJson(ws, inputErrorPayload(err, "failed"));
+              });
             return;
           }
           const msg = parseGesture(payload);
-          void dispatchGesture(msg, "ws", shouldRecord(payload))
-            .then(() => {
-              if (acknowledge) sendJson(ws, { ok: true });
+          const accepted = enqueueGesture(
+            target,
+            msg,
+            "ws",
+            shouldRecord(payload),
+          );
+          void accepted.completion
+            .then((result) => {
+              if (acknowledge)
+                sendJson(ws, { ok: true, status: result.status });
             })
-            .catch((err) => sendJson(ws, { ok: false, error: String(err) }));
+            .catch((err) => {
+              if (acknowledge)
+                sendJson(ws, inputErrorPayload(err, "failed"));
+            });
         } catch (err) {
-          sendJson(ws, { ok: false, error: String(err) });
+          if (acknowledge)
+            sendJson(ws, inputErrorPayload(err, "rejected"));
         }
       },
       close(ws) {
@@ -1802,6 +2009,7 @@ export async function startServer(opts: ServerOpts) {
       status = "stopped";
       stoppedAt = new Date().toISOString();
     }
+    inputTarget.queue.close(new Error("server stopping"));
     closeClients(1001, "server stopping");
     if (watchdog) clearInterval(watchdog);
     routePlayback.close();
