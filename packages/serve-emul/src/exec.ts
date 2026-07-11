@@ -11,20 +11,53 @@ const MAX_CONCURRENT = 4;
 const DEFAULT_MAX_BUFFER = 8 * 1024 * 1024;
 
 let active = 0;
-const waiters: Array<() => void> = [];
+type ExecWaiter = {
+  resolve: () => void;
+  reject: (reason: unknown) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+};
 
-function acquire(): Promise<void> {
+const waiters: ExecWaiter[] = [];
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The operation was aborted", "AbortError");
+}
+
+function acquire(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortReason(signal));
   if (active < MAX_CONCURRENT) {
     active++;
     return Promise.resolve();
   }
-  return new Promise<void>((resolve) => waiters.push(resolve));
+  return new Promise<void>((resolve, reject) => {
+    const waiter: ExecWaiter = { resolve, reject, signal };
+    if (signal) {
+      waiter.onAbort = () => {
+        const index = waiters.indexOf(waiter);
+        if (index === -1) return;
+        waiters.splice(index, 1);
+        reject(abortReason(signal));
+      };
+      signal.addEventListener("abort", waiter.onAbort, { once: true });
+    }
+    waiters.push(waiter);
+  });
 }
 
 function release(): void {
-  const next = waiters.shift();
-  if (next) {
-    next();
+  while (waiters.length > 0) {
+    const next = waiters.shift()!;
+    if (next.signal && next.onAbort) {
+      next.signal.removeEventListener("abort", next.onAbort);
+    }
+    if (next.signal?.aborted) {
+      next.reject(abortReason(next.signal));
+      continue;
+    }
+    next.resolve();
     return;
   }
   active--;
@@ -33,6 +66,7 @@ function release(): void {
 export type ExecOpts = {
   timeout?: number;
   maxBuffer?: number;
+  signal?: AbortSignal;
 };
 
 export type ExecResult<T extends string | Buffer> = {
@@ -57,22 +91,34 @@ function run<T extends string | Buffer>(
     let outLen = 0;
     let settled = false;
     let timedOut = false;
+    let terminationError: Error | null = null;
 
     const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    const terminate = (error: Error) => {
+      if (!terminationError) terminationError = error;
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+    };
 
     const timer = opts.timeout
       ? setTimeout(() => {
           timedOut = true;
-          try {
-            child.kill("SIGKILL");
-          } catch {}
+          terminate(new Error(`${cmd} timed out after ${opts.timeout}ms`));
         }, opts.timeout)
       : null;
+
+    const onAbort = opts.signal
+      ? () => terminate(abortReason(opts.signal!))
+      : null;
+    opts.signal?.addEventListener("abort", onAbort!, { once: true });
 
     const finish = (status: number | null, signal: NodeJS.Signals | null, error: Error | null) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (onAbort) opts.signal?.removeEventListener("abort", onAbort);
       const stdoutBuf = Buffer.concat(outChunks);
       resolve({
         status,
@@ -80,17 +126,16 @@ function run<T extends string | Buffer>(
         stdout: (encoding === "buffer" ? stdoutBuf : stdoutBuf.toString("utf8")) as T,
         stderr: Buffer.concat(errChunks).toString("utf8"),
         timedOut,
-        error,
+        error: terminationError ?? error,
       });
     };
+
+    if (opts.signal?.aborted) onAbort?.();
 
     child.stdout.on("data", (d: Buffer) => {
       outLen += d.length;
       if (outLen > maxBuffer) {
-        try {
-          child.kill("SIGKILL");
-        } catch {}
-        finish(null, null, new Error("maxBuffer exceeded"));
+        terminate(new Error("maxBuffer exceeded"));
         return;
       }
       outChunks.push(d);
@@ -107,8 +152,29 @@ async function execGated<T extends string | Buffer>(
   opts: ExecOpts,
   encoding: "utf8" | "buffer",
 ): Promise<ExecResult<T>> {
-  await acquire();
   try {
+    await acquire(opts.signal);
+  } catch (error) {
+    return {
+      status: null,
+      signal: null,
+      stdout: (encoding === "buffer" ? Buffer.alloc(0) : "") as T,
+      stderr: "",
+      timedOut: false,
+      error: error instanceof Error ? error : new Error(String(error)),
+    };
+  }
+  try {
+    if (opts.signal?.aborted) {
+      return {
+        status: null,
+        signal: null,
+        stdout: (encoding === "buffer" ? Buffer.alloc(0) : "") as T,
+        stderr: "",
+        timedOut: false,
+        error: abortReason(opts.signal),
+      };
+    }
     return await run<T>(cmd, args, opts, encoding);
   } finally {
     release();

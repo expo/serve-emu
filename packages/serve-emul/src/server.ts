@@ -25,6 +25,7 @@ import {
   type AccessibilitySnapshot,
 } from "./accessibility.ts";
 import {
+  AppManagementError,
   clearAppData,
   forceStopApp,
   grantPermission,
@@ -71,6 +72,18 @@ import {
 } from "./location.ts";
 import { parseRoutePlaybackRequest, RoutePlayback } from "./route-playback.ts";
 import { SessionRecorder } from "./session-recorder.ts";
+import {
+  MultipartUploadError,
+  stageMultipartUpload,
+} from "./multipart-upload.ts";
+import { HttpBodyError, readJsonLimited } from "./request-body.ts";
+import {
+  MAX_UPLOAD_QUEUE_TIMEOUT_MS,
+  UploadManager,
+  UploadManagerError,
+  type UploadContext,
+  type UploadManagerOptions,
+} from "./upload-manager.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -91,10 +104,31 @@ export type ServerOpts = {
   maxSize?: number;
   keyFrameInterval?: number;
   repeatFrameMs?: number;
+  maxApkUploadBytes?: number;
+  maxMediaUploadBytes?: number;
+  maxActiveUploads?: number;
+  maxQueuedUploads?: number;
+  uploadQueueTimeoutMs?: number;
 };
 
 export const DEFAULT_HOST = "127.0.0.1";
+export const DEFAULT_MAX_APK_UPLOAD_BYTES = 512 * 1024 * 1024;
+export const DEFAULT_MAX_MEDIA_UPLOAD_BYTES = 1024 * 1024 * 1024;
+export const DEFAULT_MAX_ACTIVE_UPLOADS = 2;
+export const DEFAULT_MAX_QUEUED_UPLOADS = 4;
+export const DEFAULT_UPLOAD_QUEUE_TIMEOUT_MS = 5_000;
+const MULTIPART_BODY_OVERHEAD_BYTES = 1024 * 1024;
 const SESSION_COOKIE = "semu_session";
+
+export type ServerDependencies = {
+  startScrcpy?: typeof startScrcpy;
+  listAllDevices?: typeof listAllDevices;
+  serve?: typeof Bun.serve;
+  createUploadManager?: (options: UploadManagerOptions) => UploadManager;
+  stageMultipartUpload?: typeof stageMultipartUpload;
+  installApk?: typeof installApk;
+  importMediaFile?: typeof importMediaFile;
+};
 
 /** Constant-time string compare that never throws on length mismatch. */
 function safeEqual(a: string, b: string): boolean {
@@ -163,9 +197,93 @@ const MAX_JSON_BODY_BYTES = 8 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_LOGCAT_QUERY_BYTES = 200;
 
-export async function startServer(opts: ServerOpts) {
+function serverLimit(
+  value: number | undefined,
+  fallback: number,
+  name: string,
+  allowZero = false,
+): number {
+  const resolved = value ?? fallback;
+  if (
+    !Number.isSafeInteger(resolved) ||
+    resolved < (allowZero ? 0 : 1)
+  ) {
+    throw new Error(
+      `${name} must be ${allowZero ? "a non-negative" : "a positive"} safe integer`,
+    );
+  }
+  return resolved;
+}
+
+export async function startServer(
+  opts: ServerOpts,
+  dependencies: ServerDependencies = {},
+) {
+  const startScrcpySession = dependencies.startScrcpy ?? startScrcpy;
+  const loadDevices = dependencies.listAllDevices ?? listAllDevices;
+  const serve = dependencies.serve ?? Bun.serve;
+  const stageUpload =
+    dependencies.stageMultipartUpload ?? stageMultipartUpload;
+  const installStagedApk = dependencies.installApk ?? installApk;
+  const importStagedMedia =
+    dependencies.importMediaFile ?? importMediaFile;
+  const maxApkUploadBytes = serverLimit(
+    opts.maxApkUploadBytes,
+    DEFAULT_MAX_APK_UPLOAD_BYTES,
+    "maxApkUploadBytes",
+  );
+  const maxMediaUploadBytes = serverLimit(
+    opts.maxMediaUploadBytes,
+    DEFAULT_MAX_MEDIA_UPLOAD_BYTES,
+    "maxMediaUploadBytes",
+  );
+  const maxActiveUploads = serverLimit(
+    opts.maxActiveUploads,
+    DEFAULT_MAX_ACTIVE_UPLOADS,
+    "maxActiveUploads",
+  );
+  const maxQueuedUploads = serverLimit(
+    opts.maxQueuedUploads,
+    DEFAULT_MAX_QUEUED_UPLOADS,
+    "maxQueuedUploads",
+    true,
+  );
+  const uploadQueueTimeoutMs = serverLimit(
+    opts.uploadQueueTimeoutMs,
+    DEFAULT_UPLOAD_QUEUE_TIMEOUT_MS,
+    "uploadQueueTimeoutMs",
+    true,
+  );
+  if (uploadQueueTimeoutMs > MAX_UPLOAD_QUEUE_TIMEOUT_MS) {
+    throw new Error(
+      `uploadQueueTimeoutMs must be at most ${MAX_UPLOAD_QUEUE_TIMEOUT_MS}`,
+    );
+  }
+  const maxUploadFileBytes = Math.max(
+    maxApkUploadBytes,
+    maxMediaUploadBytes,
+  );
+  if (
+    maxUploadFileBytes >
+    Number.MAX_SAFE_INTEGER - MULTIPART_BODY_OVERHEAD_BYTES * 2
+  ) {
+    throw new Error("upload byte limit is too large");
+  }
+  const maxRequestBodySize =
+    Math.max(
+      maxUploadFileBytes + MULTIPART_BODY_OVERHEAD_BYTES * 2,
+      MAX_ROUTE_BODY_BYTES,
+    );
+  const uploads = (
+    dependencies.createUploadManager ??
+    ((options: UploadManagerOptions) => new UploadManager(options))
+  )({
+    maxActive: maxActiveUploads,
+    maxQueued: maxQueuedUploads,
+    queueTimeoutMs: uploadQueueTimeoutMs,
+  });
   const openScrcpy = (serial: string) =>
-    startScrcpy({
+    startScrcpySession({
       serial,
       maxFps: opts.maxFps,
       bitRate: opts.bitRate,
@@ -257,6 +375,7 @@ export async function startServer(opts: ServerOpts) {
   let sessionRecorder = new SessionRecorder();
   let routePlayback = createRoutePlayback();
   let sessionGeneration = 0;
+  let sessionAbortController = new AbortController();
   let accessibilitySnapshotCache: {
     snapshot: AccessibilitySnapshot;
     expiresMs: number;
@@ -284,6 +403,7 @@ export async function startServer(opts: ServerOpts) {
     location: lastLocation,
     route: routePlayback.snapshot(),
     session: sessionRecorder.snapshot(),
+    uploads: uploads.snapshot(),
     clientsDetail: Array.from(clients, (client) => ({
       id: client.id,
       frameMeta: client.frameMeta,
@@ -312,7 +432,7 @@ export async function startServer(opts: ServerOpts) {
 
   const deviceGrid = async (): Promise<DeviceGridResponse> => {
     const [adbDevices, runningAvds, avds] = await Promise.all([
-      listAllDevices(),
+      loadDevices(),
       listRunningAvds(),
       listAvds(),
     ]);
@@ -362,6 +482,22 @@ export async function startServer(opts: ServerOpts) {
     return { ok: true, currentSerial, sessionStatus: status, devices: rows };
   };
 
+  const revokeSessionUploads = (reason: string): Promise<void> => {
+    const context: UploadContext = {
+      serial: currentSerial,
+      generation: sessionGeneration,
+    };
+    const error = new UploadManagerError(
+      "device-session-changed",
+      reason,
+      context,
+    );
+    if (!sessionAbortController.signal.aborted) {
+      sessionAbortController.abort(error);
+    }
+    return uploads.cancelGeneration(context.generation, error);
+  };
+
   const markTerminal = (
     nextStatus: Exclude<SessionStatus, "streaming">,
     reason: string,
@@ -377,6 +513,7 @@ export async function startServer(opts: ServerOpts) {
     stoppedAt = new Date().toISOString();
     if (!terminalCleanupDone) {
       terminalCleanupDone = true;
+      void revokeSessionUploads(reason);
       if (watchdog) clearInterval(watchdog);
       routePlayback.close();
       session.close();
@@ -423,6 +560,42 @@ export async function startServer(opts: ServerOpts) {
     return (value as Record<string, unknown>).ack !== false;
   };
 
+  const errorResponse = (error: unknown, fallbackStatus = 400) => {
+    let status = fallbackStatus;
+    let code: string | undefined;
+    if (error instanceof HttpBodyError) {
+      status = error.status;
+      code = error.code;
+    } else if (error instanceof MultipartUploadError) {
+      status = error.status;
+      code = error.code;
+    } else if (error instanceof UploadManagerError) {
+      const mapped = {
+        "queue-full": { status: 429, code: "upload-queue-full" },
+        "queue-timeout": { status: 503, code: "upload-queue-timeout" },
+        "upload-cancelled": { status: 499, code: "upload-cancelled" },
+        "device-session-changed": {
+          status: 409,
+          code: "device-session-changed",
+        },
+        closed: { status: 503, code: "upload-service-closed" },
+      } as const;
+      status = mapped[error.code].status;
+      code = mapped[error.code].code;
+    } else if (error instanceof AppManagementError) {
+      status = error.code === "adb-timeout" ? 504 : 502;
+      code = error.code;
+    }
+    return Response.json(
+      {
+        ok: false,
+        ...(code ? { code } : {}),
+        error: error instanceof Error ? error.message : String(error),
+      },
+      { status },
+    );
+  };
+
   const isResetVideoRequest = (value: unknown) =>
     typeof value === "object" &&
     value !== null &&
@@ -432,11 +605,8 @@ export async function startServer(opts: ServerOpts) {
   const readJsonBody = async (
     req: Request,
     maxBytes = MAX_JSON_BODY_BYTES,
-  ): Promise<unknown> => {
-    const contentLength = Number(req.headers.get("content-length") ?? "0");
-    if (contentLength > maxBytes) throw new Error("request body too large");
-    return req.json();
-  };
+    signal?: AbortSignal,
+  ): Promise<unknown> => readJsonLimited(req, maxBytes, signal);
 
   const shouldRecord = (value: unknown) =>
     typeof value !== "object" ||
@@ -618,10 +788,7 @@ export async function startServer(opts: ServerOpts) {
       await dispatchGesture(gesture, source, shouldRecord(payload));
       return Response.json({ ok: true });
     } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
+      return errorResponse(err);
     }
   };
 
@@ -643,10 +810,7 @@ export async function startServer(opts: ServerOpts) {
       await dispatchGesture(gesture, "rest:key", shouldRecord(payload));
       return Response.json({ ok: true });
     } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
+      return errorResponse(err);
     }
   };
 
@@ -699,10 +863,7 @@ export async function startServer(opts: ServerOpts) {
       );
       return Response.json({ ok: true, node, capturedAt: snapshot.capturedAt });
     } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
+      return errorResponse(err);
     }
   };
 
@@ -722,42 +883,105 @@ export async function startServer(opts: ServerOpts) {
       const result = await action(payload as Record<string, unknown>);
       return Response.json(result);
     } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
+      return errorResponse(err);
+    }
+  };
+
+  const assertUploadContext = (context: UploadContext) => {
+    if (
+      context.generation !== sessionGeneration ||
+      context.serial !== currentSerial ||
+      sessionAbortController.signal.aborted
+    ) {
+      throw new UploadManagerError(
+        "device-session-changed",
+        `device session ${context.generation} is no longer active`,
+        context,
       );
     }
   };
 
-  const installEndpoint = async (req: Request) => {
+  const uploadEndpoint = async (
+    req: Request,
+    context: UploadContext,
+    sessionSignal: AbortSignal,
+    options: {
+      fieldName: "apk" | "file";
+      maxFileBytes: number;
+      action: (
+        serial: string,
+        file: Awaited<ReturnType<typeof stageUpload>>,
+        signal: AbortSignal,
+      ) => Promise<unknown>;
+    },
+  ) => {
     try {
-      const form = await req.formData();
-      const file = form.get("apk");
-      if (!(file instanceof File))
-        throw new Error("multipart field apk must be a file");
-      return Response.json(await installApk(currentSerial, file));
-    } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
+      const result = await uploads.run(
+        {
+          context,
+          requestSignal: req.signal,
+          sessionSignal,
+        },
+        async ({ context: acceptedContext, signal }) => {
+          const staged = await stageUpload(req, {
+            fieldName: options.fieldName,
+            maxFileBytes: options.maxFileBytes,
+            maxBodyBytes:
+              options.maxFileBytes + MULTIPART_BODY_OVERHEAD_BYTES,
+            signal,
+          });
+          try {
+            assertUploadContext(acceptedContext);
+            return await options.action(
+              acceptedContext.serial,
+              staged,
+              signal,
+            );
+          } finally {
+            try {
+              await staged.cleanup();
+            } catch (error) {
+              throw new MultipartUploadError(
+                "upload-cleanup-failed",
+                "failed to clean up multipart upload",
+                { cause: error },
+              );
+            }
+          }
+        },
       );
+      return Response.json(result);
+    } catch (error) {
+      if (req.body && !req.body.locked) {
+        await req.body.cancel(error).catch(() => {});
+      }
+      return errorResponse(error);
     }
   };
 
-  const fileImportEndpoint = async (req: Request) => {
-    try {
-      const form = await req.formData();
-      const file = form.get("file");
-      if (!(file instanceof File))
-        throw new Error("multipart field file must be a file");
-      return Response.json(await importMediaFile(currentSerial, file));
-    } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
-    }
-  };
+  const installEndpoint = (
+    req: Request,
+    context: UploadContext,
+    sessionSignal: AbortSignal,
+  ) =>
+    uploadEndpoint(req, context, sessionSignal, {
+      fieldName: "apk",
+      maxFileBytes: maxApkUploadBytes,
+      action: (serial, file, signal) =>
+        installStagedApk(serial, file, signal),
+    });
+
+  const fileImportEndpoint = (
+    req: Request,
+    context: UploadContext,
+    sessionSignal: AbortSignal,
+  ) =>
+    uploadEndpoint(req, context, sessionSignal, {
+      fieldName: "file",
+      maxFileBytes: maxMediaUploadBytes,
+      action: (serial, file, signal) =>
+        importStagedMedia(serial, file, signal),
+    });
 
   const requestVideoReset = (reason: string) => {
     const now = Date.now();
@@ -950,7 +1174,7 @@ export async function startServer(opts: ServerOpts) {
         device: session.meta.deviceName,
       };
     }
-    const device = (await listAllDevices()).find(
+    const device = (await loadDevices()).find(
       (candidate) => candidate.serial === serial,
     );
     if (!device) throw new Error(`Unknown adb device "${serial}".`);
@@ -958,8 +1182,22 @@ export async function startServer(opts: ServerOpts) {
       throw new Error(`${serial} is ${device.state}, not ready.`);
 
     const nextSession = await openScrcpy(serial);
+    if (stopRequested) {
+      try {
+        nextSession.close();
+      } catch {}
+      throw new Error("server is stopping");
+    }
     const previousSession = session;
+    await revokeSessionUploads("device switched");
+    if (stopRequested) {
+      try {
+        nextSession.close();
+      } catch {}
+      throw new Error("server is stopping");
+    }
     sessionGeneration++;
+    sessionAbortController = new AbortController();
     closeClients(1012, "device switched");
     try {
       previousSession.close();
@@ -979,7 +1217,8 @@ export async function startServer(opts: ServerOpts) {
     };
   };
 
-  const stopCurrentSession = (reason: string) => {
+  const stopCurrentSession = async (reason: string) => {
+    const cancellation = revokeSessionUploads(reason);
     sessionGeneration++;
     status = "stopped";
     lastError = reason;
@@ -989,6 +1228,7 @@ export async function startServer(opts: ServerOpts) {
     try {
       session.close();
     } catch {}
+    await cancellation;
   };
 
   startFramePump(session, sessionGeneration);
@@ -1013,11 +1253,17 @@ export async function startServer(opts: ServerOpts) {
   attachSessionHandlers(session, sessionGeneration);
 
   let nextId = 1;
-  const server = Bun.serve<WsData>({
+  const server = serve<WsData>({
     port: opts.port,
     hostname: host,
+    maxRequestBodySize,
     async fetch(req, srv) {
       const url = new URL(req.url);
+      const requestUploadContext: UploadContext = {
+        serial: currentSerial,
+        generation: sessionGeneration,
+      };
+      const requestSessionSignal = sessionAbortController.signal;
 
       // Bootstrap: exchange a valid one-time URL token for an HttpOnly cookie,
       // then redirect to a clean URL so the secret never lingers in the address
@@ -1093,7 +1339,7 @@ export async function startServer(opts: ServerOpts) {
           return Response.json({
             ok: true,
             currentSerial,
-            devices: (await listAllDevices()).map((device) => ({
+            devices: (await loadDevices()).map((device) => ({
               ...device,
               current: device.serial === currentSerial,
             })),
@@ -1143,13 +1389,7 @@ export async function startServer(opts: ServerOpts) {
           }
           return Response.json(await switchSession(serial.trim()));
         } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
+          return errorResponse(err);
         }
       }
 
@@ -1180,13 +1420,7 @@ export async function startServer(opts: ServerOpts) {
             avd: avd.trim(),
           });
         } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
+          return errorResponse(err);
         }
       }
 
@@ -1215,17 +1449,11 @@ export async function startServer(opts: ServerOpts) {
           if (!/^emulator-\d+$/.test(serial))
             throw new Error(`${serial} is not an emulator`);
           if (serial === currentSerial)
-            stopCurrentSession("current emulator stopped");
+            await stopCurrentSession("current emulator stopped");
           await stopEmulator(serial);
           return Response.json({ ok: true, serial });
         } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
+          return errorResponse(err);
         }
       }
 
@@ -1275,13 +1503,7 @@ export async function startServer(opts: ServerOpts) {
               ),
             });
           } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
+            return errorResponse(err);
           }
         }
         return new Response("method not allowed", { status: 405 });
@@ -1323,13 +1545,7 @@ export async function startServer(opts: ServerOpts) {
               nightMode: await setNightMode(currentSerial, mode as NightMode),
             });
           } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
+            return errorResponse(err);
           }
         }
         return new Response("method not allowed", { status: 405 });
@@ -1371,13 +1587,7 @@ export async function startServer(opts: ServerOpts) {
               fontScale: await setFontScale(currentSerial, scale),
             });
           } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
+            return errorResponse(err);
           }
         }
         return new Response("method not allowed", { status: 405 });
@@ -1419,13 +1629,7 @@ export async function startServer(opts: ServerOpts) {
               network: await setNetworkEnabled(currentSerial, enabled),
             });
           } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
+            return errorResponse(err);
           }
         }
         return new Response("method not allowed", { status: 405 });
@@ -1570,13 +1774,7 @@ export async function startServer(opts: ServerOpts) {
             session: sessionRecorder.snapshot(),
           });
         } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
+          return errorResponse(err);
         }
       }
 
@@ -1592,13 +1790,21 @@ export async function startServer(opts: ServerOpts) {
       if (url.pathname === "/api/apps/install") {
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
-        return installEndpoint(req);
+        return installEndpoint(
+          req,
+          requestUploadContext,
+          requestSessionSignal,
+        );
       }
 
       if (url.pathname === "/api/files/import") {
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
-        return fileImportEndpoint(req);
+        return fileImportEndpoint(
+          req,
+          requestUploadContext,
+          requestSessionSignal,
+        );
       }
 
       if (url.pathname === "/api/apps/launch") {
@@ -1657,13 +1863,7 @@ export async function startServer(opts: ServerOpts) {
             lastLocation = await applyLocation(fix, "rest:location");
             return Response.json({ ok: true, location: lastLocation });
           } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
+            return errorResponse(err);
           }
         }
         return new Response("method not allowed", { status: 405 });
@@ -1683,13 +1883,7 @@ export async function startServer(opts: ServerOpts) {
               route: await routePlayback.start(route),
             });
           } catch (err) {
-            return Response.json(
-              {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              { status: 400 },
-            );
+            return errorResponse(err);
           }
         }
         if (req.method === "DELETE") {
@@ -1719,13 +1913,7 @@ export async function startServer(opts: ServerOpts) {
             return Response.json({ ok: true, route: routePlayback.stop() });
           throw new Error("action must be pause, resume, or stop");
         } catch (err) {
-          return Response.json(
-            {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            { status: 400 },
-          );
+          return errorResponse(err);
         }
       }
 
@@ -1750,6 +1938,7 @@ export async function startServer(opts: ServerOpts) {
       return new Response("not found", { status: 404 });
     },
     websocket: {
+      maxPayloadLength: MAX_WS_MESSAGE_BYTES,
       open(ws) {
         const handle: Client = {
           id: ws.data.id,
@@ -1795,8 +1984,9 @@ export async function startServer(opts: ServerOpts) {
     },
   });
 
-  const stop = () => {
-    if (stopRequested) return;
+  let stopTask: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopTask) return stopTask;
     stopRequested = true;
     if (status === "streaming") {
       status = "stopped";
@@ -1807,6 +1997,16 @@ export async function startServer(opts: ServerOpts) {
     routePlayback.close();
     server.stop(true);
     session.close();
+    const error = new UploadManagerError(
+      "closed",
+      "server is stopping",
+      { serial: currentSerial, generation: sessionGeneration },
+    );
+    if (!sessionAbortController.signal.aborted) {
+      sessionAbortController.abort(error);
+    }
+    stopTask = uploads.close(error);
+    return stopTask;
   };
 
   return { server, session, stop };
