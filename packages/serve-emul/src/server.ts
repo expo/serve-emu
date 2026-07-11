@@ -256,7 +256,9 @@ export async function startServer(opts: ServerOpts) {
     });
   let sessionRecorder = new SessionRecorder();
   let routePlayback = createRoutePlayback();
-  let sessionGeneration = 0;
+  // Seed from wall time so a browser that survives a server restart can still
+  // distinguish the replacement scrcpy session on the same serial.
+  let sessionGeneration = startedMs;
   let accessibilitySnapshotCache: {
     snapshot: AccessibilitySnapshot;
     expiresMs: number;
@@ -268,6 +270,7 @@ export async function startServer(opts: ServerOpts) {
     ok: status === "streaming",
     status,
     serial: currentSerial,
+    sessionGeneration,
     device: session.meta.deviceName,
     codec: session.meta.codecId,
     size: { width: screen.width, height: screen.height },
@@ -947,6 +950,7 @@ export async function startServer(opts: ServerOpts) {
       return {
         ok: true,
         serial: currentSerial,
+        sessionGeneration,
         device: session.meta.deviceName,
       };
     }
@@ -975,6 +979,7 @@ export async function startServer(opts: ServerOpts) {
     return {
       ok: true,
       serial: currentSerial,
+      sessionGeneration,
       device: nextSession.meta.deviceName,
     };
   };
@@ -1217,7 +1222,7 @@ export async function startServer(opts: ServerOpts) {
           if (serial === currentSerial)
             stopCurrentSession("current emulator stopped");
           await stopEmulator(serial);
-          return Response.json({ ok: true, serial });
+          return Response.json({ ok: true, serial, sessionGeneration });
         } catch (err) {
           return Response.json(
             {

@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import type { StreamStats } from "./stream-worker";
+import {
+  deviceSessionStore,
+  useDeviceSessionRevision,
+  type DeviceSessionHealthRequest,
+} from "./device-session-store";
+import { usePoll } from "./use-poll";
 
 export type DeviceSize = { width: number; height: number };
 
@@ -17,6 +23,8 @@ export type Sender = (msg: Record<string, unknown>, ack?: boolean) => void;
 
 type ApiInfo = {
   size: DeviceSize;
+  serial?: string | null;
+  sessionGeneration?: number | null;
   status?: "streaming" | "stopped" | "error";
   lastFrameAt?: string | null;
   lastError?: string | null;
@@ -27,6 +35,11 @@ type WorkerEvent =
   | { type: "session"; size: DeviceSize }
   | { type: "rendered" }
   | { type: "stats"; stats: StreamStats };
+
+type HealthPollResult = {
+  data: ApiInfo;
+  request: DeviceSessionHealthRequest;
+};
 
 // A canvas can transfer control to an OffscreenCanvas only once, so the worker
 // that received it must be reused if the effect re-runs for the same element.
@@ -40,6 +53,8 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
     stats: null,
   });
   const workerRef = useRef<Worker | null>(null);
+  const hasRenderedFrameRef = useRef(false);
+  const deviceSessionRevision = useDeviceSessionRevision();
 
   const send = useCallback<Sender>((msg, ack = true) => {
     workerRef.current?.postMessage({
@@ -47,6 +62,54 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
       text: JSON.stringify(ack ? msg : { ...msg, ack: false }),
     });
   }, []);
+
+  const pollHealth = useCallback(async ({ signal }: { signal: AbortSignal }): Promise<HealthPollResult> => {
+    const request = deviceSessionStore.beginHealthRequest();
+    const response = await fetch("/health", { cache: "no-store", signal });
+    return { data: await response.json() as ApiInfo, request };
+  }, []);
+
+  const applyServerStatus = useCallback(({ data, request }: HealthPollResult) => {
+    if (!deviceSessionStore.applyHealth(data, request)) return;
+    const lastFrameAgeMs = data.lastFrameAt ? Date.now() - Date.parse(data.lastFrameAt) : Infinity;
+    setState((current) => {
+      const deviceSize =
+        current.deviceSize?.width === data.size.width && current.deviceSize.height === data.size.height
+          ? current.deviceSize
+          : data.size;
+      const status =
+        current.status === "OffscreenCanvas unsupported"
+          ? current.status
+          : data.status && data.status !== "streaming"
+            ? data.lastError || data.status
+            : !hasRenderedFrameRef.current && lastFrameAgeMs > 5000
+              ? "waiting for video"
+              : current.status === "stream stalled" ||
+                  current.status === "metadata unavailable" ||
+                  current.status === "waiting for video"
+                ? "streaming"
+                : current.status;
+      return current.deviceSize === deviceSize && current.status === status
+        ? current
+        : { ...current, deviceSize, status };
+    });
+  }, []);
+
+  const markHealthUnavailable = useCallback(() => {
+    setState((current) =>
+      current.status === "metadata unavailable" || current.status === "OffscreenCanvas unsupported"
+        ? current
+        : { ...current, status: "metadata unavailable" }
+    );
+  }, []);
+
+  usePoll({
+    poll: pollHealth,
+    onResult: applyServerStatus,
+    onError: markHealthUnavailable,
+    intervalMs: 1500,
+    pollKey: deviceSessionRevision,
+  });
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -57,8 +120,7 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
     }
 
     let cancelled = false;
-    let hasRenderedFrame = false;
-    let healthTimer: ReturnType<typeof setInterval> | null = null;
+    hasRenderedFrameRef.current = false;
 
     const setStatus = (status: string) =>
       setState((prev) => (prev.status === status ? prev : { ...prev, status }));
@@ -83,57 +145,19 @@ export function useStream(canvasRef: RefObject<HTMLCanvasElement>) {
       if (msg.type === "status") {
         setStatus(msg.status);
       } else if (msg.type === "session") {
+        hasRenderedFrameRef.current = false;
         setState((s) => ({ ...s, deviceSize: msg.size }));
       } else if (msg.type === "rendered") {
-        hasRenderedFrame = true;
+        hasRenderedFrameRef.current = true;
       } else if (msg.type === "stats") {
-        if (msg.stats.rendered) hasRenderedFrame = true;
+        if (msg.stats.rendered) hasRenderedFrameRef.current = true;
         setState((s) => ({ ...s, fps: msg.stats.fps, stats: msg.stats }));
       }
     };
     worker.addEventListener("message", onMessage);
 
-    const applyServerStatus = (d: ApiInfo) => {
-      const lastFrameAgeMs = d.lastFrameAt ? Date.now() - Date.parse(d.lastFrameAt) : Infinity;
-      setState((s) => ({
-        ...s,
-        deviceSize: d.size,
-        status:
-          d.status && d.status !== "streaming"
-            ? d.lastError || d.status
-            : !hasRenderedFrame && lastFrameAgeMs > 5000
-              ? "waiting for video"
-              : s.status === "stream stalled" ||
-                  s.status === "metadata unavailable" ||
-                  s.status === "waiting for video"
-                ? "streaming"
-              : s.status,
-      }));
-    };
-
-    fetch("/health")
-      .then((r) => r.json() as Promise<ApiInfo>)
-      .then((d) => {
-        if (!cancelled) applyServerStatus(d);
-      })
-      .catch(() => {
-        if (!cancelled) setStatus("metadata unavailable");
-      });
-
-    healthTimer = setInterval(() => {
-      fetch("/health")
-        .then((r) => r.json() as Promise<ApiInfo>)
-        .then((d) => {
-          if (!cancelled) applyServerStatus(d);
-        })
-        .catch(() => {
-          if (!cancelled) setStatus("metadata unavailable");
-        });
-    }, 1500);
-
     return () => {
       cancelled = true;
-      if (healthTimer) clearInterval(healthTimer);
       worker.removeEventListener("message", onMessage);
       worker.postMessage({ type: "stop" });
       workerRef.current = null;

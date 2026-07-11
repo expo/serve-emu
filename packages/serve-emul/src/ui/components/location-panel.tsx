@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent } from "react";
+import { useDeviceSessionSnapshot } from "../lib/device-session-store";
+import { usePoll } from "../lib/use-poll";
 
 type Point = { x: number; y: number };
 type LocationPoint = { latitude: number; longitude: number; altitude?: number };
@@ -188,6 +190,7 @@ export function LocationPanel() {
   const [speedKph, setSpeedKph] = useState("30");
   const [multiplier, setMultiplier] = useState("1");
   const [loop, setLoop] = useState(false);
+  const deviceSession = useDeviceSessionSnapshot();
 
   const syncDraft = useCallback((next: LocationPoint, recenter = false) => {
     const normalized = {
@@ -216,35 +219,31 @@ export function LocationPanel() {
     return () => observer.disconnect();
   }, []);
 
-  useEffect(() => {
-    fetch("/api/location")
-      .then((r) => r.json())
-      .then((data: { location?: LocationPoint | null }) => {
-        if (data.location) syncDraft(data.location, true);
-      })
-      .catch(() => {});
-  }, [syncDraft]);
+  const { refresh: refreshLocation } = usePoll({
+    poll: async ({ signal }) => {
+      const response = await fetch("/api/location", { cache: "no-store", signal });
+      return await response.json() as { location?: LocationPoint | null };
+    },
+    onResult: (data) => syncDraft(data.location ?? DEFAULT_LOCATION, true),
+    intervalMs: null,
+    pollKey: deviceSession.revision,
+    enabled: !deviceSession.transitioning,
+  });
 
-  useEffect(() => {
-    let cancelled = false;
-    const syncRoute = () => {
-      fetch("/api/route")
-        .then((r) => r.json() as Promise<RouteSnapshot>)
-        .then((route) => {
-          if (cancelled) return;
-          setRouteStatus(route);
-          if (route.currentLocation) syncDraft(route.currentLocation, route.status === "running");
-          if (route.lastError) setStatus(route.lastError);
-        })
-        .catch(() => {});
-    };
-    syncRoute();
-    const timer = setInterval(syncRoute, 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [syncDraft]);
+  const { refresh: refreshRoute } = usePoll({
+    poll: async ({ signal }) => {
+      const response = await fetch("/api/route", { cache: "no-store", signal });
+      return await response.json() as RouteSnapshot;
+    },
+    onResult: (route) => {
+      setRouteStatus(route);
+      if (route.currentLocation) syncDraft(route.currentLocation, route.status === "running");
+      if (route.lastError) setStatus(route.lastError);
+    },
+    intervalMs: 1000,
+    pollKey: deviceSession.revision,
+    enabled: !deviceSession.transitioning,
+  });
 
   const centerPixel = useMemo(() => project(center, zoom), [center, zoom]);
   const draftPixel = useMemo(() => project(draft, zoom), [draft, zoom]);
@@ -317,6 +316,7 @@ export function LocationPanel() {
       const data = (await res.json()) as { ok?: boolean; error?: string };
       if (!res.ok || !data.ok) throw new Error(data.error || "location update failed");
       setStatus(`Applied ${formatCoord(location.latitude)}, ${formatCoord(location.longitude)}`);
+      refreshLocation();
     } catch (err) {
       setStatus(err instanceof Error ? err.message : String(err));
     }
@@ -385,6 +385,7 @@ export function LocationPanel() {
       if (!res.ok || !data.ok || !data.route) throw new Error(data.error || "route start failed");
       setRouteStatus(data.route);
       setStatus("Route running");
+      refreshRoute();
     } catch (err) {
       setStatus(err instanceof Error ? err.message : String(err));
     }
@@ -401,6 +402,7 @@ export function LocationPanel() {
       if (!res.ok || !data.ok || !data.route) throw new Error(data.error || "route control failed");
       setRouteStatus(data.route);
       setStatus(action === "stop" ? "Route stopped" : `Route ${data.route.status}`);
+      refreshRoute();
     } catch (err) {
       setStatus(err instanceof Error ? err.message : String(err));
     }

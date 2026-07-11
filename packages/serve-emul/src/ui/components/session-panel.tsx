@@ -1,4 +1,6 @@
-import { useEffect, useState } from "react";
+import { useCallback, useState } from "react";
+import { useDeviceSessionSnapshot } from "../lib/device-session-store";
+import { usePoll } from "../lib/use-poll";
 
 type SessionEvent = {
   id: number;
@@ -28,19 +30,21 @@ export function SessionPanel() {
   const [session, setSession] = useState<SessionSnapshot | null>(null);
   const [multiplier, setMultiplier] = useState("1");
   const [status, setStatus] = useState("Ready");
+  const deviceSession = useDeviceSessionSnapshot();
 
-  const refresh = () => {
-    fetch("/api/session")
-      .then((r) => r.json() as Promise<SessionSnapshot>)
-      .then(setSession)
-      .catch(() => setStatus("Session unavailable"));
-  };
-
-  useEffect(() => {
-    refresh();
-    const timer = setInterval(refresh, 1000);
-    return () => clearInterval(timer);
-  }, []);
+  const applySession = useCallback((snapshot: SessionSnapshot) => setSession(snapshot), []);
+  const applySessionError = useCallback(() => setStatus("Session unavailable"), []);
+  const { refresh } = usePoll({
+    poll: async ({ signal }) => {
+      const response = await fetch("/api/session", { cache: "no-store", signal });
+      return await response.json() as SessionSnapshot;
+    },
+    onResult: applySession,
+    onError: applySessionError,
+    intervalMs: 1000,
+    pollKey: deviceSession.revision,
+    enabled: !deviceSession.transitioning,
+  });
 
   const replay = async () => {
     const rate = Number(multiplier);
@@ -60,6 +64,7 @@ export function SessionPanel() {
     }
     setSession(data.session ?? null);
     setStatus("Replaying");
+    refresh();
   };
 
   const stopReplay = async () => {
@@ -67,6 +72,7 @@ export function SessionPanel() {
     const data = await res.json() as { session?: SessionSnapshot };
     setSession(data.session ?? null);
     setStatus("Replay stopped");
+    refresh();
   };
 
   const clear = async () => {
@@ -74,6 +80,7 @@ export function SessionPanel() {
     const data = await res.json() as { session?: SessionSnapshot };
     setSession(data.session ?? null);
     setStatus("Cleared");
+    refresh();
   };
 
   const copy = async () => {
