@@ -1,19 +1,20 @@
 import { execText } from "./exec.ts";
+import type { ForegroundApp } from "./shared/api-contracts.ts";
 
-export type ForegroundApp = {
-  packageName: string | null;
-  activity: string | null;
-  pid: number | null;
-  label: string | null;
-  versionName: string | null;
-  versionCode: string | null;
-  debuggable: boolean | null;
-};
+export type { ForegroundApp } from "./shared/api-contracts.ts";
 
 async function adbShell(serial: string, args: string[], timeout = 4_000): Promise<string> {
   const result = await execText("adb", ["-s", serial, "shell", ...args], { timeout });
-  if (result.status !== 0) {
-    throw new Error((result.stderr || result.stdout || `adb shell ${args.join(" ")} failed`).trim());
+  if (result.status !== 0 || result.error) {
+    throw new Error(
+      (
+        result.stderr ||
+        result.error?.message ||
+        result.stdout ||
+        `adb shell ${args.join(" ")} failed`
+      ).trim(),
+      { cause: result.error ?? undefined },
+    );
   }
   return result.stdout;
 }

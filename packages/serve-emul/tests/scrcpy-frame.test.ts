@@ -8,6 +8,7 @@ import {
   parseVideoPreamble,
   readFrame,
 } from "../src/scrcpy.ts";
+import { SCRCPY_VERSION } from "../scripts/fetch-scrcpy.ts";
 
 function frameHeader(
   protocol: 3 | 4,
@@ -27,9 +28,43 @@ function frameHeader(
   return h;
 }
 
+function sessionHeader(width: number, height: number, clientResized: boolean) {
+  const header = Buffer.alloc(12);
+  header.writeUInt32BE(0x80000000 + (clientResized ? 1 : 0), 0);
+  header.writeUInt32BE(width, 4);
+  header.writeUInt32BE(height, 8);
+  return header;
+}
+
+function videoPreamble(
+  protocol: 3 | 4,
+  options: { dummy: boolean; extra?: Buffer; codecId?: number },
+): Buffer {
+  const name = Buffer.alloc(64);
+  name.write("Pixel 8", "utf8");
+  const metadata = Buffer.alloc(protocol === 4 ? 16 : 12);
+  metadata.writeUInt32BE(options.codecId ?? 0x68323634, 0);
+  if (protocol === 4) {
+    metadata.writeUInt32BE(0x80000000, 4);
+    metadata.writeUInt32BE(720, 8);
+    metadata.writeUInt32BE(1280, 12);
+  } else {
+    metadata.writeUInt32BE(720, 4);
+    metadata.writeUInt32BE(1280, 8);
+  }
+  return Buffer.concat([
+    ...(options.dummy ? [Buffer.of(0)] : []),
+    name,
+    metadata,
+    options.extra ?? Buffer.alloc(0),
+  ]);
+}
+
 class MockSock extends EventEmitter {
   destroyed = false;
+  destroyCalls = 0;
   destroy() {
+    this.destroyCalls++;
     this.destroyed = true;
     this.emit("close");
   }
@@ -40,15 +75,143 @@ function makeReader() {
   return { s, r: new FramedReader(s as unknown as Socket) };
 }
 
-test("v4 strips flag bits from pts", () => {
-  const h = frameHeader(4, { pts: 12345n, size: 10, key: true, config: true });
-  const p = parseFrameHeader(h, 4);
-  expect(p.kind).toBe("frame");
-  if (p.kind === "frame") {
-    expect(p.pts).toBe(12345n);
-    expect(p.isKey).toBe(true);
-    expect(p.isConfig).toBe(true);
-  }
+describe("scrcpy protocol goldens", () => {
+  test("fixtures are pinned to the vendored scrcpy 4.0 protocol", () => {
+    expect(SCRCPY_VERSION).toBe("4.0");
+  });
+
+  test.each([
+    { protocol: 3 as const, dummy: false },
+    { protocol: 3 as const, dummy: true },
+    { protocol: 4 as const, dummy: false },
+    { protocol: 4 as const, dummy: true },
+  ])("parses v$protocol preamble (dummy=$dummy)", ({ protocol, dummy }) => {
+    const extra = Buffer.of(0xaa, 0xbb, 0xcc);
+    expect(parseVideoPreamble(videoPreamble(protocol, { dummy, extra }))).toEqual({
+      deviceName: "Pixel 8",
+      codecName: "h264",
+      width: 720,
+      height: 1280,
+      protocol,
+      extra,
+    });
+  });
+
+  test("v3 config and key headers match emitted flag layouts", () => {
+    expect(
+      parseFrameHeader(Buffer.from("800000000000000000000004", "hex"), 3),
+    ).toEqual({
+      kind: "frame",
+      size: 4,
+      pts: 0n,
+      isConfig: true,
+      isKey: false,
+    });
+    expect(
+      parseFrameHeader(Buffer.from("400000000000007b00000004", "hex"), 3),
+    ).toEqual({
+      kind: "frame",
+      size: 4,
+      pts: 123n,
+      isConfig: false,
+      isKey: true,
+    });
+  });
+
+  test("v4 config and key headers match emitted flag layouts", () => {
+    expect(
+      parseFrameHeader(Buffer.from("400000000000000000000004", "hex"), 4),
+    ).toEqual({
+      kind: "frame",
+      size: 4,
+      pts: 0n,
+      isConfig: true,
+      isKey: false,
+    });
+    expect(
+      parseFrameHeader(Buffer.from("200000000000007b00000004", "hex"), 4),
+    ).toEqual({
+      kind: "frame",
+      size: 4,
+      pts: 123n,
+      isConfig: false,
+      isKey: true,
+    });
+  });
+
+  test.each([
+    {
+      resized: false,
+      header: "80000000000002d000000500",
+    },
+    {
+      resized: true,
+      header: "80000001000002d000000500",
+    },
+  ])("v4 session header exposes resized=$resized", ({ resized, header }) => {
+    expect(parseFrameHeader(Buffer.from(header, "hex"), 4)).toEqual({
+      kind: "session",
+      clientResized: resized,
+      width: 720,
+      height: 1280,
+    });
+  });
+
+  test("fragmented dummy v4 preamble is reassembled exactly", async () => {
+    const { s, r } = makeReader();
+    const promise = r
+      .read(81, "header")
+      .then((buffer) => parseVideoPreamble(buffer));
+    const preamble = videoPreamble(4, { dummy: true });
+    for (const chunk of [
+      preamble.subarray(0, 1),
+      preamble.subarray(1, 17),
+      preamble.subarray(17, 64),
+      preamble.subarray(64),
+    ]) {
+      s.emit("data", chunk);
+    }
+    expect(await promise).toEqual({
+      deviceName: "Pixel 8",
+      codecName: "h264",
+      width: 720,
+      height: 1280,
+      protocol: 4,
+      extra: Buffer.alloc(0),
+    });
+  });
+
+  test("fragmented v3 frame preserves flags, pts, and payload", async () => {
+    const { s, r } = makeReader();
+    const promise = readFrame(r, 3);
+    const packet = Buffer.concat([
+      Buffer.from("400000000000002a00000004", "hex"),
+      Buffer.of(1, 2, 3, 4),
+    ]);
+    for (const byte of packet) s.emit("data", Buffer.of(byte));
+    expect(await promise).toEqual({
+      type: "frame",
+      data: Buffer.of(1, 2, 3, 4),
+      pts: 42n,
+      isConfig: false,
+      isKey: true,
+    });
+  });
+
+  test("fragmented v4 session packet preserves session flags", async () => {
+    const { s, r } = makeReader();
+    const promise = readFrame(r, 4);
+    const header = sessionHeader(720, 1280, true);
+    s.emit("data", header.subarray(0, 3));
+    s.emit("data", header.subarray(3, 11));
+    s.emit("data", header.subarray(11));
+    expect(await promise).toEqual({
+      type: "session",
+      width: 720,
+      height: 1280,
+      clientResized: true,
+    });
+  });
 });
 
 test("clean EOF when stream ends before a header (read after end)", async () => {
@@ -65,7 +228,8 @@ test("overflow destroys reader and cannot resume", async () => {
   const err = await r.read(4, "header").catch((e) => e);
   expect(err.code).toBe("reader-overflow");
   expect(s.destroyed).toBe(true);
-  s.emit("data", Buffer.of(1, 2, 3, 4));
+  s.emit("data", Buffer.allocUnsafe(33 * 1024 * 1024));
+  expect(s.destroyCalls).toBe(1);
   const err2 = await r.read(4, "header").catch((e) => e);
   expect(err2.code).toBe("reader-overflow");
 });

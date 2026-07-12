@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState, type DragEvent } from "react";
+import { useRef, useState, type DragEvent } from "react";
+import { useDeviceSessionSnapshot } from "../lib/device-session-store";
+import { usePoll } from "../lib/use-poll";
 
 type AppApiResult = {
   ok?: boolean;
@@ -44,39 +46,37 @@ export function AppManagementPanel() {
   const [dragOver, setDragOver] = useState(false);
   const [foreground, setForeground] = useState<ForegroundApp | null>(null);
   const [foregroundError, setForegroundError] = useState<string | null>(null);
+  const deviceSession = useDeviceSessionSnapshot();
 
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = async () => {
-      try {
-        const res = await fetch("/api/foreground", { cache: "no-store" });
-        const json = await res.json() as { ok?: boolean; app?: ForegroundApp; error?: string };
-        if (cancelled) return;
-        if (json.ok && json.app) {
-          setForeground(json.app);
-          setForegroundError(null);
-        } else {
-          setForeground(null);
-          setForegroundError(json.error || "Foreground app unavailable");
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setForeground(null);
-          setForegroundError(err instanceof Error ? err.message : String(err));
-        }
+  const { refresh: refreshForeground } = usePoll({
+    poll: async ({ signal }) => {
+      const res = await fetch("/api/foreground", { cache: "no-store", signal });
+      return await res.json() as { ok?: boolean; app?: ForegroundApp; error?: string };
+    },
+    onResult: (json) => {
+      if (json.ok && json.app) {
+        setForeground(json.app);
+        setForegroundError(null);
+      } else {
+        setForeground(null);
+        setForegroundError(json.error || "Foreground app unavailable");
       }
-    };
-    void refresh();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    },
+    onError: (error) => {
+      setForeground(null);
+      setForegroundError(error instanceof Error ? error.message : String(error));
+    },
+    intervalMs: null,
+    pollKey: deviceSession.revision,
+    enabled: !deviceSession.transitioning,
+  });
 
   const run = async (label: string, request: () => Promise<AppApiResult>) => {
     setStatus(`${label}...`);
     try {
       const result = await request();
       setStatus(outputFor(result));
+      if (result.ok) refreshForeground();
     } catch (err) {
       setStatus(err instanceof Error ? err.message : String(err));
     }

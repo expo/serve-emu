@@ -1,4 +1,5 @@
-import { execBuffer, execText } from "./exec.ts";
+import { spawn } from "node:child_process";
+import { execBuffer, execText, type ExecResult } from "./exec.ts";
 
 const ADB_QUERY_TIMEOUT_MS = 2_000;
 const ADB_MUTATION_TIMEOUT_MS = 5_000;
@@ -21,7 +22,7 @@ export type NightModeStatus = {
   mode: NightMode | "unknown";
   raw: string;
 };
-type NetworkRadioStatus = "enabled" | "disabled" | "unknown";
+export type NetworkRadioStatus = "enabled" | "disabled" | "unknown";
 export type NetworkStatus = {
   enabled: boolean | null;
   wifi: NetworkRadioStatus;
@@ -32,9 +33,24 @@ export type NetworkStatus = {
   };
 };
 
+function execFailed(result: ExecResult<string | Buffer>): boolean {
+  return result.status !== 0 || result.error !== null;
+}
+
+function execFailure(result: ExecResult<string | Buffer>): string {
+  const stdout =
+    typeof result.stdout === "string" ? result.stdout.trim() : "";
+  return (
+    result.stderr.trim() ||
+    result.error?.message ||
+    stdout ||
+    "unknown error"
+  );
+}
+
 export async function listAllDevices(): Promise<Device[]> {
   const r = await execText("adb", ["devices"], { timeout: ADB_QUERY_TIMEOUT_MS });
-  if (r.status !== 0) throw new Error(`adb devices failed: ${r.stderr}`);
+  if (execFailed(r)) throw new Error(`adb devices failed: ${execFailure(r)}`);
   return r.stdout
     .split("\n")
     .slice(1)
@@ -46,7 +62,7 @@ export async function listAllDevices(): Promise<Device[]> {
     });
 }
 
-async function listDevices(): Promise<Device[]> {
+export async function listDevices(): Promise<Device[]> {
   return (await listAllDevices()).filter((d) => d.state === "device");
 }
 
@@ -66,8 +82,33 @@ export async function screencapPng(serial: string): Promise<Buffer> {
     maxBuffer: 64 * 1024 * 1024,
     timeout: ADB_SCREENSHOT_TIMEOUT_MS,
   });
-  if (r.status !== 0) throw new Error(`screencap failed: ${r.stderr}`);
+  if (execFailed(r)) throw new Error(`screencap failed: ${execFailure(r)}`);
   return r.stdout;
+}
+
+export async function shell(serial: string, cmd: string[]): Promise<void> {
+  const r = await execText("adb", ["-s", serial, "shell", ...cmd], {
+    timeout: ADB_MUTATION_TIMEOUT_MS,
+  });
+  if (execFailed(r)) {
+    throw new Error(
+      `adb shell ${cmd.join(" ")} failed: ${execFailure(r)}`,
+    );
+  }
+}
+
+export function shellSpawn(serial: string, cmd: string[]) {
+  return spawn("adb", ["-s", serial, "shell", ...cmd]);
+}
+
+export async function getDeviceSize(serial: string): Promise<{ width: number; height: number }> {
+  const r = await execText("adb", ["-s", serial, "shell", "wm", "size"], {
+    timeout: ADB_QUERY_TIMEOUT_MS,
+  });
+  if (execFailed(r)) throw new Error(`wm size failed: ${execFailure(r)}`);
+  const m = r.stdout.match(/(\d+)x(\d+)/);
+  if (!m) throw new Error(`Could not parse wm size output: ${r.stdout}`);
+  return { width: Number(m[1]), height: Number(m[2]) };
 }
 
 function orientationFromRotation(mode: "free" | "lock" | "unknown", rotation: number | null): OrientationStatus["orientation"] {
@@ -81,7 +122,11 @@ export async function getUserRotation(serial: string): Promise<OrientationStatus
   const r = await execText("adb", ["-s", serial, "shell", "cmd", "window", "user-rotation"], {
     timeout: ADB_QUERY_TIMEOUT_MS,
   });
-  if (r.status !== 0) throw new Error(`cmd window user-rotation failed: ${r.stderr}`);
+  if (execFailed(r)) {
+    throw new Error(
+      `cmd window user-rotation failed: ${execFailure(r)}`,
+    );
+  }
   const raw = r.stdout.trim();
   const match = raw.match(/^(free|lock)(?:\s+(\d+))?$/);
   if (!match) {
@@ -100,7 +145,11 @@ export async function setUserRotation(serial: string, orientation: OrientationMo
   const r = await execText("adb", ["-s", serial, "shell", ...args], {
     timeout: ADB_MUTATION_TIMEOUT_MS,
   });
-  if (r.status !== 0) throw new Error(`adb shell ${args.join(" ")} failed: ${r.stderr}`);
+  if (execFailed(r)) {
+    throw new Error(
+      `adb shell ${args.join(" ")} failed: ${execFailure(r)}`,
+    );
+  }
   return getUserRotation(serial);
 }
 
@@ -108,7 +157,11 @@ export async function getFontScale(serial: string): Promise<FontScaleStatus> {
   const r = await execText("adb", ["-s", serial, "shell", "settings", "get", "system", "font_scale"], {
     timeout: ADB_QUERY_TIMEOUT_MS,
   });
-  if (r.status !== 0) throw new Error(`settings get system font_scale failed: ${r.stderr}`);
+  if (execFailed(r)) {
+    throw new Error(
+      `settings get system font_scale failed: ${execFailure(r)}`,
+    );
+  }
   const raw = r.stdout.trim();
   const scale = Number(raw);
   if (!Number.isFinite(scale) || scale <= 0) {
@@ -126,7 +179,11 @@ export async function setFontScale(serial: string, scale: number): Promise<FontS
   const r = await execText("adb", ["-s", serial, "shell", ...args], {
     timeout: ADB_MUTATION_TIMEOUT_MS,
   });
-  if (r.status !== 0) throw new Error(`adb shell ${args.join(" ")} failed: ${r.stderr}`);
+  if (execFailed(r)) {
+    throw new Error(
+      `adb shell ${args.join(" ")} failed: ${execFailure(r)}`,
+    );
+  }
   return getFontScale(serial);
 }
 
@@ -143,7 +200,9 @@ export async function getNightMode(serial: string): Promise<NightModeStatus> {
   const r = await execText("adb", ["-s", serial, "shell", "cmd", "uimode", "night"], {
     timeout: ADB_QUERY_TIMEOUT_MS,
   });
-  if (r.status !== 0) throw new Error(`cmd uimode night failed: ${r.stderr}`);
+  if (execFailed(r)) {
+    throw new Error(`cmd uimode night failed: ${execFailure(r)}`);
+  }
   const raw = r.stdout.trim();
   return { mode: nightModeFromRaw(raw), raw };
 }
@@ -154,15 +213,32 @@ export async function setNightMode(serial: string, mode: NightMode): Promise<Nig
   const r = await execText("adb", ["-s", serial, "shell", ...args], {
     timeout: ADB_MUTATION_TIMEOUT_MS,
   });
-  if (r.status !== 0) throw new Error(`adb shell ${args.join(" ")} failed: ${r.stderr}`);
+  if (execFailed(r)) {
+    throw new Error(
+      `adb shell ${args.join(" ")} failed: ${execFailure(r)}`,
+    );
+  }
   return getNightMode(serial);
 }
 
-async function globalSetting(serial: string, name: string): Promise<string> {
-  const r = await execText("adb", ["-s", serial, "shell", "settings", "get", "global", name], {
-    timeout: ADB_QUERY_TIMEOUT_MS,
-  });
-  if (r.status !== 0) throw new Error(`settings get global ${name} failed: ${r.stderr}`);
+async function globalSetting(
+  serial: string,
+  name: string,
+  runExec: typeof execText = execText,
+): Promise<string> {
+  const r = await runExec(
+    "adb",
+    ["-s", serial, "shell", "settings", "get", "global", name],
+    {
+      timeout: ADB_QUERY_TIMEOUT_MS,
+    },
+  );
+  if (execFailed(r)) {
+    throw new Error(
+      `settings get global ${name} failed: ${execFailure(r)}`,
+      { cause: r.error ?? undefined },
+    );
+  }
   return r.stdout.trim();
 }
 
@@ -172,9 +248,14 @@ function radioStatusFromSetting(raw: string): NetworkRadioStatus {
   return "unknown";
 }
 
-export async function getNetworkStatus(serial: string): Promise<NetworkStatus> {
-  const wifiRaw = await globalSetting(serial, "wifi_on");
-  const mobileDataRaw = await globalSetting(serial, "mobile_data");
+export async function getNetworkStatus(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<NetworkStatus> {
+  const [wifiRaw, mobileDataRaw] = await Promise.all([
+    globalSetting(serial, "wifi_on", runExec),
+    globalSetting(serial, "mobile_data", runExec),
+  ]);
   const wifi = radioStatusFromSetting(wifiRaw);
   const mobileData = radioStatusFromSetting(mobileDataRaw);
   const radios = [wifi, mobileData];
@@ -198,7 +279,11 @@ export async function setNetworkEnabled(serial: string, enabled: boolean): Promi
     const r = await execText("adb", ["-s", serial, "shell", ...args], {
       timeout: ADB_MUTATION_TIMEOUT_MS,
     });
-    if (r.status !== 0) throw new Error(`adb shell ${args.join(" ")} failed: ${r.stderr}`);
+    if (execFailed(r)) {
+      throw new Error(
+        `adb shell ${args.join(" ")} failed: ${execFailure(r)}`,
+      );
+    }
   }
   return getNetworkStatus(serial);
 }

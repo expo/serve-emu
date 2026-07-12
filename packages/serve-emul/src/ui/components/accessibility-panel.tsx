@@ -1,4 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useDeviceSessionSnapshot } from "../lib/device-session-store";
+import { usePoll } from "../lib/use-poll";
+import { AccessibilityNodeList } from "./accessibility-node-list";
 
 export type AccessibilityNode = {
   id: string;
@@ -27,17 +30,6 @@ type AccessibilitySelector = Partial<
     "id" | "text" | "contentDescription" | "resourceId" | "className" | "packageName" | "clickable" | "enabled"
   >
 > & { index?: number };
-
-function nodeLabel(node: AccessibilityNode): string {
-  return node.text || node.contentDescription || node.resourceId || node.className || "Unlabeled";
-}
-
-function nodeMeta(node: AccessibilityNode): string {
-  const role = node.className.split(".").pop() || "node";
-  const width = node.bounds.right - node.bounds.left;
-  const height = node.bounds.bottom - node.bounds.top;
-  return `${role} · ${width}x${height}`;
-}
 
 function preferredSelectorForNode(node: AccessibilityNode): AccessibilitySelector {
   if (node.resourceId) return { resourceId: node.resourceId };
@@ -82,42 +74,36 @@ export function AccessibilityPanel({
   onHighlight,
 }: Props) {
   const [status, setStatus] = useState("AX off");
-  const refreshInFlightRef = useRef(false);
+  const deviceSession = useDeviceSessionSnapshot();
 
-  const refresh = useCallback(async () => {
-    if (!enabled) return;
-    if (refreshInFlightRef.current) return;
-    refreshInFlightRef.current = true;
-    setStatus("Reading...");
-    try {
-      const res = await fetch("/api/accessibility", { cache: "no-store" });
-      const json = await res.json() as { ok?: boolean; nodes?: AccessibilityNode[]; error?: string };
+  const { refresh } = usePoll({
+    enabled: enabled && !deviceSession.transitioning,
+    poll: async ({ signal }) => {
+      setStatus("Reading...");
+      const res = await fetch("/api/accessibility", { cache: "no-store", signal });
+      return await res.json() as { ok?: boolean; nodes?: AccessibilityNode[]; error?: string };
+    },
+    onResult: (json) => {
       if (!json.ok || !json.nodes) {
         setStatus(json.error || "AX unavailable");
         return;
       }
       onNodesChange(json.nodes);
       setStatus(`${json.nodes.length} nodes`);
-    } catch (err) {
-      setStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      refreshInFlightRef.current = false;
-    }
-  }, [enabled, onNodesChange]);
+    },
+    onError: (error) => setStatus(error instanceof Error ? error.message : String(error)),
+    intervalMs: 3000,
+    pollKey: deviceSession.revision,
+  });
 
   useEffect(() => {
-    if (!enabled) {
-      onNodesChange([]);
-      onHighlight(null);
-      setStatus("AX off");
-      return;
-    }
-    void refresh();
-    const timer = setInterval(refresh, 3000);
-    return () => clearInterval(timer);
-  }, [enabled, refresh, onHighlight, onNodesChange]);
+    if (enabled && !deviceSession.transitioning) return;
+    onNodesChange([]);
+    onHighlight(null);
+    setStatus(enabled ? "Switching device..." : "AX off");
+  }, [deviceSession.transitioning, enabled, onHighlight, onNodesChange]);
 
-  const tapNode = async (node: AccessibilityNode) => {
+  const tapNode = useCallback(async (node: AccessibilityNode) => {
     setStatus("Tapping...");
     try {
       const res = await fetch("/api/accessibility/tap", {
@@ -131,10 +117,11 @@ export function AccessibilityPanel({
         return;
       }
       setStatus("Tapped");
+      refresh();
     } catch (err) {
       setStatus(err instanceof Error ? err.message : String(err));
     }
-  };
+  }, [nodes, refresh]);
 
   return (
     <section className="tool-panel accessibility-panel">
@@ -148,30 +135,14 @@ export function AccessibilityPanel({
           Refresh
         </button>
       </div>
-      {enabled && (
-        <div className="ax-list" role="list">
-          {nodes.length === 0 ? (
-            <div className="ax-empty">No accessibility nodes yet.</div>
-          ) : (
-            nodes.map((node) => (
-              <button
-                key={node.id}
-                type="button"
-                className={node.id === highlightedId ? "ax-node active" : "ax-node"}
-                onMouseEnter={() => onHighlight(node.id)}
-                onMouseLeave={() => onHighlight(null)}
-                onFocus={() => onHighlight(node.id)}
-                onBlur={() => onHighlight(null)}
-                onClick={() => void tapNode(node)}
-                title={node.resourceId || node.packageName}
-              >
-                <span>{nodeLabel(node)}</span>
-                <code>{nodeMeta(node)}</code>
-              </button>
-            ))
-          )}
-        </div>
-      )}
+      {enabled ? (
+        <AccessibilityNodeList
+          nodes={nodes}
+          highlightedId={highlightedId}
+          onHighlight={onHighlight}
+          onTapNode={tapNode}
+        />
+      ) : null}
     </section>
   );
 }
