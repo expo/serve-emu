@@ -36,7 +36,7 @@ type MapDrag = {
   moved: boolean;
 };
 type RouteSnapshot = {
-  status: "idle" | "running" | "paused" | "completed" | "error";
+  status: "idle" | "running" | "paused" | "completed" | "error" | "closed";
   waypointCount: number;
   totalMeters: number;
   progressMeters: number;
