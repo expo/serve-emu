@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+// Canonical wire spec and scrcpy version upgrade checklist: ../docs/protocol.md
 export const SCRCPY_VERSION = "4.0";
 const URL = `https://github.com/Genymobile/scrcpy/releases/download/v${SCRCPY_VERSION}/scrcpy-server-v${SCRCPY_VERSION}`;
 

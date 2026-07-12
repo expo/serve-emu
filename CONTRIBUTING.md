@@ -77,9 +77,12 @@ Run the same aggregate check used by CI before requesting review:
 bun run check
 ```
 
-The default CI suite is entirely device-free: fake clocks, timers, sockets,
-processes, and sessions exercise lifecycle and protocol behavior without an
-Android SDK, ADB, an emulator, or a connected device.
+The aggregate check verifies generated documentation, runs package coverage,
+checks the server, browser, and test TypeScript projects, builds the production
+UI, and exercises the packed package. The default CI suite is entirely
+device-free: fake clocks, timers, sockets, processes, and sessions exercise
+lifecycle and protocol behavior without an Android SDK, ADB, an emulator, or a
+connected device.
 
 For runtime changes, optionally supplement CI with a real device or emulator:
 
@@ -101,21 +104,17 @@ you performed in the pull request.
 
 ## scrcpy and ADB Notes
 
-Streaming uses the vendored scrcpy server at `vendor/scrcpy-server-v<VERSION>`.
+Streaming uses the vendored scrcpy server at
+`packages/serve-emul/vendor/scrcpy-server-v<VERSION>`.
 The pinned version is controlled by `packages/serve-emul/scripts/fetch-scrcpy.ts`.
 
 The scrcpy wire protocol can drift between major versions. If you bump the
-scrcpy server version, re-validate `packages/serve-emul/src/scrcpy.ts` against the
-new server and document what changed.
-
-Current protocol shape:
-
-- open two sockets through `adb forward tcp:<port> localabstract:scrcpy_<scid>`
-- both sockets start with a 1-byte dummy prefix
-- the video socket sends a 64-byte device name and 12-byte codec metadata
-- each frame is `[8-byte PTS big-endian, 4-byte size big-endian, Annex-B NALUs]`
-- the high bit of PTS marks codec configuration frames
-- the control socket consumes binary messages encoded in `src/input.ts`
+scrcpy server version, follow the complete
+[scrcpy upgrade checklist](packages/serve-emul/docs/protocol.md#scrcpy-upgrade-checklist).
+The canonical protocol reference documents the current v3/v4 video framing,
+control messages, `SEMU` WebSocket metadata, and byte-level golden examples. Do
+not duplicate those layouts in another document; update the reference and its
+parser fixtures together.
 
 Do not shell out to `adb shell input` for device interaction. Write to scrcpy's
 control socket instead; the latency difference is large enough to affect agent
@@ -189,8 +188,9 @@ Before publishing, review `packages/serve-emul/CHANGELOG.md`, then run:
 bun run check
 ```
 
-That runs the package tests, server and UI typechecks, production UI build,
-packed-tarball consumer smoke test, and Knip unused-code analysis.
+That verifies generated documentation, runs package coverage, checks the server,
+UI, and test TypeScript projects, builds the production UI, and runs the
+packed-tarball consumer smoke test.
 
 Commit only the version and changelog files, then tag and publish:
 

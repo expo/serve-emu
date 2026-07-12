@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { SCRCPY_VERSION, ensureScrcpyServer } from "../scripts/fetch-scrcpy.ts";
 import { execText } from "./exec.ts";
 
+// Canonical scrcpy wire layouts and upgrade checklist: ../docs/protocol.md
 const DEVICE_JAR_CACHE_PATH =
   `/data/local/tmp/serve-emul-scrcpy-server-v${SCRCPY_VERSION}.jar`;
 

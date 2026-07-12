@@ -28,12 +28,17 @@ bun run --filter serve-emul setup
 bun run packages/serve-emul/src/cli.ts
 bun run dev
 bun run --filter serve-emul dev:ui
+bun run --filter serve-emul test
 bun run --filter serve-emul typecheck
 bun run --filter serve-emul typecheck:ui
 bun run --filter serve-emul build
+bun run docs:check
+bun run check
 ```
 
-`setup` downloads the pinned scrcpy server into `vendor/` and builds the browser UI. The CLI also runs the scrcpy setup lazily on first start.
+`setup` downloads the pinned scrcpy server into
+`packages/serve-emul/vendor/` and builds the browser UI. The CLI also runs the
+scrcpy setup lazily on first start.
 
 ## Runtime Assumptions
 
@@ -46,17 +51,16 @@ bun run --filter serve-emul build
 
 ## scrcpy Protocol Notes
 
-Streaming runs through the vendored scrcpy server (`vendor/scrcpy-server-v<VERSION>`). The version is pinned in `packages/serve-emul/scripts/fetch-scrcpy.ts`. The wire protocol drifts between scrcpy majors, so bumping the version requires re-validating `packages/serve-emul/src/scrcpy.ts` and `packages/serve-emul/src/input.ts`.
+The canonical [protocol reference](packages/serve-emul/docs/protocol.md) is the
+source of truth for scrcpy v3/v4 framing, control packets, `SEMU` metadata,
+golden bytes, and the scrcpy upgrade checklist. The server version remains
+pinned in `packages/serve-emul/scripts/fetch-scrcpy.ts`; update that marker, the
+reference, and parser fixtures together whenever it changes.
 
-Current server protocol shape:
-
-- Open two sockets through `adb forward tcp:<port> localabstract:scrcpy_<scid>`.
-- Both sockets may include a 1-byte dummy prefix; `src/scrcpy.ts` detects video preamble alignment instead of assuming one fixed offset.
-- The video socket yields a 64-byte device name, then 12 bytes of codec metadata: codec id, width, height, all big-endian.
-- Frames are `[8B PTS BE, 4B size BE, N B Annex-B NALUs]`.
-- PTS high bits mark config and key frames. Keep `PACKET_FLAG_CONFIG` and `PACKET_FLAG_KEY_FRAME` handling in sync with scrcpy.
-- Cache SPS/PPS config packets and prepend them to keyframes so clients joining mid-stream can initialize their decoder.
-- Control socket packets are binary messages described in `packages/serve-emul/src/input.ts`.
+Keep protocol-sensitive behavior low-latency and join-safe: detect the video
+preamble alignment, bound packet and reader sizes, cache SPS/PPS configuration
+for key frames, and encode input directly onto the control socket. Do not add a
+second byte-layout description here that can drift from the tested reference.
 
 ## Server and API Guidance
 
@@ -77,12 +81,10 @@ Current server protocol shape:
 
 ## Validation
 
-Run the checks that match the touched area:
+Run the aggregate check before handing off a change:
 
 ```sh
-bun run --filter serve-emul typecheck
-bun run --filter serve-emul typecheck:ui
-bun run --filter serve-emul build
+bun run check
 ```
 
 For runtime or protocol changes, also test manually with a booted emulator or device:

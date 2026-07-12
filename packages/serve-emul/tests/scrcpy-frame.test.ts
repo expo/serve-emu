@@ -9,6 +9,10 @@ import {
   readFrame,
 } from "../src/scrcpy.ts";
 import { SCRCPY_VERSION } from "../scripts/fetch-scrcpy.ts";
+import {
+  PROTOCOL_GOLDEN_HEX,
+  goldenBytes,
+} from "./fixtures/protocol-golden.ts";
 
 function frameHeader(
   protocol: 3 | 4,
@@ -78,6 +82,37 @@ function makeReader() {
 describe("scrcpy protocol goldens", () => {
   test("fixtures are pinned to the vendored scrcpy 4.0 protocol", () => {
     expect(SCRCPY_VERSION).toBe("4.0");
+  });
+
+  test("documented byte fixtures are accepted by the parser", () => {
+    const name = Buffer.alloc(64);
+    name.write("Pixel Golden", "utf8");
+    for (const [protocol, tail] of [
+      [3, "v3-preamble-tail"],
+      [4, "v4-preamble-tail"],
+    ] as const) {
+      expect(
+        parseVideoPreamble(Buffer.concat([name, Buffer.from(goldenBytes(tail))])),
+      ).toMatchObject({ protocol, width: 1080, height: 1920 });
+    }
+
+    expect(
+      parseFrameHeader(Buffer.from(goldenBytes("v3-key-header")), 3),
+    ).toMatchObject({ kind: "frame", pts: 42n, isKey: true });
+    expect(
+      parseFrameHeader(Buffer.from(goldenBytes("v4-key-header")), 4),
+    ).toMatchObject({ kind: "frame", pts: 42n, isKey: true });
+    expect(
+      parseFrameHeader(Buffer.from(goldenBytes("v4-resize")), 4),
+    ).toEqual({
+      kind: "session",
+      clientResized: true,
+      width: 1080,
+      height: 1920,
+    });
+    expect(PROTOCOL_GOLDEN_HEX["v4-resize"]).toBe(
+      "800000010000043800000780",
+    );
   });
 
   test.each([
