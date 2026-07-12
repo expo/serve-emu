@@ -194,8 +194,11 @@ async function main() {
   const stop = (): Promise<void> => {
     if (stopping) return stopping;
     stopping = (async () => {
-      await stopServer();
-      emulatorLaunch?.stop();
+      try {
+        await stopServer();
+      } finally {
+        emulatorLaunch?.stop();
+      }
     })();
     return stopping;
   };

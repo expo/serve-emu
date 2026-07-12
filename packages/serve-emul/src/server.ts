@@ -68,6 +68,17 @@ import {
 } from "./location.ts";
 import { parseRoutePlaybackRequest } from "./route-playback.ts";
 import {
+  parseSessionReplayMultiplier,
+  SessionReplayConflictError,
+} from "./session-recorder.ts";
+import {
+  clearSessionReplayResponse,
+  sessionReplayErrorResponse,
+  startSessionReplayResponse,
+  stopSessionReplayResponse,
+} from "./session-replay-api.ts";
+import { createSessionReplayHandlers } from "./session-replay-session.ts";
+import {
   ActiveDeviceSession,
   DeviceSessionManager,
   SessionChangedError,
@@ -1621,66 +1632,83 @@ export async function startServer(
       if (url.pathname === "/api/session") {
         if (req.method === "GET")
           return Response.json(requestContext.recorder.snapshot());
-        if (req.method === "DELETE")
-          return Response.json({
-            ok: true,
-            session: requestContext.recorder.clear(),
-          });
+        if (req.method === "DELETE") {
+          try {
+            sessions.assertCurrent(requestContext);
+            return clearSessionReplayResponse(requestContext.recorder);
+          } catch (err) {
+            return errorResponse(err);
+          }
+        }
         return new Response("method not allowed", { status: 405 });
       }
 
       if (url.pathname === "/api/session/replay") {
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
+        const replayRecorder = requestContext.recorder;
+        const replayAdmissionEpoch = replayRecorder.replayAdmissionEpoch;
+        let multiplier: number;
         try {
           const payload = await readJsonBody(
             req,
             MAX_JSON_BODY_BYTES,
             requestContext,
           );
-          const multiplier =
-            typeof payload === "object" &&
-            payload !== null &&
-            !Array.isArray(payload)
-              ? Number((payload as Record<string, unknown>).multiplier ?? 1)
-              : 1;
-          const replay = requestContext.recorder.replay(
-            {
-              dispatchGesture: (gesture) =>
-                dispatchGesture(
-                  requestContext,
-                  gesture,
-                  "session:replay",
-                  false,
-                ),
-              setLocation: async (fix) => {
-                await applyLocation(
-                  requestContext,
-                  fix,
-                  "session:replay",
-                  false,
-                );
-              },
-            },
-            multiplier,
-          );
-          void requestContext.trackUntilAbort(replay).catch(() => {});
-          return Response.json({
-            ok: true,
-            session: requestContext.recorder.snapshot(),
-          });
+          multiplier = parseSessionReplayMultiplier(payload);
         } catch (err) {
-          return errorResponse(err);
+          return err instanceof SessionChangedError
+            ? errorResponse(err)
+            : sessionReplayErrorResponse(err, 400);
         }
+        const isCurrentReplaySession = () =>
+          replayAdmissionEpoch === replayRecorder.replayAdmissionEpoch &&
+          replayRecorder === requestContext.recorder &&
+          sessions.isCurrent(requestContext);
+        const handlers = createSessionReplayHandlers({
+          generation: requestContext.generation,
+          getGeneration: () => sessions.current.generation,
+          dispatchGesture: (gesture) =>
+            dispatch(
+              requestContext.scrcpy.controlSocket,
+              gesture,
+              requestContext.screen,
+            ),
+          setLocation: async (fix, signal) => {
+            requestContext.route.stop();
+            await setLocation(requestContext.serial, fix, signal);
+            if (!isCurrentReplaySession()) {
+              throw new SessionReplayConflictError(
+                "device session changed during session replay",
+              );
+            }
+            requestContext.lastLocation = {
+              ...fix,
+              appliedAt: new Date().toISOString(),
+            };
+          },
+        });
+        return startSessionReplayResponse(
+          replayRecorder,
+          handlers,
+          multiplier,
+          isCurrentReplaySession,
+        );
       }
 
       if (url.pathname === "/api/session/replay/stop") {
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
-        return Response.json({
-          ok: true,
-          session: requestContext.recorder.stopReplay(),
-        });
+        const stoppedRecorder = requestContext.recorder;
+        const response = await stopSessionReplayResponse(stoppedRecorder);
+        if (!sessions.isCurrent(requestContext)) {
+          return sessionReplayErrorResponse(
+            new SessionReplayConflictError(
+              "device session changed while stopping session replay",
+            ),
+          );
+        }
+        return response;
       }
 
       if (url.pathname === "/api/apps/install") {

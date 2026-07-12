@@ -5,6 +5,7 @@ import type { GeoFix } from "./location.ts";
 import { RoutePlayback } from "./route-playback.ts";
 import type { ScrcpySession } from "./scrcpy.ts";
 import { SessionRecorder } from "./session-recorder.ts";
+import { disposeReplayBefore } from "./session-replay-lifecycle.ts";
 import type { SessionStatus } from "./session-status.ts";
 
 const FRAME_STAT_WINDOW = 240;
@@ -248,9 +249,14 @@ export class ActiveDeviceSession<
     this.lastError = reason;
     this.stoppedAt = new Date(this.#now()).toISOString();
     this.abortController.abort(new SessionChangedError(this.generation, null));
-    this.recorder.stopReplay();
-    this.route.stop();
-    this.route.close();
+    const replayDisposed = disposeReplayBefore({
+      recorder: this.recorder,
+      stopRoute: () => {
+        this.route.stop();
+        this.route.close();
+      },
+      afterReplayStopped: () => {},
+    });
     if (this.watchdog) clearInterval(this.watchdog);
     this.watchdog = null;
     this.closeClients(opts.clientCode ?? (nextStatus === "error" ? 1011 : 1000), reason);
@@ -261,10 +267,10 @@ export class ActiveDeviceSession<
 
     void (async () => {
       for (const cleanup of cleanups) this.#startCleanup(cleanup);
+      await replayDisposed;
       try {
         this.scrcpy.close();
       } catch {}
-      await this.#drainCleanups();
       await Promise.allSettled(drains);
       await this.#drainCleanups();
       // A route start that was awaiting its initial location can otherwise
