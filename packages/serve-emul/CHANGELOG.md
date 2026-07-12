@@ -8,7 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
 - `minor` for backwards-compatible user-facing features or APIs
 - `major` for breaking CLI, HTTP API, WebSocket protocol, package, or runtime behavior
 
-## 1.0.0 - 2026-07-11
+## 0.0.5 - 2026-07-12
 
 ### Breaking
 
@@ -25,8 +25,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
   `recording` field.
 - Add packed-tarball consumer tests and Knip static analysis to the package
   validation pipeline.
-- Apply the required major-version bump from 0.0.4 to 1.0.0 for the package
-  resolution compatibility change.
+- Publish the cumulative package-boundary and runtime improvements as 0.0.5.
 
 ## 0.0.4 - 2026-06-21
 

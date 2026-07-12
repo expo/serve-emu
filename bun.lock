@@ -11,7 +11,7 @@
     },
     "packages/serve-emul": {
       "name": "serve-emul",
-      "version": "0.0.4",
+      "version": "0.0.5",
       "bin": {
         "serve-emul": "src/cli.ts",
       },
