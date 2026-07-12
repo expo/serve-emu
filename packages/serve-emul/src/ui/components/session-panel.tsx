@@ -14,6 +14,10 @@ type SessionSnapshot = {
   events: SessionEvent[];
   recording: boolean;
   replaying: boolean;
+  replayStatus: "idle" | "running" | "completed" | "cancelled" | "error";
+  replayStartedAt: string | null;
+  replayCompletedAt: string | null;
+  replayCancelledAt: string | null;
   lastError: string | null;
 };
 
@@ -64,14 +68,30 @@ export function SessionPanel() {
 
   const stopReplay = async () => {
     const res = await fetch("/api/session/replay/stop", { method: "POST" });
-    const data = await res.json() as { session?: SessionSnapshot };
+    const data = await res.json() as {
+      ok?: boolean;
+      error?: string;
+      session?: SessionSnapshot;
+    };
+    if (!res.ok || !data.ok) {
+      setStatus(data.error ?? "Replay stop failed");
+      return;
+    }
     setSession(data.session ?? null);
     setStatus("Replay stopped");
   };
 
   const clear = async () => {
     const res = await fetch("/api/session", { method: "DELETE" });
-    const data = await res.json() as { session?: SessionSnapshot };
+    const data = await res.json() as {
+      ok?: boolean;
+      error?: string;
+      session?: SessionSnapshot;
+    };
+    if (!res.ok || !data.ok) {
+      setStatus(data.error ?? "Session clear failed");
+      return;
+    }
     setSession(data.session ?? null);
     setStatus("Cleared");
   };
