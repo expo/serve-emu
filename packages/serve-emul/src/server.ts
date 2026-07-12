@@ -72,6 +72,7 @@ import {
   DeviceSessionManager,
   SessionChangedError,
 } from "./device-session-context.ts";
+import { routePlaybackErrorResponse } from "./route-playback-api.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -1778,10 +1779,15 @@ export async function startServer(
           return Response.json(requestContext.route.snapshot());
         }
         if (req.method === "POST") {
+          let route: ReturnType<typeof parseRoutePlaybackRequest>;
           try {
-            const route = parseRoutePlaybackRequest(
+            route = parseRoutePlaybackRequest(
               await readJsonBody(req, MAX_ROUTE_BODY_BYTES, requestContext),
             );
+          } catch (err) {
+            return errorResponse(err, 400);
+          }
+          try {
             const start = requestContext.route.start(route);
             const snapshot = await requestContext.trackDrain(start);
             sessions.assertCurrent(requestContext);
@@ -1790,7 +1796,9 @@ export async function startServer(
               route: snapshot,
             });
           } catch (err) {
-            return errorResponse(err);
+            return err instanceof SessionChangedError
+              ? errorResponse(err)
+              : routePlaybackErrorResponse(err);
           }
         }
         if (req.method === "DELETE") {

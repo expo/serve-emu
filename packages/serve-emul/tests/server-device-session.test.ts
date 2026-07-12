@@ -201,6 +201,65 @@ describe("startServer device session lifecycle", () => {
     expect(captured.stopCalls).toBe(1);
   });
 
+  test("cancels an old route start when the device session changes", async () => {
+    const a = fakeScrcpy("A");
+    const b = fakeScrcpy("B");
+    const captured: CapturedServer = { options: null, stopCalls: 0 };
+    const routeLocationStarted = deferred<void>();
+    let routeSignal: AbortSignal | null = null;
+    const started = await startServer(
+      { serial: "A", port: 3300 },
+      {
+        openScrcpy: async (serial) => (serial === "A" ? a : b).session,
+        listDevices: async () => [
+          { serial: "A", state: "device" },
+          { serial: "B", state: "device" },
+        ],
+        setLocation: async (serial, _fix, signal) => {
+          if (serial !== "A") return;
+          routeSignal = signal;
+          routeLocationStarted.resolve();
+          await new Promise<void>((_resolve, reject) => {
+            signal.addEventListener(
+              "abort",
+              () => reject(signal.reason),
+              { once: true },
+            );
+          });
+        },
+        serve: capturingServe(captured),
+      },
+    );
+
+    const oldRoute = invokeFetch(captured, "/api/route", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        waypoints: [{ latitude: 51.5, longitude: -0.1 }],
+      }),
+    });
+    await routeLocationStarted.promise;
+
+    const switchResponse = await invokeFetch(captured, "/api/devices/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ serial: "B" }),
+    });
+    expect(switchResponse.status).toBe(200);
+    expect(routeSignal?.aborted).toBe(true);
+
+    const staleResponse = await oldRoute;
+    expect(staleResponse.status).toBe(409);
+    expect(await staleResponse.json()).toMatchObject({ ok: false });
+    const healthResponse = await invokeFetch(captured, "/health");
+    expect(await healthResponse.json()).toMatchObject({
+      generation: 1,
+      serial: "B",
+      route: { status: "idle" },
+    });
+    await started.stop();
+  });
+
   test("rejects a request whose body finishes after the device changes", async () => {
     const a = fakeScrcpy("A");
     const b = fakeScrcpy("B");

@@ -117,9 +117,9 @@ export class ActiveDeviceSession<
         client.ws.close(code, reason);
       });
     this.route = new RoutePlayback({
-      applyLocation: async (fix) => {
+      applyLocation: async (fix, signal) => {
         this.assertUsable();
-        await opts.applyLocation(this.serial, fix, this.signal);
+        await opts.applyLocation(this.serial, fix, signal);
         this.assertUsable();
       },
       onLocation: (fix) => {
