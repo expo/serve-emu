@@ -40,12 +40,23 @@ export type ScrcpyErrorCode =
 
 export type StartOpts = {
   serial: string;
+  signal?: AbortSignal;
   maxFps?: number;
   bitRate?: number;
   maxSize?: number;
   keyFrameInterval?: number;
   repeatFrameMs?: number;
 };
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("scrcpy startup aborted");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError(signal);
+}
 
 // Single source of truth for encoder defaults; the CLI reads these for its
 // option defaults and --help text so the two can't drift.
@@ -376,9 +387,11 @@ async function waitForAbstractSocket(
   serial: string,
   name: string,
   timeoutMs = 30_000,
+  signal?: AbortSignal,
 ) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    throwIfAborted(signal);
     const r = spawnSync(
       "adb",
       ["-s", serial, "shell", "cat", "/proc/net/unix"],
@@ -387,30 +400,50 @@ async function waitForAbstractSocket(
       },
     );
     if (r.stdout && r.stdout.includes(`@${name}`)) return;
-    await sleep(100);
+    await sleep(100, undefined, { signal });
   }
   throw new Error(`Timed out waiting for scrcpy abstract socket @${name}`);
 }
 
-async function connectOnce(port: number, timeoutMs = 3_000): Promise<Socket> {
+async function connectOnce(
+  port: number,
+  timeoutMs = 3_000,
+  signal?: AbortSignal,
+): Promise<Socket> {
   return new Promise<Socket>((resolve, reject) => {
     const s = createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
+      s.removeListener("error", onError);
+      s.removeListener("connect", onConnect);
+      callback();
+    };
     const timeout = setTimeout(() => {
-      s.destroy();
-      reject(new Error(`Timed out connecting to adb forward tcp:${port}`));
+      finish(() => {
+        s.destroy();
+        reject(new Error(`Timed out connecting to adb forward tcp:${port}`));
+      });
     }, timeoutMs);
     const onError = (e: Error) => {
-      clearTimeout(timeout);
-      s.removeListener("connect", onConnect);
-      reject(e);
+      finish(() => reject(e));
     };
     const onConnect = () => {
-      clearTimeout(timeout);
-      s.removeListener("error", onError);
-      resolve(s);
+      finish(() => resolve(s));
+    };
+    const onAbort = () => {
+      finish(() => {
+        s.destroy();
+        reject(abortError(signal!));
+      });
     };
     s.once("error", onError);
     s.once("connect", onConnect);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
 }
 
@@ -492,7 +525,9 @@ export function parseVideoPreamble(buf: Buffer): {
 }
 
 export async function startScrcpy(opts: StartOpts): Promise<ScrcpySession> {
+  throwIfAborted(opts.signal);
   const jar = await ensureScrcpyServer();
+  throwIfAborted(opts.signal);
   const { serial } = opts;
   const maxFps = opts.maxFps ?? SCRCPY_DEFAULTS.maxFps;
   const bitRate = opts.bitRate ?? SCRCPY_DEFAULTS.bitRate;
@@ -532,10 +567,15 @@ export async function startScrcpy(opts: StartOpts): Promise<ScrcpySession> {
       } catch {}
     }
   };
+  const onAbort = () => close();
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
+    throwIfAborted(opts.signal);
     adb(serial, ["push", jar, DEVICE_JAR_PATH]);
+    throwIfAborted(opts.signal);
     localPort = forwardAbstractSocket(serial, scid);
+    throwIfAborted(opts.signal);
 
     proc = spawn(
       "adb",
@@ -577,13 +617,20 @@ export async function startScrcpy(opts: StartOpts): Promise<ScrcpySession> {
     // Wait for the device-side abstract socket to appear before the host dials in;
     // otherwise adb accepts the local connection, then closes it the moment the
     // device-side connect fails, and the client sees a phantom EOF.
-    await waitForAbstractSocket(serial, `scrcpy_${scid}`);
+    await waitForAbstractSocket(
+      serial,
+      `scrcpy_${scid}`,
+      30_000,
+      opts.signal,
+    );
+    throwIfAborted(opts.signal);
 
     // scrcpy in tunnel_forward mode waits for ALL configured sockets to be
     // connected before it begins streaming. Open both, then read the video
     // preamble.
-    videoSock = await connectOnce(localPort);
-    controlSock = await connectOnce(localPort);
+    videoSock = await connectOnce(localPort, 3_000, opts.signal);
+    controlSock = await connectOnce(localPort, 3_000, opts.signal);
+    throwIfAborted(opts.signal);
 
     // After dummy byte, scrcpy may push clipboard events on the control socket;
     // drain them.
@@ -592,7 +639,9 @@ export async function startScrcpy(opts: StartOpts): Promise<ScrcpySession> {
     const reader = new FramedReader(videoSock);
     // scrcpy variants disagree on whether the video socket includes the dummy
     // byte, so detect the codec metadata alignment instead of blindly skipping.
-    const preamble = parseVideoPreamble(await reader.read(81, "header"));
+    const preambleBytes = await reader.read(81, "header");
+    throwIfAborted(opts.signal);
+    const preamble = parseVideoPreamble(preambleBytes);
     if (preamble.codecName !== "h264") {
       throw new ScrcpyStreamError(
         "unsupported-codec",
@@ -602,6 +651,7 @@ export async function startScrcpy(opts: StartOpts): Promise<ScrcpySession> {
     }
     reader.prepend(preamble.extra);
 
+    opts.signal?.removeEventListener("abort", onAbort);
     return {
       transport: "scrcpy",
       meta: {
@@ -621,6 +671,7 @@ export async function startScrcpy(opts: StartOpts): Promise<ScrcpySession> {
       close,
     };
   } catch (err) {
+    opts.signal?.removeEventListener("abort", onAbort);
     close();
     throw err;
   }

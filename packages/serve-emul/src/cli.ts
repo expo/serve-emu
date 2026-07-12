@@ -190,17 +190,20 @@ async function main() {
     throw err;
   });
 
-  const stop = () => {
-    stopServer();
-    emulatorLaunch?.stop();
+  let stopping: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopping) return stopping;
+    stopping = (async () => {
+      await stopServer();
+      emulatorLaunch?.stop();
+    })();
+    return stopping;
   };
   process.once("SIGINT", () => {
-    stop();
-    process.exit(0);
+    void stop().finally(() => process.exit(0));
   });
   process.once("SIGTERM", () => {
-    stop();
-    process.exit(0);
+    void stop().finally(() => process.exit(0));
   });
 
   const base = `http://${displayHost(host)}:${server.port}`;
