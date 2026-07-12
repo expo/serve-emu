@@ -220,6 +220,15 @@ export async function getAccessibilitySnapshot(
   signal?: AbortSignal,
 ): Promise<AccessibilitySnapshot> {
   const xml = await dumpXml(serial, signal);
+  return {
+    ok: true,
+    capturedAt: new Date().toISOString(),
+    nodes: parseAccessibilityXml(xml),
+  };
+}
+
+/** Parse a uiautomator XML dump without requiring a live Android device. */
+export function parseAccessibilityXml(xml: string): AccessibilityNode[] {
   const nodes: AccessibilityNode[] = [];
   let index = 0;
   for (const match of xml.matchAll(/<node\b[^>]*>/g)) {
@@ -238,5 +247,5 @@ export async function getAccessibilitySnapshot(
       bounds,
     });
   }
-  return { ok: true, capturedAt: new Date().toISOString(), nodes };
+  return nodes;
 }

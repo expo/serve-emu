@@ -3,8 +3,13 @@ import type { ForegroundApp } from "./shared/api-contracts.ts";
 
 export type { ForegroundApp } from "./shared/api-contracts.ts";
 
-async function adbShell(serial: string, args: string[], timeout = 4_000): Promise<string> {
-  const result = await execText("adb", ["-s", serial, "shell", ...args], { timeout });
+async function adbShell(
+  serial: string,
+  args: string[],
+  timeout = 4_000,
+  runExec: typeof execText = execText,
+): Promise<string> {
+  const result = await runExec("adb", ["-s", serial, "shell", ...args], { timeout });
   if (result.status !== 0 || result.error) {
     throw new Error(
       (
@@ -40,8 +45,11 @@ function parseComponent(value: string): { packageName: string; activity: string 
   return { packageName, activity };
 }
 
-async function foregroundComponent(serial: string): Promise<{ packageName: string; activity: string | null } | null> {
-  const windowDump = await adbShell(serial, ["dumpsys", "window"], 5_000);
+async function foregroundComponent(
+  serial: string,
+  runExec: typeof execText,
+): Promise<{ packageName: string; activity: string | null } | null> {
+  const windowDump = await adbShell(serial, ["dumpsys", "window"], 5_000, runExec);
   const windowMatch = firstMatch(windowDump, [
     /mCurrentFocus=Window\{[^}]*\s([A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+)\}/,
     /mFocusedApp=ActivityRecord\{[^}]*\s([A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+)\s/,
@@ -52,7 +60,12 @@ async function foregroundComponent(serial: string): Promise<{ packageName: strin
     if (parsed) return parsed;
   }
 
-  const activityDump = await adbShell(serial, ["dumpsys", "activity", "activities"], 5_000);
+  const activityDump = await adbShell(
+    serial,
+    ["dumpsys", "activity", "activities"],
+    5_000,
+    runExec,
+  );
   const activityMatch = firstMatch(activityDump, [
     /topResumedActivity=ActivityRecord\{[^}]*\s([A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+)\s/,
     /mResumedActivity: ActivityRecord\{[^}]*\s([A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+)\s/,
@@ -61,9 +74,13 @@ async function foregroundComponent(serial: string): Promise<{ packageName: strin
   return activityMatch?.[1] ? parseComponent(activityMatch[1]) : null;
 }
 
-async function packagePid(serial: string, packageName: string): Promise<number | null> {
+async function packagePid(
+  serial: string,
+  packageName: string,
+  runExec: typeof execText,
+): Promise<number | null> {
   try {
-    const out = (await adbShell(serial, ["pidof", packageName], 2_000)).trim();
+    const out = (await adbShell(serial, ["pidof", packageName], 2_000, runExec)).trim();
     const first = out.split(/\s+/)[0];
     const pid = first ? Number(first) : NaN;
     return Number.isFinite(pid) ? pid : null;
@@ -72,9 +89,18 @@ async function packagePid(serial: string, packageName: string): Promise<number |
   }
 }
 
-async function packageDetails(serial: string, packageName: string) {
+async function packageDetails(
+  serial: string,
+  packageName: string,
+  runExec: typeof execText,
+) {
   try {
-    const dump = await adbShell(serial, ["dumpsys", "package", packageName], 5_000);
+    const dump = await adbShell(
+      serial,
+      ["dumpsys", "package", packageName],
+      5_000,
+      runExec,
+    );
     const versionName = dump.match(/versionName=([^\s]+)/)?.[1] ?? null;
     const versionCode = dump.match(/versionCode=(\d+)/)?.[1] ?? null;
     const label =
@@ -88,8 +114,11 @@ async function packageDetails(serial: string, packageName: string) {
   }
 }
 
-export async function getForegroundApp(serial: string): Promise<ForegroundApp> {
-  const component = await foregroundComponent(serial);
+export async function getForegroundApp(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<ForegroundApp> {
+  const component = await foregroundComponent(serial, runExec);
   if (!component) {
     return {
       packageName: null,
@@ -102,8 +131,8 @@ export async function getForegroundApp(serial: string): Promise<ForegroundApp> {
     };
   }
   const [details, pid] = await Promise.all([
-    packageDetails(serial, component.packageName),
-    packagePid(serial, component.packageName),
+    packageDetails(serial, component.packageName, runExec),
+    packagePid(serial, component.packageName, runExec),
   ]);
   return {
     packageName: component.packageName,

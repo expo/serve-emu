@@ -236,42 +236,86 @@ export async function importMediaFile(
   }
 }
 
-export function launchApp(serial: string, packageNameValue: string, activity?: string): Promise<AppActionResult> {
+export function launchApp(
+  serial: string,
+  packageNameValue: string,
+  activity?: string,
+  dependencies: AppManagementDependencies = {},
+): Promise<AppActionResult> {
   const pkg = packageName(packageNameValue);
   if (activity) {
     const act = activityName(activity);
     const component = act.includes("/") ? act : `${pkg}/${act}`;
-    return adb(serial, ["shell", "am", "start", "-n", component]);
+    return adb(
+      serial,
+      ["shell", "am", "start", "-n", component],
+      30_000,
+      undefined,
+      dependencies.execText,
+    );
   }
-  return adb(serial, [
-    "shell",
-    "monkey",
-    "-p",
-    pkg,
-    "-c",
-    "android.intent.category.LAUNCHER",
-    "1",
-  ]);
+  return adb(
+    serial,
+    [
+      "shell",
+      "monkey",
+      "-p",
+      pkg,
+      "-c",
+      "android.intent.category.LAUNCHER",
+      "1",
+    ],
+    30_000,
+    undefined,
+    dependencies.execText,
+  );
 }
 
-export function clearAppData(serial: string, packageNameValue: string): Promise<AppActionResult> {
-  return adb(serial, ["shell", "pm", "clear", packageName(packageNameValue)]);
+export function clearAppData(
+  serial: string,
+  packageNameValue: string,
+  dependencies: AppManagementDependencies = {},
+): Promise<AppActionResult> {
+  return adb(
+    serial,
+    ["shell", "pm", "clear", packageName(packageNameValue)],
+    30_000,
+    undefined,
+    dependencies.execText,
+  );
 }
 
-export function forceStopApp(serial: string, packageNameValue: string): Promise<AppActionResult> {
-  return adb(serial, ["shell", "am", "force-stop", packageName(packageNameValue)]);
+export function forceStopApp(
+  serial: string,
+  packageNameValue: string,
+  dependencies: AppManagementDependencies = {},
+): Promise<AppActionResult> {
+  return adb(
+    serial,
+    ["shell", "am", "force-stop", packageName(packageNameValue)],
+    30_000,
+    undefined,
+    dependencies.execText,
+  );
 }
 
 export function grantPermission(
   serial: string,
   packageNameValue: string,
   permissionValue: string,
+  dependencies: AppManagementDependencies = {},
 ): Promise<AppActionResult> {
-  return adb(serial, [
-    "shell",
-    "pm",
-    "grant",
-    packageName(packageNameValue),
-    permissionName(permissionValue),
-  ]);
+  return adb(
+    serial,
+    [
+      "shell",
+      "pm",
+      "grant",
+      packageName(packageNameValue),
+      permissionName(permissionValue),
+    ],
+    30_000,
+    undefined,
+    dependencies.execText,
+  );
 }
