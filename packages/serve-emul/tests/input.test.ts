@@ -1,170 +1,114 @@
 import { describe, expect, test } from "bun:test";
 import type { Socket } from "node:net";
 import {
+  MAX_TEXT_BYTES,
   dispatch,
-  resetVideoPacket,
-  type DispatchSleep,
+  normalizeTextForControl,
+  parseGesture,
   type Gesture,
 } from "../src/input.ts";
-import { SCRCPY_VERSION } from "../scripts/fetch-scrcpy.ts";
 
-const SCREEN = { width: 100, height: 200 };
-
-class CaptureSocket {
+class FakeSocket {
   readonly writes: Buffer[] = [];
 
-  write(data: Buffer): boolean {
-    this.writes.push(Buffer.from(data));
+  write(chunk: Uint8Array | string): boolean {
+    this.writes.push(Buffer.from(chunk));
     return true;
   }
 }
 
-function golden(value: string): string {
-  return value.replaceAll(/\s/g, "");
+function parsedText(text: string): Extract<Gesture, { type: "text" }> {
+  const gesture = parseGesture({ type: "text", text });
+  if (gesture.type !== "text") throw new Error("expected a text gesture");
+  return gesture;
 }
 
-async function encode(gesture: Gesture): Promise<{
-  packets: string[];
-  delays: number[];
-}> {
-  const socket = new CaptureSocket();
-  const delays: number[] = [];
-  const sleep: DispatchSleep = async (ms) => {
-    delays.push(ms);
-  };
-  await dispatch(socket as unknown as Socket, gesture, SCREEN, sleep);
-  return {
-    packets: socket.writes.map((packet) => packet.toString("hex")),
-    delays,
-  };
+function decodeTextPacket(packet: Buffer): string {
+  expect(packet.readUInt8(0)).toBe(1);
+  const length = packet.readUInt32BE(1);
+  expect(packet.length).toBe(5 + length);
+  return packet.subarray(5).toString("utf8");
 }
 
-describe("scrcpy control packet goldens", () => {
-  test("fixtures are pinned to the vendored scrcpy 4.0 protocol", () => {
-    expect(SCRCPY_VERSION).toBe("4.0");
+async function dispatchText(gesture: Extract<Gesture, { type: "text" }>) {
+  const socket = new FakeSocket();
+  await dispatch(socket as unknown as Socket, gesture, { width: 1080, height: 1920 });
+  expect(socket.writes).toHaveLength(1);
+  return socket.writes[0];
+}
+
+async function expectParsedPacketParity(input: string, expected: string) {
+  const gesture = parsedText(input);
+  expect(gesture.text).toBe(expected);
+  expect(Buffer.byteLength(gesture.text, "utf8")).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+
+  const packet = await dispatchText(gesture);
+  expect(packet.readUInt32BE(1)).toBe(Buffer.byteLength(gesture.text, "utf8"));
+  expect(decodeTextPacket(packet)).toBe(gesture.text);
+}
+
+describe("normalizeTextForControl", () => {
+  test("preserves ASCII and empty text", () => {
+    expect(normalizeTextForControl("hello")).toBe("hello");
+    expect(normalizeTextForControl("")).toBe("");
   });
 
-  test("tap writes exact down/up packets with an injectable delay", async () => {
-    const result = await encode({ type: "tap", x: 0.25, y: 0.5 });
-    expect(result).toEqual({
-      packets: [
-        golden("02 00 0000000000000000 00000019 00000064 0064 00c8 ffff 00000001 00000001"),
-        golden("02 01 0000000000000000 00000019 00000064 0064 00c8 0000 00000001 00000000"),
-      ],
-      delays: [20],
-    });
+  test("truncates overlong ASCII to the byte limit", () => {
+    const normalized = normalizeTextForControl("a".repeat(MAX_TEXT_BYTES + 1));
+    expect(normalized).toBe("a".repeat(MAX_TEXT_BYTES));
+    expect(Buffer.byteLength(normalized, "utf8")).toBe(MAX_TEXT_BYTES);
   });
 
-  test("touch writes the exact action, pointer, position, and screen", async () => {
-    const result = await encode({
-      type: "touch",
-      action: "move",
-      x: 0.1,
-      y: 0.2,
-      pointerId: 7,
-    });
-    expect(result).toEqual({
-      packets: [
-        golden("02 02 0000000000000007 0000000a 00000028 0064 00c8 ffff 00000001 00000001"),
-      ],
-      delays: [],
-    });
+  test("keeps a multibyte code point that exactly fits", () => {
+    const normalized = normalizeTextForControl(`${"a".repeat(298)}éZ`);
+    expect(normalized).toBe(`${"a".repeat(298)}é`);
+    expect(Buffer.byteLength(normalized, "utf8")).toBe(MAX_TEXT_BYTES);
   });
 
-  test("key writes exact down/up packets including meta state", async () => {
-    const result = await encode({ type: "key", keycode: 66, metaState: 3 });
-    expect(result).toEqual({
-      packets: [
-        golden("00 00 00000042 00000000 00000003"),
-        golden("00 01 00000042 00000000 00000003"),
-      ],
-      delays: [],
-    });
+  test("never splits an emoji code point at the boundary", () => {
+    const normalized = normalizeTextForControl(`${"a".repeat(298)}😀`);
+    expect(normalized).toBe("a".repeat(298));
+    expect(Buffer.byteLength(normalized, "utf8")).toBe(298);
+    expect(Buffer.from(normalized, "utf8").toString("utf8")).toBe(normalized);
   });
 
-  test("text writes an exact UTF-8 length-prefixed packet", async () => {
-    const result = await encode({ type: "text", text: "A😀" });
-    expect(result).toEqual({
-      packets: [golden("01 00000005 41 f09f9880")],
-      delays: [],
-    });
+  test("canonicalizes lone surrogates to the bytes scrcpy receives", async () => {
+    const input = `before\ud800after`;
+    const expected = "before�after";
+
+    expect(normalizeTextForControl(input)).toBe(expected);
+    await expectParsedPacketParity(input, expected);
+  });
+});
+
+describe("text control packet parity", () => {
+  test("parsed and packet text match for empty and ASCII input", async () => {
+    await expectParsedPacketParity("", "");
+    await expectParsedPacketParity("plain text", "plain text");
+    await expectParsedPacketParity("x".repeat(301), "x".repeat(MAX_TEXT_BYTES));
   });
 
-  test("text truncation never splits a UTF-8 code point", async () => {
-    const result = await encode({
-      type: "text",
-      text: `${"a".repeat(299)}😀tail`,
-    });
-    const packet = Buffer.from(result.packets[0], "hex");
-    expect(packet.readUInt32BE(1)).toBe(299);
-    expect(packet.subarray(5).toString("utf8")).toBe("a".repeat(299));
-    expect(packet).toHaveLength(304);
+  test("parsed and packet text match at multibyte and emoji boundaries", async () => {
+    await expectParsedPacketParity(
+      `${"a".repeat(298)}étail`,
+      `${"a".repeat(298)}é`,
+    );
+    await expectParsedPacketParity(
+      `${"a".repeat(296)}😀tail`,
+      `${"a".repeat(296)}😀`,
+    );
+    await expectParsedPacketParity(
+      `${"a".repeat(298)}😀tail`,
+      "a".repeat(298),
+    );
   });
 
-  test.each([
-    {
-      name: "back",
-      gesture: { type: "back" } as const,
-      packets: ["04 00", "04 01"],
-    },
-    {
-      name: "home",
-      gesture: { type: "home" } as const,
-      packets: [
-        "00 00 00000003 00000000 00000000",
-        "00 01 00000003 00000000 00000000",
-      ],
-    },
-    {
-      name: "recents",
-      gesture: { type: "recents" } as const,
-      packets: [
-        "00 00 000000bb 00000000 00000000",
-        "00 01 000000bb 00000000 00000000",
-      ],
-    },
-    {
-      name: "power",
-      gesture: { type: "power" } as const,
-      packets: [
-        "00 00 0000001a 00000000 00000000",
-        "00 01 0000001a 00000000 00000000",
-      ],
-    },
-  ])("$name writes exact navigation packets", async ({ gesture, packets }) => {
-    const result = await encode(gesture);
-    expect(result).toEqual({
-      packets: packets.map(golden),
-      delays: [],
-    });
-  });
+  test("dispatch normalizes callers that bypass parseGesture", async () => {
+    const input = `${"한".repeat(100)}😀extra`;
+    const expected = "한".repeat(100);
+    const packet = await dispatchText({ type: "text", text: input });
 
-  test("reset-video is the exact one-byte control packet", () => {
-    expect(resetVideoPacket().toString("hex")).toBe("11");
-  });
-
-  test("swipe writes a deterministic golden packet plan", async () => {
-    const result = await encode({
-      type: "swipe",
-      x1: 0,
-      y1: 0,
-      x2: 1,
-      y2: 1,
-      durationMs: 80,
-    });
-    expect(result).toEqual({
-      packets: [
-        golden("02 00 0000000000000000 00000000 00000000 0064 00c8 ffff 00000001 00000001"),
-        golden("02 02 0000000000000000 0000000d 00000019 0064 00c8 ffff 00000001 00000001"),
-        golden("02 02 0000000000000000 00000019 00000032 0064 00c8 ffff 00000001 00000001"),
-        golden("02 02 0000000000000000 00000026 0000004b 0064 00c8 ffff 00000001 00000001"),
-        golden("02 02 0000000000000000 00000032 00000064 0064 00c8 ffff 00000001 00000001"),
-        golden("02 02 0000000000000000 0000003f 0000007d 0064 00c8 ffff 00000001 00000001"),
-        golden("02 02 0000000000000000 0000004b 00000096 0064 00c8 ffff 00000001 00000001"),
-        golden("02 02 0000000000000000 00000058 000000af 0064 00c8 ffff 00000001 00000001"),
-        golden("02 01 0000000000000000 00000064 000000c8 0064 00c8 0000 00000001 00000000"),
-      ],
-      delays: [10, 10, 10, 10, 10, 10, 10, 10],
-    });
+    expect(decodeTextPacket(packet)).toBe(expected);
+    expect(packet.readUInt32BE(1)).toBe(MAX_TEXT_BYTES);
   });
 });

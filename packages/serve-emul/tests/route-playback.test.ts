@@ -1,58 +1,25 @@
 import { describe, expect, test } from "bun:test";
 import {
   RoutePlayback,
-  type RoutePlaybackRuntime,
-  type RoutePlaybackTimer,
+  RoutePlaybackConflictError,
+  type RoutePlaybackClock,
+  type RoutePlaybackRequest,
 } from "../src/route-playback.ts";
-import type { GeoFix } from "../src/location.ts";
-
-type FakeTimer = {
-  id: number;
-  callback: () => void;
-  ms: number;
-  active: boolean;
-};
-
-class FakeRuntime implements RoutePlaybackRuntime {
-  nowMs = Date.UTC(2026, 0, 1);
-  readonly timers: FakeTimer[] = [];
-  #nextId = 1;
-
-  now = () => this.nowMs;
-
-  setInterval = (callback: () => void, ms: number): RoutePlaybackTimer => {
-    const timer: FakeTimer = {
-      id: this.#nextId++,
-      callback,
-      ms,
-      active: true,
-    };
-    this.timers.push(timer);
-    return timer;
-  };
-
-  clearInterval = (handle: RoutePlaybackTimer): void => {
-    (handle as FakeTimer).active = false;
-  };
-
-  get activeTimers(): FakeTimer[] {
-    return this.timers.filter((timer) => timer.active);
-  }
-
-  advance(ms: number): void {
-    this.nowMs += ms;
-  }
-}
+import {
+  routePlaybackErrorResponse,
+  startRoutePlaybackResponse,
+} from "../src/route-playback-api.ts";
+import { createSessionRoutePlayback } from "../src/route-playback-session.ts";
 
 type Deferred<T> = {
   promise: Promise<T>;
   resolve: (value: T) => void;
-  reject: (error: Error) => void;
+  reject: (reason?: unknown) => void;
 };
 
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
-  let reject!: (error: Error) => void;
+  let reject!: (reason?: unknown) => void;
   const promise = new Promise<T>((res, rej) => {
     resolve = res;
     reject = rej;
@@ -60,208 +27,441 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
+class ManualClock implements RoutePlaybackClock {
+  nowMs = Date.UTC(2026, 0, 1);
+  active = new Map<number, () => void>();
+  cleared: Array<() => void> = [];
+  maxActive = 0;
+  #nextHandle = 1;
+
+  now = () => this.nowMs;
+
+  setInterval = (callback: () => void): number => {
+    const handle = this.#nextHandle++;
+    this.active.set(handle, callback);
+    this.maxActive = Math.max(this.maxActive, this.active.size);
+    return handle;
+  };
+
+  clearInterval = (handle: unknown): void => {
+    const callback = this.active.get(handle as number);
+    if (callback) this.cleared.push(callback);
+    this.active.delete(handle as number);
+  };
+
+  advance(ms: number): void {
+    this.nowMs += ms;
+  }
+
+  fireActive(): void {
+    for (const callback of [...this.active.values()]) callback();
+  }
+
+  fireCleared(): void {
+    for (const callback of this.cleared.splice(0)) callback();
+  }
+}
+
+const request: RoutePlaybackRequest = {
+  waypoints: [
+    { latitude: 51.5, longitude: -0.12 },
+    { latitude: 51.51, longitude: -0.11 },
+  ],
+  speedKph: 30,
+  multiplier: 1,
+  intervalMs: 250,
+};
+
 async function flushMicrotasks(): Promise<void> {
-  await Promise.resolve();
   await Promise.resolve();
   await Promise.resolve();
 }
 
-const LONG_ROUTE = {
-  waypoints: [
-    { latitude: 0, longitude: 0 },
-    { latitude: 0, longitude: 0.01 },
-  ],
-  speedKph: 30,
-  intervalMs: 1_000,
-};
-
-describe("RoutePlayback timer ownership", () => {
-  test("pause, resume, and stop own exactly one live timer", async () => {
-    const runtime = new FakeRuntime();
-    const applied: GeoFix[] = [];
+describe("RoutePlayback lifecycle", () => {
+  test("close during the initial apply aborts the run without a callback or timer", async () => {
+    const clock = new ManualClock();
+    const applying = deferred<void>();
+    const locations: unknown[] = [];
+    let signal: AbortSignal | undefined;
     const playback = new RoutePlayback({
-      runtime,
-      applyLocation: (fix) => {
-        applied.push(fix);
+      clock,
+      applyLocation: (_fix, runSignal) => {
+        signal = runSignal;
+        return applying.promise;
       },
+      onLocation: (fix) => locations.push(fix),
+    });
+
+    const starting = playback.start(request);
+    expect(signal?.aborted).toBe(false);
+    expect(playback.close().status).toBe("closed");
+    expect(playback.close().status).toBe("closed");
+    expect(signal?.aborted).toBe(true);
+
+    applying.resolve();
+    await expect(starting).rejects.toBeInstanceOf(RoutePlaybackConflictError);
+    expect(locations).toHaveLength(0);
+    expect(clock.active.size).toBe(0);
+    expect(playback.snapshot()).toMatchObject({
+      status: "closed",
+      waypointCount: 0,
+      speedKph: 30,
+      multiplier: 1,
+      intervalMs: 1000,
+      loop: false,
+      currentLocation: null,
+    });
+  });
+
+  test("rejects a concurrent start and owns at most one timer", async () => {
+    const clock = new ManualClock();
+    const applying = deferred<void>();
+    const playback = new RoutePlayback({
+      clock,
+      applyLocation: () => applying.promise,
       onLocation: () => {},
     });
 
-    await playback.start(LONG_ROUTE);
-    expect(runtime.activeTimers).toHaveLength(1);
-    const firstTimer = runtime.activeTimers[0]!;
-    expect(firstTimer.ms).toBe(1_000);
-
-    runtime.advance(250);
-    expect(playback.pause()).toMatchObject({
-      status: "paused",
-      pausedAt: "2026-01-01T00:00:00.250Z",
+    const first = playback.start(request);
+    const second = playback.start(request);
+    await expect(second).rejects.toBeInstanceOf(RoutePlaybackConflictError);
+    await expect(second).rejects.toMatchObject({
+      message: "route playback start is already in progress",
     });
-    expect(runtime.activeTimers).toHaveLength(0);
 
-    runtime.advance(250);
-    expect(playback.resume().status).toBe("running");
-    expect(runtime.activeTimers).toHaveLength(1);
-    const resumedTimer = runtime.activeTimers[0]!;
-
-    // A callback already queued by a cleared interval must not re-enter after
-    // resume, when the route is running again.
-    firstTimer.callback();
-    await flushMicrotasks();
-    expect(applied).toHaveLength(1);
-
-    runtime.advance(1_000);
-    resumedTimer.callback();
-    await flushMicrotasks();
-    expect(applied).toHaveLength(2);
-    expect(playback.snapshot().progressMeters).toBeGreaterThan(8);
-
+    applying.resolve();
+    expect((await first).status).toBe("running");
+    expect(clock.active.size).toBe(1);
+    expect(clock.maxActive).toBe(1);
     expect(playback.stop().status).toBe("idle");
-    expect(runtime.activeTimers).toHaveLength(0);
-    resumedTimer.callback();
-    await flushMicrotasks();
-    expect(applied).toHaveLength(2);
+    expect(playback.stop().status).toBe("idle");
+    expect(clock.active.size).toBe(0);
   });
 
-  test("concurrent starts let only the newest generation install a timer", async () => {
-    const runtime = new FakeRuntime();
-    const applies: Array<{ fix: GeoFix; pending: Deferred<void> }> = [];
-    const locations: GeoFix[] = [];
+  test("stop is reusable while close is terminal", async () => {
+    const clock = new ManualClock();
     const playback = new RoutePlayback({
-      runtime,
-      applyLocation: (fix) => {
-        const pending = deferred<void>();
-        applies.push({ fix, pending });
-        return pending.promise;
-      },
-      onLocation: (fix) => locations.push(fix),
-    });
-
-    const firstStart = playback.start({
-      waypoints: [{ latitude: 1, longitude: 1 }],
-      intervalMs: 1_000,
-    });
-    const secondStart = playback.start({
-      waypoints: [{ latitude: 2, longitude: 2 }],
-      intervalMs: 2_000,
-    });
-    expect(applies.map(({ fix }) => fix.latitude)).toEqual([1, 2]);
-
-    applies[0]!.pending.resolve();
-    await firstStart;
-    expect(runtime.activeTimers).toHaveLength(0);
-    expect(locations).toEqual([]);
-
-    applies[1]!.pending.resolve();
-    const latest = await secondStart;
-    expect(latest).toMatchObject({
-      status: "running",
-      intervalMs: 2_000,
-      currentLocation: { latitude: 2, longitude: 2 },
-    });
-    expect(locations.map((fix) => fix.latitude)).toEqual([2]);
-    expect(runtime.activeTimers).toHaveLength(1);
-    expect(runtime.activeTimers[0]!.ms).toBe(2_000);
-  });
-
-  test("close during the initial apply invalidates the pending start", async () => {
-    const runtime = new FakeRuntime();
-    const pending = deferred<void>();
-    const locations: GeoFix[] = [];
-    const playback = new RoutePlayback({
-      runtime,
-      applyLocation: () => pending.promise,
-      onLocation: (fix) => locations.push(fix),
-    });
-
-    const starting = playback.start(LONG_ROUTE);
-    playback.close();
-    expect(playback.snapshot().status).toBe("idle");
-    pending.resolve();
-
-    expect((await starting).status).toBe("idle");
-    expect(runtime.activeTimers).toHaveLength(0);
-    expect(locations).toEqual([]);
-  });
-
-  test("pause and resume during initial apply do not duplicate the timer", async () => {
-    const runtime = new FakeRuntime();
-    const pending = deferred<void>();
-    const playback = new RoutePlayback({
-      runtime,
-      applyLocation: () => pending.promise,
+      clock,
+      applyLocation: () => {},
       onLocation: () => {},
     });
 
-    const starting = playback.start(LONG_ROUTE);
-    playback.pause();
-    playback.resume();
-    expect(runtime.activeTimers).toHaveLength(1);
+    await playback.start(request);
+    expect(clock.active.size).toBe(1);
+    expect(playback.pause().status).toBe("paused");
+    expect(clock.active.size).toBe(0);
+    expect(playback.resume().status).toBe("running");
+    expect(playback.resume().status).toBe("running");
+    expect(clock.active.size).toBe(1);
+    playback.stop();
+    playback.stop();
+    expect(clock.active.size).toBe(0);
 
-    pending.resolve();
-    expect((await starting).status).toBe("running");
-    expect(runtime.activeTimers).toHaveLength(1);
+    await playback.start(request);
+    expect(clock.active.size).toBe(1);
+    playback.close();
+    playback.resume();
+    clock.fireCleared();
+    expect(clock.active.size).toBe(0);
+    expect(playback.snapshot().status).toBe("closed");
+    await expect(playback.start(request)).rejects.toBeInstanceOf(
+      RoutePlaybackConflictError,
+    );
   });
 
-  test("late failure from a stopped tick cannot mutate the idle snapshot", async () => {
-    const runtime = new FakeRuntime();
-    const pendingTick = deferred<void>();
-    const locations: GeoFix[] = [];
+  test("stop during the initial apply invalidates the run and remains reusable", async () => {
+    const clock = new ManualClock();
+    const firstApply = deferred<void>();
+    let calls = 0;
+    let firstSignal: AbortSignal | undefined;
+    const playback = new RoutePlayback({
+      clock,
+      applyLocation: (_fix, signal) => {
+        calls++;
+        if (calls === 1) {
+          firstSignal = signal;
+          return firstApply.promise;
+        }
+      },
+      onLocation: () => {},
+    });
+
+    const firstStart = playback.start(request);
+    expect(playback.stop().status).toBe("idle");
+    expect(playback.stop().status).toBe("idle");
+    expect(firstSignal?.aborted).toBe(true);
+    const secondStart = playback.start(request);
+    expect((await secondStart).status).toBe("running");
+    expect(clock.active.size).toBe(1);
+    firstApply.resolve();
+    await expect(firstStart).rejects.toBeInstanceOf(RoutePlaybackConflictError);
+    expect(playback.snapshot().status).toBe("running");
+    expect(clock.active.size).toBe(1);
+    playback.close();
+  });
+
+  test("pause and resume during startup defer timer ownership to start", async () => {
+    const clock = new ManualClock();
+    const applying = deferred<void>();
+    const playback = new RoutePlayback({
+      clock,
+      applyLocation: () => applying.promise,
+      onLocation: () => {},
+    });
+
+    const starting = playback.start(request);
+    expect(playback.pause().status).toBe("paused");
+    expect(playback.resume().status).toBe("running");
+    expect(clock.active.size).toBe(0);
+    applying.resolve();
+    expect((await starting).status).toBe("running");
+    expect(clock.active.size).toBe(1);
+    expect(clock.maxActive).toBe(1);
+    playback.close();
+  });
+
+  test("initial apply failures reject and map to a non-success API status", async () => {
+    const playback = new RoutePlayback({
+      clock: new ManualClock(),
+      applyLocation: () => {
+        throw new Error("geo fix failed");
+      },
+      onLocation: () => {},
+    });
+
+    const response = await startRoutePlaybackResponse(playback, request);
+    expect(response.ok).toBe(false);
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({
+      ok: false,
+      error: "geo fix failed",
+    });
+    expect(playback.snapshot()).toMatchObject({
+      status: "error",
+      lastError: "geo fix failed",
+    });
+  });
+
+  test("successful starts return the running route API response", async () => {
+    const playback = new RoutePlayback({
+      clock: new ManualClock(),
+      applyLocation: () => {},
+      onLocation: () => {},
+    });
+
+    const response = await startRoutePlaybackResponse(playback, request);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      ok: true,
+      route: { status: "running", waypointCount: 2 },
+    });
+    playback.close();
+  });
+
+  test("route request validation errors remain bad requests", async () => {
+    const response = routePlaybackErrorResponse(
+      new Error("route must include at least one waypoint"),
+      400,
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      ok: false,
+      error: "route must include at least one waypoint",
+    });
+  });
+
+  test("concurrent and disposed starts map to conflict responses", async () => {
+    const applying = deferred<void>();
+    const playback = new RoutePlayback({
+      clock: new ManualClock(),
+      applyLocation: () => applying.promise,
+      onLocation: () => {},
+    });
+    const first = playback.start(request);
+
+    const response = await startRoutePlaybackResponse(playback, request);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      ok: false,
+      error: "route playback start is already in progress",
+    });
+
+    playback.close();
+    applying.resolve();
+    await expect(first).rejects.toBeInstanceOf(RoutePlaybackConflictError);
+
+    const disposedResponse = await startRoutePlaybackResponse(
+      playback,
+      request,
+    );
+    expect(disposedResponse.status).toBe(409);
+    expect(await disposedResponse.json()).toEqual({
+      ok: false,
+      error: "route playback is closed",
+    });
+  });
+
+  test("a stale request generation returns conflict before starting a route", async () => {
+    let applies = 0;
+    const playback = new RoutePlayback({
+      clock: new ManualClock(),
+      applyLocation: () => {
+        applies++;
+      },
+      onLocation: () => {},
+    });
+
+    const response = await startRoutePlaybackResponse(
+      playback,
+      request,
+      () => false,
+    );
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      ok: false,
+      error: "device session changed before route playback start",
+    });
+    expect(applies).toBe(0);
+    expect(playback.snapshot().status).toBe("idle");
+  });
+
+  test("unexpected start failures map to server errors", async () => {
+    const response = await startRoutePlaybackResponse(
+      {
+        start: async () => {
+          throw new Error("unexpected route failure");
+        },
+      },
+      request,
+    );
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      ok: false,
+      error: "unexpected route failure",
+    });
+  });
+
+  test("periodic apply failure stops the owned timer", async () => {
+    const clock = new ManualClock();
     let applyCount = 0;
     const playback = new RoutePlayback({
-      runtime,
+      clock,
       applyLocation: () => {
         applyCount++;
-        return applyCount === 1 ? undefined : pendingTick.promise;
+        if (applyCount === 2) throw new Error("periodic geo fix failed");
       },
-      onLocation: (fix) => locations.push(fix),
+      onLocation: () => {},
     });
 
-    await playback.start(LONG_ROUTE);
-    runtime.advance(1_000);
-    runtime.activeTimers[0]!.callback();
-    await flushMicrotasks();
-    expect(applyCount).toBe(2);
-
-    playback.stop();
-    pendingTick.reject(new Error("stale apply failed"));
+    await playback.start(request);
+    clock.advance(250);
+    clock.fireActive();
     await flushMicrotasks();
 
     expect(playback.snapshot()).toMatchObject({
-      status: "idle",
-      lastError: null,
-      progressMeters: 0,
+      status: "error",
+      lastError: "periodic geo fix failed",
     });
-    expect(runtime.activeTimers).toHaveLength(0);
-    expect(locations).toHaveLength(1);
+    expect(clock.active.size).toBe(0);
   });
 
-  test("completion applies the final waypoint and releases its timer", async () => {
-    const runtime = new FakeRuntime();
-    const locations: GeoFix[] = [];
+  test("close during a periodic apply suppresses the late location callback", async () => {
+    const clock = new ManualClock();
+    const periodicApply = deferred<void>();
+    const published: unknown[] = [];
+    let applyCount = 0;
+    let periodicSignal: AbortSignal | undefined;
     const playback = new RoutePlayback({
-      runtime,
-      applyLocation: () => {},
-      onLocation: (fix) => locations.push(fix),
+      clock,
+      applyLocation: (_fix, signal) => {
+        applyCount++;
+        if (applyCount === 2) {
+          periodicSignal = signal;
+          return periodicApply.promise;
+        }
+      },
+      onLocation: (fix) => published.push(fix),
     });
 
-    await playback.start({
-      waypoints: [
-        { latitude: 0, longitude: 0 },
-        { latitude: 0, longitude: 0.0001 },
-      ],
-      speedKph: 360,
-      intervalMs: 1_000,
-    });
-    runtime.advance(1_000);
-    runtime.activeTimers[0]!.callback();
+    await playback.start(request);
+    clock.advance(250);
+    clock.fireActive();
+    expect(applyCount).toBe(2);
+    playback.close();
+    expect(periodicSignal?.aborted).toBe(true);
+    periodicApply.resolve();
     await flushMicrotasks();
 
-    const snapshot = playback.snapshot();
-    expect(snapshot.status).toBe("completed");
-    expect(snapshot.completedAt).toBe("2026-01-01T00:00:01.000Z");
-    expect(snapshot.currentLocation?.longitude).toBeCloseTo(0.0001, 8);
-    expect(runtime.activeTimers).toHaveLength(0);
-    expect(locations).toHaveLength(2);
+    expect(published).toHaveLength(1);
+    expect(playback.snapshot().status).toBe("closed");
+    expect(clock.active.size).toBe(0);
+  });
+
+  test("a disposed device player cannot publish a late location", async () => {
+    const oldClock = new ManualClock();
+    const oldApply = deferred<void>();
+    const published: string[] = [];
+    let oldSignal: AbortSignal | undefined;
+    const oldPlayback = new RoutePlayback({
+      clock: oldClock,
+      applyLocation: (_fix, signal) => {
+        oldSignal = signal;
+        return oldApply.promise;
+      },
+      onLocation: () => published.push("old"),
+    });
+    const oldStart = oldPlayback.start(request);
+
+    oldPlayback.close();
+    const newPlayback = new RoutePlayback({
+      clock: new ManualClock(),
+      applyLocation: () => {},
+      onLocation: () => published.push("new"),
+    });
+    await newPlayback.start(request);
+    oldApply.resolve();
+    await expect(oldStart).rejects.toBeInstanceOf(RoutePlaybackConflictError);
+
+    expect(oldSignal?.aborted).toBe(true);
+    expect(published).toEqual(["new"]);
+    expect(oldClock.active.size).toBe(0);
+    oldPlayback.close();
+    oldClock.fireCleared();
+    expect(published).toEqual(["new"]);
+    newPlayback.close();
+  });
+
+  test("session playback binds its serial and suppresses stale generation updates", async () => {
+    const clock = new ManualClock();
+    const applying = deferred<void>();
+    const appliedSerials: string[] = [];
+    const published: unknown[] = [];
+    let generation = 3;
+    const playback = createSessionRoutePlayback({
+      serial: "emulator-5554",
+      generation,
+      getGeneration: () => generation,
+      clock,
+      applyLocation: (serial) => {
+        appliedSerials.push(serial);
+        return applying.promise;
+      },
+      onLocation: (fix) => published.push(fix),
+    });
+
+    const starting = startRoutePlaybackResponse(playback, request);
+    generation++;
+    applying.resolve();
+    const response = await starting;
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      ok: false,
+      error: "device session changed during route playback",
+    });
+    expect(appliedSerials).toEqual(["emulator-5554"]);
+    expect(published).toHaveLength(0);
+    expect(playback.snapshot().status).toBe("closed");
+    expect(clock.active.size).toBe(0);
   });
 });
