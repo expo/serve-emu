@@ -1,6 +1,6 @@
 import type { GeoFix } from "./location.ts";
 
-export type RouteWaypoint = GeoFix;
+type RouteWaypoint = GeoFix;
 
 export type RoutePlaybackRequest = {
   waypoints: RouteWaypoint[];

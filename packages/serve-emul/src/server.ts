@@ -2276,6 +2276,3 @@ export async function startServer(
     stop,
   };
 }
-
-export type StartedServer = Awaited<ReturnType<typeof startServer>>;
-export type { ScrcpySession };

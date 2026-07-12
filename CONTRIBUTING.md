@@ -163,6 +163,12 @@ git commit -m "<scoped message>" -- path/to/file1 path/to/file2
 source of truth. Release tags should be named `v<version>`, for example
 `v0.1.0`.
 
+The npm package is CLI-only and intentionally has no supported JavaScript or
+TypeScript imports. Any future programmatic entry point must be added explicitly
+to `exports`, documented as a supported API, exercised from the packed tarball
+in a temporary consumer, and reviewed for its semver impact. Publishing source
+files does not make their deep-import paths public APIs.
+
 Choose the version bump with semver:
 
 - `patch` for fixes and small internal improvements
@@ -183,8 +189,8 @@ Before publishing, review `packages/serve-emul/CHANGELOG.md`, then run:
 bun run check
 ```
 
-That runs the package tests, server typecheck, UI typecheck, and production UI
-build.
+That runs the package tests, server and UI typechecks, production UI build,
+packed-tarball consumer smoke test, and Knip unused-code analysis.
 
 Commit only the version and changelog files, then tag and publish:
 

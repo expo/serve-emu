@@ -16,11 +16,9 @@ const ACTION_MOVE = 2;
 
 // Common Android keycodes
 const KEY = {
-  back: 4,
   home: 3,
   recents: 187,
   power: 26,
-  enter: 66,
 } as const;
 
 const PRIMARY_POINTER_ID = 0n;

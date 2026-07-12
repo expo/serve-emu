@@ -31,6 +31,7 @@
   "bin": {
     "serve-emul": "src/cli.ts"
   },
+  "exports": {},
   "scripts": {
     "setup": "bun run scripts/fetch-scrcpy.ts && bun run build:ui",
     "dev": "bun --watch run src/cli.ts",
@@ -40,7 +41,9 @@
     "build": "bun run build:ui",
     "test": "bun test",
     "coverage": "bun test --coverage --coverage-reporter=text --coverage-reporter=lcov --coverage-dir=coverage && bun run scripts/check-coverage.ts",
-    "check": "bun run coverage && bun run typecheck && bun run typecheck:ui && bun run typecheck:tests && bun run build",
+    "test:package": "bun run scripts/package-smoke.ts",
+    "check:unused": "knip",
+    "check": "bun run coverage && bun run typecheck && bun run typecheck:ui && bun run typecheck:tests && bun run build && bun run test:package",
     "release": "bun run scripts/release.ts",
     "typecheck": "tsc --noEmit",
     "typecheck:ui": "tsc -p src/ui --noEmit",
@@ -65,6 +68,7 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "knip": "6.26.0",
     "vite": "^5.4.11"
   }
 }

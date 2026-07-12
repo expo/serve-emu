@@ -9,7 +9,7 @@ import { execText } from "./exec.ts";
 const DEVICE_JAR_CACHE_PATH =
   `/data/local/tmp/serve-emul-scrcpy-server-v${SCRCPY_VERSION}.jar`;
 
-export type ScrcpyMeta = {
+type ScrcpyMeta = {
   deviceName: string;
   codecId: string;
   width: number;
@@ -129,7 +129,7 @@ export const SCRCPY_DEFAULTS = {
   repeatFrameMs: 0,
 } as const;
 
-export type VideoFrame = {
+type VideoFrame = {
   type: "frame";
   data: Buffer;
   pts: bigint;
@@ -137,7 +137,7 @@ export type VideoFrame = {
   isKey: boolean;
 };
 
-export type VideoSession = {
+type VideoSession = {
   type: "session";
   width: number;
   height: number;
@@ -739,9 +739,9 @@ export function parseFrameHeader(
   if (protocol === 4 && (ptsRaw & PACKET_V4_FLAG_SESSION) !== 0n) {
     return {
       kind: "session",
-      clientResized: (header.readUInt32BE(0) & 1) !== 0,
       width: header.readUInt32BE(4),
       height: header.readUInt32BE(8),
+      clientResized: (ptsRaw & (1n << 32n)) !== 0n,
     };
   }
   const size = header.readUInt32BE(8);
@@ -1223,9 +1223,9 @@ export async function readFrame(
   if (parsed.kind === "session") {
     return {
       type: "session",
-      clientResized: parsed.clientResized,
       width: parsed.width,
       height: parsed.height,
+      clientResized: parsed.clientResized,
     };
   }
 
