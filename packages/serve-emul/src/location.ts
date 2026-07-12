@@ -93,13 +93,30 @@ export function setEmulatorLocation(serial: string, fix: GeoFix): void {
 export async function setEmulatorLocationAsync(
   serial: string,
   fix: GeoFix,
-  runExec: typeof execText = execText,
+  signalOrExec?: AbortSignal | typeof execText,
+  runExecOverride?: typeof execText,
 ): Promise<void> {
+  const signal =
+    signalOrExec instanceof AbortSignal ? signalOrExec : undefined;
+  const runExec =
+    runExecOverride ??
+    (typeof signalOrExec === "function" ? signalOrExec : execText);
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error("location update aborted");
+  }
   const result = await runExec("adb", geoFixArgs(serial, fix), {
     timeout: 5_000,
     maxBuffer: 64 * 1024,
     lane: "interactive",
+    signal,
   });
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error("location update aborted");
+  }
   if (result.timedOut) throw new Error("adb emu geo fix timed out");
   const output = `${result.stdout}${result.stderr}`.trim();
   if (result.error) {

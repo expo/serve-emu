@@ -1,7 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { execText, type ExecLane } from "./exec.ts";
+import { randomBytes } from "node:crypto";
+import { execText } from "./exec.ts";
 
 export type AppActionResult = {
   ok: true;
@@ -12,6 +10,34 @@ export type FileImportResult = AppActionResult & {
   path: string;
   kind: "image" | "video" | "file";
 };
+
+export type LocalUploadFile = {
+  path: string;
+  filename: string;
+  mediaType: string;
+  size: number;
+};
+
+export type AppManagementErrorCode =
+  | "adb-failed"
+  | "adb-timeout"
+  | "adb-cleanup-failed";
+
+export type AppManagementDependencies = {
+  execText?: typeof execText;
+  uploadId?: () => string;
+};
+
+export class AppManagementError extends Error {
+  constructor(
+    readonly code: AppManagementErrorCode,
+    message: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = "AppManagementError";
+  }
+}
 
 const PACKAGE_RE = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/;
 const PERMISSION_RE = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/;
@@ -25,17 +51,43 @@ async function adb(
   serial: string,
   args: string[],
   timeout = 30_000,
-  lane: ExecLane = "default",
+  signal?: AbortSignal,
+  runExec: typeof execText = execText,
 ): Promise<AppActionResult> {
-  const result = await execText("adb", ["-s", serial, ...args], {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new DOMException("The operation was aborted", "AbortError");
+  }
+  const result = await runExec("adb", ["-s", serial, ...args], {
     timeout,
-    lane,
+    signal,
+    lane: "background",
   });
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new DOMException("The operation was aborted", "AbortError");
+  }
   const text = output(result.stdout, result.stderr);
-  if (result.status !== 0 || result.error) {
-    throw new Error(
-      result.error?.message || text || `adb ${args.join(" ")} failed`,
-      { cause: result.error ?? undefined },
+  if (result.timedOut) {
+    throw new AppManagementError(
+      "adb-timeout",
+      text || `adb ${args.join(" ")} timed out`,
+      { cause: result.error },
+    );
+  }
+  if (result.error) {
+    throw new AppManagementError(
+      "adb-failed",
+      text || result.error.message || `adb ${args.join(" ")} failed`,
+      { cause: result.error },
+    );
+  }
+  if (result.status !== 0) {
+    throw new AppManagementError(
+      "adb-failed",
+      text || `adb ${args.join(" ")} failed`,
     );
   }
   return { ok: true, output: text };
@@ -45,9 +97,10 @@ function adbHost(
   serial: string,
   args: string[],
   timeout = 30_000,
-  lane: ExecLane = "default",
+  signal?: AbortSignal,
+  runExec: typeof execText = execText,
 ): Promise<AppActionResult> {
-  return adb(serial, args, timeout, lane);
+  return adb(serial, args, timeout, signal, runExec);
 }
 
 function validate(value: unknown, name: string, pattern: RegExp): string {
@@ -69,75 +122,120 @@ export function permissionName(value: unknown): string {
   return validate(value, "permission", PERMISSION_RE);
 }
 
-export async function installApk(serial: string, file: File): Promise<AppActionResult> {
-  if (!file.name.toLowerCase().endsWith(".apk")) throw new Error("APK file must end with .apk");
-  const dir = mkdtempSync(join(tmpdir(), "serve-emul-apk-"));
-  const path = join(dir, "upload.apk");
-  try {
-    writeFileSync(path, new Uint8Array(await file.arrayBuffer()));
-    return await adb(
-      serial,
-      ["install", "-r", path],
-      120_000,
-      "background",
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+export async function installApk(
+  serial: string,
+  file: LocalUploadFile,
+  signal?: AbortSignal,
+  dependencies: AppManagementDependencies = {},
+): Promise<AppActionResult> {
+  if (!file.filename.toLowerCase().endsWith(".apk")) {
+    throw new Error("APK file must end with .apk");
   }
+  return adb(
+    serial,
+    ["install", "-r", file.path],
+    120_000,
+    signal,
+    dependencies.execText,
+  );
 }
 
-function safeFileName(name: string): string {
+function safeFileName(name: string, fallback: string): string {
   const clean = name.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-  return clean || `upload-${Date.now()}`;
+  return clean && clean !== "." && clean !== ".." ? clean : fallback;
 }
 
-function mediaKind(file: File): FileImportResult["kind"] {
-  if (file.type.startsWith("image/")) return "image";
-  if (file.type.startsWith("video/")) return "video";
-  const lower = file.name.toLowerCase();
+function mediaKind(file: LocalUploadFile): FileImportResult["kind"] {
+  if (file.mediaType.startsWith("image/")) return "image";
+  if (file.mediaType.startsWith("video/")) return "video";
+  const lower = file.filename.toLowerCase();
   if (/\.(png|jpe?g|gif|webp|heic|heif)$/.test(lower)) return "image";
   if (/\.(mp4|m4v|mov|webm|3gp|mkv)$/.test(lower)) return "video";
   return "file";
 }
 
-export async function importMediaFile(serial: string, file: File): Promise<FileImportResult> {
-  const dir = mkdtempSync(join(tmpdir(), "serve-emul-media-"));
-  const localPath = join(dir, safeFileName(file.name));
+export async function importMediaFile(
+  serial: string,
+  file: LocalUploadFile,
+  signal?: AbortSignal,
+  dependencies: AppManagementDependencies = {},
+): Promise<FileImportResult> {
+  const uploadId =
+    dependencies.uploadId?.() ?? randomBytes(6).toString("hex");
+  const filename = safeFileName(file.filename, `upload-${uploadId}`);
   const kind = mediaKind(file);
   const remoteDir =
     kind === "image" ? "/sdcard/Pictures" : kind === "video" ? "/sdcard/Movies" : "/sdcard/Download";
-  const remotePath = `${remoteDir}/${safeFileName(file.name)}`;
+  const remotePath = `${remoteDir}/${filename}`;
+  const partialPath = `${remoteDir}/.serve-emul-${uploadId}-${filename}.part`;
+  const runExec = dependencies.execText;
+  let committed = false;
+  let operationFailure: unknown;
   try {
-    writeFileSync(localPath, new Uint8Array(await file.arrayBuffer()));
     await adb(
       serial,
       ["shell", "mkdir", "-p", remoteDir],
       30_000,
-      "background",
+      signal,
+      runExec,
     );
     await adbHost(
       serial,
-      ["push", localPath, remotePath],
+      ["push", file.path, partialPath],
       120_000,
-      "background",
+      signal,
+      runExec,
     );
     await adb(
       serial,
-      [
-        "shell",
-        "am",
-        "broadcast",
-        "-a",
-        "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
-        "-d",
-        `file://${remotePath}`,
-      ],
+      ["shell", "mv", "-f", partialPath, remotePath],
       30_000,
-      "background",
+      signal,
+      runExec,
     );
-    return { ok: true, output: `Imported ${file.name} to ${remotePath}`, path: remotePath, kind };
+    committed = true;
+    await adb(serial, [
+      "shell",
+      "am",
+      "broadcast",
+      "-a",
+      "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+      "-d",
+      `file://${remotePath}`,
+    ], 30_000, signal, runExec);
+    return {
+      ok: true,
+      output: `Imported ${file.filename} to ${remotePath}`,
+      path: remotePath,
+      kind,
+    };
+  } catch (error) {
+    operationFailure = error;
+    throw error;
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    if (!committed) {
+      try {
+        await adb(
+          serial,
+          ["shell", "rm", "-f", partialPath],
+          5_000,
+          undefined,
+          runExec,
+        );
+      } catch (cleanupError) {
+        throw new AppManagementError(
+          "adb-cleanup-failed",
+          `failed to remove partial upload ${partialPath}`,
+          {
+            cause: new AggregateError(
+              [operationFailure, cleanupError].filter(
+                (error) => error !== undefined,
+              ),
+            ),
+          },
+        );
+      }
+    }
   }
 }
 
