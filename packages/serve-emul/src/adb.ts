@@ -48,8 +48,10 @@ function execFailure(result: ExecResult<string | Buffer>): string {
   );
 }
 
-export async function listAllDevices(): Promise<Device[]> {
-  const r = await execText("adb", ["devices"], { timeout: ADB_QUERY_TIMEOUT_MS });
+export async function listAllDevices(
+  runExec: typeof execText = execText,
+): Promise<Device[]> {
+  const r = await runExec("adb", ["devices"], { timeout: ADB_QUERY_TIMEOUT_MS });
   if (execFailed(r)) throw new Error(`adb devices failed: ${execFailure(r)}`);
   return r.stdout
     .split("\n")
@@ -62,13 +64,18 @@ export async function listAllDevices(): Promise<Device[]> {
     });
 }
 
-export async function listDevices(): Promise<Device[]> {
-  return (await listAllDevices()).filter((d) => d.state === "device");
+export async function listDevices(
+  runExec: typeof execText = execText,
+): Promise<Device[]> {
+  return (await listAllDevices(runExec)).filter((d) => d.state === "device");
 }
 
-export async function pickDevice(explicit?: string): Promise<string> {
+export async function pickDevice(
+  explicit?: string,
+  runExec: typeof execText = execText,
+): Promise<string> {
   if (explicit) return explicit;
-  const devices = await listDevices();
+  const devices = await listDevices(runExec);
   if (devices.length === 0) throw new Error("No booted Android device found. Start an emulator or attach a device.");
   if (devices.length > 1)
     throw new Error(
@@ -77,8 +84,11 @@ export async function pickDevice(explicit?: string): Promise<string> {
   return devices[0].serial;
 }
 
-export async function screencapPng(serial: string): Promise<Buffer> {
-  const r = await execBuffer("adb", ["-s", serial, "exec-out", "screencap", "-p"], {
+export async function screencapPng(
+  serial: string,
+  runExec: typeof execBuffer = execBuffer,
+): Promise<Buffer> {
+  const r = await runExec("adb", ["-s", serial, "exec-out", "screencap", "-p"], {
     maxBuffer: 64 * 1024 * 1024,
     timeout: ADB_SCREENSHOT_TIMEOUT_MS,
   });
@@ -86,8 +96,12 @@ export async function screencapPng(serial: string): Promise<Buffer> {
   return r.stdout;
 }
 
-export async function shell(serial: string, cmd: string[]): Promise<void> {
-  const r = await execText("adb", ["-s", serial, "shell", ...cmd], {
+export async function shell(
+  serial: string,
+  cmd: string[],
+  runExec: typeof execText = execText,
+): Promise<void> {
+  const r = await runExec("adb", ["-s", serial, "shell", ...cmd], {
     timeout: ADB_MUTATION_TIMEOUT_MS,
   });
   if (execFailed(r)) {
@@ -97,12 +111,19 @@ export async function shell(serial: string, cmd: string[]): Promise<void> {
   }
 }
 
-export function shellSpawn(serial: string, cmd: string[]) {
-  return spawn("adb", ["-s", serial, "shell", ...cmd]);
+export function shellSpawn(
+  serial: string,
+  cmd: string[],
+  runSpawn: typeof spawn = spawn,
+) {
+  return runSpawn("adb", ["-s", serial, "shell", ...cmd]);
 }
 
-export async function getDeviceSize(serial: string): Promise<{ width: number; height: number }> {
-  const r = await execText("adb", ["-s", serial, "shell", "wm", "size"], {
+export async function getDeviceSize(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<{ width: number; height: number }> {
+  const r = await runExec("adb", ["-s", serial, "shell", "wm", "size"], {
     timeout: ADB_QUERY_TIMEOUT_MS,
   });
   if (execFailed(r)) throw new Error(`wm size failed: ${execFailure(r)}`);
@@ -118,8 +139,11 @@ function orientationFromRotation(mode: "free" | "lock" | "unknown", rotation: nu
   return "unknown";
 }
 
-export async function getUserRotation(serial: string): Promise<OrientationStatus> {
-  const r = await execText("adb", ["-s", serial, "shell", "cmd", "window", "user-rotation"], {
+export async function getUserRotation(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<OrientationStatus> {
+  const r = await runExec("adb", ["-s", serial, "shell", "cmd", "window", "user-rotation"], {
     timeout: ADB_QUERY_TIMEOUT_MS,
   });
   if (execFailed(r)) {
@@ -137,12 +161,16 @@ export async function getUserRotation(serial: string): Promise<OrientationStatus
   return { mode, rotation, orientation: orientationFromRotation(mode, rotation), raw };
 }
 
-export async function setUserRotation(serial: string, orientation: OrientationMode): Promise<OrientationStatus> {
+export async function setUserRotation(
+  serial: string,
+  orientation: OrientationMode,
+  runExec: typeof execText = execText,
+): Promise<OrientationStatus> {
   const args =
     orientation === "auto"
       ? ["cmd", "window", "user-rotation", "free"]
       : ["cmd", "window", "user-rotation", "lock", orientation === "portrait" ? "0" : "1"];
-  const r = await execText("adb", ["-s", serial, "shell", ...args], {
+  const r = await runExec("adb", ["-s", serial, "shell", ...args], {
     timeout: ADB_MUTATION_TIMEOUT_MS,
   });
   if (execFailed(r)) {
@@ -150,11 +178,14 @@ export async function setUserRotation(serial: string, orientation: OrientationMo
       `adb shell ${args.join(" ")} failed: ${execFailure(r)}`,
     );
   }
-  return getUserRotation(serial);
+  return getUserRotation(serial, runExec);
 }
 
-export async function getFontScale(serial: string): Promise<FontScaleStatus> {
-  const r = await execText("adb", ["-s", serial, "shell", "settings", "get", "system", "font_scale"], {
+export async function getFontScale(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<FontScaleStatus> {
+  const r = await runExec("adb", ["-s", serial, "shell", "settings", "get", "system", "font_scale"], {
     timeout: ADB_QUERY_TIMEOUT_MS,
   });
   if (execFailed(r)) {
@@ -170,13 +201,17 @@ export async function getFontScale(serial: string): Promise<FontScaleStatus> {
   return { scale, raw };
 }
 
-export async function setFontScale(serial: string, scale: number): Promise<FontScaleStatus> {
+export async function setFontScale(
+  serial: string,
+  scale: number,
+  runExec: typeof execText = execText,
+): Promise<FontScaleStatus> {
   if (!Number.isFinite(scale) || scale < 0.7 || scale > 2) {
     throw new Error("font scale must be between 0.7 and 2.0");
   }
   const normalized = scale.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
   const args = ["settings", "put", "system", "font_scale", normalized];
-  const r = await execText("adb", ["-s", serial, "shell", ...args], {
+  const r = await runExec("adb", ["-s", serial, "shell", ...args], {
     timeout: ADB_MUTATION_TIMEOUT_MS,
   });
   if (execFailed(r)) {
@@ -184,7 +219,7 @@ export async function setFontScale(serial: string, scale: number): Promise<FontS
       `adb shell ${args.join(" ")} failed: ${execFailure(r)}`,
     );
   }
-  return getFontScale(serial);
+  return getFontScale(serial, runExec);
 }
 
 function nightModeFromRaw(raw: string): NightMode | "unknown" {
@@ -196,8 +231,11 @@ function nightModeFromRaw(raw: string): NightMode | "unknown" {
   return "unknown";
 }
 
-export async function getNightMode(serial: string): Promise<NightModeStatus> {
-  const r = await execText("adb", ["-s", serial, "shell", "cmd", "uimode", "night"], {
+export async function getNightMode(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<NightModeStatus> {
+  const r = await runExec("adb", ["-s", serial, "shell", "cmd", "uimode", "night"], {
     timeout: ADB_QUERY_TIMEOUT_MS,
   });
   if (execFailed(r)) {
@@ -207,10 +245,14 @@ export async function getNightMode(serial: string): Promise<NightModeStatus> {
   return { mode: nightModeFromRaw(raw), raw };
 }
 
-export async function setNightMode(serial: string, mode: NightMode): Promise<NightModeStatus> {
+export async function setNightMode(
+  serial: string,
+  mode: NightMode,
+  runExec: typeof execText = execText,
+): Promise<NightModeStatus> {
   const value = mode === "dark" ? "yes" : mode === "light" ? "no" : "auto";
   const args = ["cmd", "uimode", "night", value];
-  const r = await execText("adb", ["-s", serial, "shell", ...args], {
+  const r = await runExec("adb", ["-s", serial, "shell", ...args], {
     timeout: ADB_MUTATION_TIMEOUT_MS,
   });
   if (execFailed(r)) {
@@ -218,7 +260,7 @@ export async function setNightMode(serial: string, mode: NightMode): Promise<Nig
       `adb shell ${args.join(" ")} failed: ${execFailure(r)}`,
     );
   }
-  return getNightMode(serial);
+  return getNightMode(serial, runExec);
 }
 
 async function globalSetting(
@@ -272,11 +314,15 @@ export async function getNetworkStatus(
   };
 }
 
-export async function setNetworkEnabled(serial: string, enabled: boolean): Promise<NetworkStatus> {
+export async function setNetworkEnabled(
+  serial: string,
+  enabled: boolean,
+  runExec: typeof execText = execText,
+): Promise<NetworkStatus> {
   const action = enabled ? "enable" : "disable";
   for (const service of ["wifi", "data"]) {
     const args = ["svc", service, action];
-    const r = await execText("adb", ["-s", serial, "shell", ...args], {
+    const r = await runExec("adb", ["-s", serial, "shell", ...args], {
       timeout: ADB_MUTATION_TIMEOUT_MS,
     });
     if (execFailed(r)) {
@@ -285,5 +331,5 @@ export async function setNetworkEnabled(serial: string, enabled: boolean): Promi
       );
     }
   }
-  return getNetworkStatus(serial);
+  return getNetworkStatus(serial, runExec);
 }
