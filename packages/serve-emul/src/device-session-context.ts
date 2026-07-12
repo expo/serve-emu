@@ -1,4 +1,5 @@
 import type { AccessibilitySnapshot } from "./accessibility.ts";
+import { ControlInputQueue } from "./control-input-queue.ts";
 import { FrameStatWindow } from "./frame-stat-window.ts";
 import type { Screen } from "./input.ts";
 import type { GeoFix } from "./location.ts";
@@ -38,6 +39,7 @@ type ActiveDeviceSessionOpts<TClient extends SessionClient> = {
   scrcpy: ScrcpySession;
   applyLocation: (serial: string, fix: GeoFix, signal: AbortSignal) => Promise<void>;
   closeClient?: (client: TClient, code: number, reason: string) => void;
+  inputQueue?: ControlInputQueue;
   now?: () => number;
 };
 
@@ -61,6 +63,7 @@ export class ActiveDeviceSession<
   readonly scrcpy: ScrcpySession;
   readonly screen: Screen;
   readonly recorder = new SessionRecorder();
+  readonly inputQueue: ControlInputQueue;
   readonly route: RoutePlayback;
   readonly clients = new Set<TClient>();
   readonly abortController = new AbortController();
@@ -117,6 +120,17 @@ export class ActiveDeviceSession<
       ((client, code, reason) => {
         client.ws.close(code, reason);
       });
+    this.inputQueue =
+      opts.inputQueue ??
+      (opts.scrcpy.controlSocket
+        ? new ControlInputQueue({ socket: opts.scrcpy.controlSocket })
+        : new ControlInputQueue({
+            writer: {
+              async write() {
+                throw new Error("scrcpy control socket is unavailable");
+              },
+            },
+          }));
     this.route = new RoutePlayback({
       applyLocation: async (fix, signal) => {
         this.assertUsable();
@@ -249,6 +263,7 @@ export class ActiveDeviceSession<
     this.lastError = reason;
     this.stoppedAt = new Date(this.#now()).toISOString();
     this.abortController.abort(new SessionChangedError(this.generation, null));
+    this.inputQueue.close(new Error(reason));
     const replayDisposed = disposeReplayBefore({
       recorder: this.recorder,
       stopRoute: () => {
