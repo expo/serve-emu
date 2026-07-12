@@ -85,12 +85,15 @@ class FrameFeed {
 
 class FakeControlSocket extends EventEmitter {
   readonly writes: Buffer[] = [];
+  readonly destroyed = false;
+  readonly writable = true;
   returnValue = true;
   throwOnWrite = false;
 
-  write(packet: Buffer): boolean {
+  write(packet: Buffer, callback?: (err?: Error | null) => void): boolean {
     this.writes.push(Buffer.from(packet));
     if (this.throwOnWrite) throw new Error("injected reset write failure");
+    callback?.();
     return this.returnValue;
   }
 }
@@ -370,6 +373,7 @@ describe("server recovery watchdog", () => {
     const session = harness.sessions.get("A")!;
     try {
       await harness.openWebSocket();
+      await waitFor(() => session.fakeControlSocket.writes.length === 1);
       expect(session.fakeControlSocket.writes).toHaveLength(1);
 
       for (let second = 1; second <= 10; second++) {
@@ -379,6 +383,7 @@ describe("server recovery watchdog", () => {
         if (second === 1) await harness.openWebSocket();
       }
 
+      await waitFor(() => session.fakeControlSocket.writes.length === 5);
       expect(session.fakeControlSocket.writes).toHaveLength(5);
       const health = await harness.health();
       expect(health).toMatchObject({
@@ -469,6 +474,10 @@ describe("server recovery watchdog", () => {
       expect(selectedC.status).toBe(200);
       expect(harness.clock.activeTimers).toBe(1);
       const clientC = await harness.openWebSocket();
+      await waitFor(
+        () =>
+          harness.sessions.get("C")!.fakeControlSocket.writes.length === 1,
+      );
       expect(harness.sessions.get("C")!.fakeControlSocket.writes).toHaveLength(1);
 
       harness.clock.advance(5_000);
@@ -477,7 +486,7 @@ describe("server recovery watchdog", () => {
       expect(harness.sessions.get("C")!.fakeControlSocket.writes).toHaveLength(1);
       expect(clientC.closes).toHaveLength(0);
     } finally {
-      harness.started.stop();
+      await harness.started.stop();
     }
     expect(harness.clock.activeTimers).toBe(0);
     expect(harness.captured.stopCalls).toBe(1);
@@ -538,7 +547,8 @@ describe("server recovery watchdog", () => {
     const switching = harness.post("/api/devices/select", { serial: "B" });
     await waitFor(() => harness.startCalls.includes("B"));
 
-    harness.started.stop();
+    const stopping = harness.started.stop();
+    await waitFor(() => harness.clock.activeTimers === 0);
     expect(harness.clock.activeTimers).toBe(0);
     harness.startGates.get("B")!.resolve();
 
@@ -546,10 +556,11 @@ describe("server recovery watchdog", () => {
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({
       ok: false,
-      error: "server is stopping",
+      error: "device session manager is closed",
     });
     expect(harness.sessions.get("B")!.closeCount).toBe(1);
     expect(harness.clock.activeTimers).toBe(0);
+    await stopping;
   });
 
   test("rejects a pre-switch websocket upgrade and its reset messages", async () => {
@@ -579,23 +590,26 @@ describe("server recovery watchdog", () => {
     }
   });
 
-  test("exposes failed reset attempts without marking an admitted client request", async () => {
+  test("exposes an admitted reset even when its queued write later fails", async () => {
     const harness = await createHarness();
     const session = harness.sessions.get("A")!;
     session.fakeControlSocket.throwOnWrite = true;
     try {
       await harness.openWebSocket();
+      await waitFor(() => session.fakeControlSocket.writes.length === 1);
       let health = await harness.health();
       expect(session.fakeControlSocket.writes).toHaveLength(1);
       expect(health).toMatchObject({
-        videoResetRequests: 0,
-        lastVideoResetAt: null,
+        videoResetRequests: 1,
+        lastVideoResetAt: "1970-01-01T00:00:00.000Z",
         keyFrameRecovery: {
           awaitingClients: 1,
           lastResetAttemptAt: "1970-01-01T00:00:00.000Z",
         },
       });
-      expect(health.clientsDetail[0].lastKeyFrameRequestAt).toBeNull();
+      expect(health.clientsDetail[0].lastKeyFrameRequestAt).toBe(
+        "1970-01-01T00:00:00.000Z",
+      );
 
       const secondClient = await harness.openWebSocket();
       harness.handlers.websocket.message(
@@ -607,15 +621,11 @@ describe("server recovery watchdog", () => {
       harness.clock.advance(2_500);
       harness.clock.fireActive();
       health = await harness.health();
-      expect(session.fakeControlSocket.writes.length).toBeGreaterThanOrEqual(2);
+      expect(session.fakeControlSocket.writes).toHaveLength(1);
       expect(health.keyFrameRecovery.lastResetAttemptAt).toBe(
         "1970-01-01T00:00:02.500Z",
       );
-      expect(
-        health.clientsDetail.every(
-          (entry: any) => entry.lastKeyFrameRequestAt === null,
-        ),
-      ).toBe(true);
+      expect(health.videoResetRequests).toBe(1);
     } finally {
       harness.started.stop();
     }
