@@ -1,4 +1,9 @@
-export type HardwareKey = "back" | "home" | "recents" | "power";
+import type { Gesture } from "../../shared/control-contracts";
+
+export type HardwareKey = Extract<
+  Gesture,
+  { type: "back" | "home" | "recents" | "power" }
+>["type"];
 
 type Props = {
   onPress: (key: HardwareKey) => void;

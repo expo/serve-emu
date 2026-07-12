@@ -1,15 +1,12 @@
 import { randomBytes } from "node:crypto";
 import { execText } from "./exec.ts";
+import type {
+  AppActionResponse,
+  FileImportResponse,
+} from "./shared/api-contracts.ts";
 
-export type AppActionResult = {
-  ok: true;
-  output: string;
-};
-
-export type FileImportResult = AppActionResult & {
-  path: string;
-  kind: "image" | "video" | "file";
-};
+export type AppActionResult = AppActionResponse;
+export type FileImportResult = FileImportResponse;
 
 export type LocalUploadFile = {
   path: string;
