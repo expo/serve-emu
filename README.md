@@ -256,6 +256,15 @@ curl -X POST "$BASE/api/accessibility/tap" \
 curl -N "$BASE/api/logcat?package=com.example.app&search=error"
 ```
 
+Logcat subscriptions share one `adb logcat` child for the active device.
+New children start at the live tail instead of replaying the device's buffered
+history. Matching lines are delivered in short `logs` SSE batches; each
+subscriber has bounded line and byte queues, and batch payloads report
+queue/source drop counts. `/health` exposes the active child, subscriber count,
+queued bytes, limits, and cumulative delivery/drop totals under `logcat`.
+Pausing Logcat in the browser closes its SSE connection, so paused panels do
+not keep receiving and discarding device output.
+
 ### Device Settings
 
 ```sh

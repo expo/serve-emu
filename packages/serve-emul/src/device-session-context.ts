@@ -3,6 +3,7 @@ import { ControlInputQueue } from "./control-input-queue.ts";
 import { FrameStatWindow } from "./frame-stat-window.ts";
 import type { Screen } from "./input.ts";
 import type { GeoFix } from "./location.ts";
+import { LogcatHub } from "./logcat.ts";
 import { RoutePlayback } from "./route-playback.ts";
 import type { ScrcpySession } from "./scrcpy.ts";
 import { SessionRecorder } from "./session-recorder.ts";
@@ -63,6 +64,7 @@ export class ActiveDeviceSession<
   readonly scrcpy: ScrcpySession;
   readonly screen: Screen;
   readonly recorder = new SessionRecorder();
+  readonly logcat: LogcatHub;
   readonly inputQueue: ControlInputQueue;
   readonly route: RoutePlayback;
   readonly clients = new Set<TClient>();
@@ -106,6 +108,7 @@ export class ActiveDeviceSession<
 
   constructor(opts: ActiveDeviceSessionOpts<TClient>) {
     this.serial = opts.serial;
+    this.logcat = new LogcatHub(opts.serial);
     this.generation = opts.generation;
     this.scrcpy = opts.scrcpy;
     this.screen = {
@@ -264,6 +267,7 @@ export class ActiveDeviceSession<
     this.stoppedAt = new Date(this.#now()).toISOString();
     this.abortController.abort(new SessionChangedError(this.generation, null));
     this.inputQueue.close(new Error(reason));
+    this.logcat.close(reason);
     const replayDisposed = disposeReplayBefore({
       recorder: this.recorder,
       stopRoute: () => {

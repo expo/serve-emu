@@ -1,9 +1,8 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { spawn } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
 import type { ServerWebSocket } from "bun";
-import { execText, getExecSnapshot } from "./exec.ts";
+import { getExecSnapshot } from "./exec.ts";
 import {
   getFontScale,
   getNetworkStatus,
@@ -484,6 +483,7 @@ export async function startServer(
     location: context.lastLocation,
     route: context.route.snapshot(),
     session: context.recorder.snapshot(),
+    logcat: context.logcat.snapshot(),
     uploads: uploads.snapshot(),
     executor: getExecSnapshot(),
     clientsDetail: Array.from(context.clients, (client) => ({
@@ -797,24 +797,7 @@ export async function startServer(
     return context.lastLocation;
   };
 
-  const resolvePackagePids = async (
-    context: DeviceContext,
-    packageName: string,
-  ): Promise<Set<string>> => {
-    if (!/^[A-Za-z0-9_.:-]+$/.test(packageName)) return new Set();
-    const r = await execText(
-      "adb",
-      ["-s", context.serial, "shell", "pidof", packageName],
-      {
-        timeout: 2_000,
-        signal: context.signal,
-      },
-    );
-    if (r.status !== 0) return new Set();
-    return new Set(r.stdout.trim().split(/\s+/).filter(Boolean));
-  };
-
-  const logcatStream = (context: DeviceContext, url: URL) => {
+  const logcatStream = (context: DeviceContext, req: Request, url: URL) => {
     const packageName = (url.searchParams.get("package") ?? "")
       .trim()
       .slice(0, MAX_LOGCAT_QUERY_BYTES);
@@ -822,140 +805,7 @@ export async function startServer(
       .trim()
       .slice(0, MAX_LOGCAT_QUERY_BYTES)
       .toLowerCase();
-    const proc = spawn("adb", [
-      "-s",
-      context.serial,
-      "logcat",
-      "-v",
-      "threadtime",
-    ]);
-    const encoder = new TextEncoder();
-    let pidSet = new Set<string>();
-    let pidTimer: ReturnType<typeof setInterval> | null = null;
-    let buffer = "";
-    let processSettled = false;
-    const processDone = new Promise<void>((resolve) => {
-      const settle = () => {
-        processSettled = true;
-        resolve();
-      };
-      proc.once("exit", settle);
-      proc.once("error", settle);
-    });
-    const waitForProcess = (timeoutMs: number) =>
-      new Promise<boolean>((resolve) => {
-        if (processSettled) {
-          resolve(true);
-          return;
-        }
-        const timer = setTimeout(() => resolve(false), timeoutMs);
-        void processDone.then(() => {
-          clearTimeout(timer);
-          resolve(true);
-        });
-      });
-    let cleanupTask: Promise<void> | null = null;
-    const cleanup = (): Promise<void> => {
-      if (cleanupTask) return cleanupTask;
-      if (pidTimer) clearInterval(pidTimer);
-      pidTimer = null;
-      try {
-        proc.kill("SIGTERM");
-      } catch {}
-      cleanupTask = (async () => {
-        if (await waitForProcess(500)) return;
-        try {
-          proc.kill("SIGKILL");
-        } catch {}
-        await waitForProcess(500);
-      })();
-      return cleanupTask;
-    };
-    const unregisterCleanup = context.registerCleanup(cleanup);
-
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        const send = (event: string, value: unknown) => {
-          try {
-            controller.enqueue(
-              encoder.encode(
-                `event: ${event}\ndata: ${JSON.stringify(value)}\n\n`,
-              ),
-            );
-          } catch {}
-        };
-        const matches = (line: string) => {
-          if (search && !line.toLowerCase().includes(search)) return false;
-          if (!packageName) return true;
-          const parts = line.trim().split(/\s+/, 5);
-          const pid = parts[2];
-          return (pid && pidSet.has(pid)) || line.includes(packageName);
-        };
-        const consume = (chunk: Buffer) => {
-          buffer += chunk.toString("utf8");
-          const lines = buffer.split(/\r?\n/);
-          buffer = lines.pop() ?? "";
-          for (const line of lines) {
-            if (line && matches(line))
-              send("log", { line, at: new Date().toISOString() });
-          }
-        };
-
-        send("ready", {
-          serial: context.serial,
-          package: packageName || null,
-          pids: Array.from(pidSet),
-          search: search || null,
-        });
-        if (packageName) {
-          void resolvePackagePids(context, packageName)
-            .then((set) => {
-              if (!context.signal.aborted) pidSet = set;
-            })
-            .catch(() => {});
-          pidTimer = setInterval(() => {
-            void resolvePackagePids(context, packageName)
-              .then((set) => {
-                if (!context.signal.aborted) pidSet = set;
-              })
-              .catch(() => {});
-          }, 5_000);
-        }
-        proc.stdout.on("data", consume);
-        proc.stderr.on("data", (chunk) => {
-          const text = chunk.toString("utf8").trim();
-          if (text) send("error", { line: text, at: new Date().toISOString() });
-        });
-        proc.once("exit", (code, signal) => {
-          send("close", { code, signal });
-          try {
-            controller.close();
-          } catch {}
-          void cleanup();
-          unregisterCleanup();
-        });
-        proc.once("error", (err) => {
-          send("error", { line: err.message, at: new Date().toISOString() });
-          try {
-            controller.close();
-          } catch {}
-          void cleanup();
-          unregisterCleanup();
-        });
-      },
-      cancel() {
-        unregisterCleanup();
-        return cleanup();
-      },
-    });
-
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
-    });
+    return context.logcat.subscribe({ packageName, search }, req.signal);
   };
 
   const gestureEndpoint = async (
@@ -1900,7 +1750,8 @@ export async function startServer(
           return new Response("method not allowed", { status: 405 });
         try {
           sessions.assertCurrent(requestContext);
-          return logcatStream(requestContext, url);
+          srv.timeout(req, 0);
+          return logcatStream(requestContext, req, url);
         } catch (err) {
           return errorResponse(err);
         }
