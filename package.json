@@ -1,6 +1,7 @@
 {
   "name": "serve-emul-monorepo",
   "private": true,
+  "packageManager": "bun@1.3.13",
   "workspaces": ["packages/*"],
   "scripts": {
     "dev": "bun run --filter serve-emul dev",

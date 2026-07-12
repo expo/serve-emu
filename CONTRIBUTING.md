@@ -7,10 +7,13 @@ and include enough verification detail for reviewers to reproduce your results.
 
 ## Development Setup
 
-Requirements:
+Required for the device-free development and CI checks:
 
-- Bun 1.1+
+- Bun 1.3.13 (the version pinned by the repository)
 - Node.js 18+
+
+Optional prerequisites for manual runtime validation:
+
 - Android platform-tools with `adb` on `PATH`
 - A booted Android emulator or attached Android device
 - Chrome, Edge, or Safari 16.4+ for WebCodecs support
@@ -18,7 +21,7 @@ Requirements:
 Install dependencies:
 
 ```sh
-bun install
+bun install --frozen-lockfile
 ```
 
 Fetch the vendored scrcpy server and build the browser UI:
@@ -60,12 +63,25 @@ Prefer kebab-case for TypeScript and JavaScript filenames.
 Before opening a pull request, run the checks that match your change:
 
 ```sh
+bun run --filter serve-emul test
+bun run --filter serve-emul coverage
 bun run --filter serve-emul typecheck
 bun run --filter serve-emul typecheck:ui
+bun run --filter serve-emul typecheck:tests
 bun run --filter serve-emul build
 ```
 
-For runtime changes, also test against a real device or emulator:
+Run the same aggregate check used by CI before requesting review:
+
+```sh
+bun run check
+```
+
+The default CI suite is entirely device-free: fake clocks, timers, sockets,
+processes, and sessions exercise lifecycle and protocol behavior without an
+Android SDK, ADB, an emulator, or a connected device.
+
+For runtime changes, optionally supplement CI with a real device or emulator:
 
 ```sh
 adb devices
