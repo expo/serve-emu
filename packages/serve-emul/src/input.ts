@@ -1,5 +1,3 @@
-import type { Socket } from "node:net";
-
 // Canonical control-message layout and upgrade checklist: ../docs/protocol.md
 // ControlMessage type codes validated against the pinned scrcpy server.
 const TYPE_INJECT_KEYCODE = 0;
@@ -19,11 +17,9 @@ const ACTION_MOVE = 2;
 
 // Common Android keycodes
 const KEY = {
-  back: 4,
   home: 3,
   recents: 187,
   power: 26,
-  enter: 66,
 } as const;
 
 const PRIMARY_POINTER_ID = 0n;
@@ -44,7 +40,7 @@ export type Gesture =
 
 export type Screen = { width: number; height: number };
 
-const MAX_TEXT_BYTES = 300;
+export const MAX_TEXT_BYTES = 300;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -115,6 +111,14 @@ function textBytes(text: string): Buffer {
   return Buffer.from(out.join(""), "utf8");
 }
 
+export function normalizeTextForControl(text: string): string {
+  return textBytes(text).toString("utf8");
+}
+
+export function normalizeGesture(gesture: Gesture): Gesture {
+  return parseGesture(gesture);
+}
+
 export function parseGesture(value: unknown): Gesture {
   if (!isRecord(value) || typeof value.type !== "string") {
     throw new Error("message must be a gesture object");
@@ -153,7 +157,7 @@ export function parseGesture(value: unknown): Gesture {
       };
     case "text":
       if (typeof value.text !== "string") throw new Error("text must be a string");
-      return { type: "text", text: value.text };
+      return { type: "text", text: textBytes(value.text).toString("utf8") };
     case "back":
     case "home":
     case "recents":
@@ -214,74 +218,159 @@ function backOrScreenOnPacket(action: number): Buffer {
   return buf;
 }
 
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 function actionCode(a: "down" | "move" | "up"): number {
   return a === "down" ? ACTION_DOWN : a === "up" ? ACTION_UP : ACTION_MOVE;
 }
 
-export async function dispatch(control: Socket, g: Gesture, screen: Screen): Promise<void> {
+export type ControlStep = {
+  delayMs: number;
+  packet: Buffer;
+};
+
+export type CompiledGesture = {
+  gesture: Gesture;
+  steps: ControlStep[];
+  bytes: number;
+};
+
+function validateScreen(screen: Screen): Screen {
+  if (
+    !Number.isInteger(screen.width) ||
+    !Number.isInteger(screen.height) ||
+    screen.width <= 0 ||
+    screen.height <= 0 ||
+    screen.width > 0xffff ||
+    screen.height > 0xffff
+  ) {
+    throw new Error("screen width and height must be integers between 1 and 65535");
+  }
+  return { width: screen.width, height: screen.height };
+}
+
+export function compileGesture(
+  gesture: Gesture,
+  screenValue: Screen,
+): CompiledGesture {
+  const normalized = normalizeGesture(gesture);
+  const screen = validateScreen(screenValue);
   const px = (n: number) => n * screen.width;
   const py = (n: number) => n * screen.height;
+  const steps: ControlStep[] = [];
+  const append = (packet: Buffer, delayMs = 0) => {
+    steps.push({ delayMs, packet });
+  };
 
-  switch (g.type) {
+  switch (normalized.type) {
     case "tap": {
-      control.write(touchPacket(ACTION_DOWN, px(g.x), py(g.y), screen));
-      await sleep(20);
-      control.write(touchPacket(ACTION_UP, px(g.x), py(g.y), screen));
-      return;
+      append(
+        touchPacket(
+          ACTION_DOWN,
+          px(normalized.x),
+          py(normalized.y),
+          screen,
+        ),
+      );
+      append(
+        touchPacket(
+          ACTION_UP,
+          px(normalized.x),
+          py(normalized.y),
+          screen,
+        ),
+        20,
+      );
+      break;
     }
     case "swipe": {
-      const dur = Math.max(80, g.durationMs ?? 250);
-      const steps = Math.max(8, Math.round(dur / 16));
-      control.write(touchPacket(ACTION_DOWN, px(g.x1), py(g.y1), screen));
-      for (let i = 1; i < steps; i++) {
-        const t = i / steps;
-        const x = px(g.x1 + (g.x2 - g.x1) * t);
-        const y = py(g.y1 + (g.y2 - g.y1) * t);
-        await sleep(dur / steps);
-        control.write(touchPacket(ACTION_MOVE, x, y, screen));
+      const dur = Math.max(80, normalized.durationMs ?? 250);
+      const stepCount = Math.max(8, Math.round(dur / 16));
+      const stepDelayMs = dur / stepCount;
+      append(
+        touchPacket(
+          ACTION_DOWN,
+          px(normalized.x1),
+          py(normalized.y1),
+          screen,
+        ),
+      );
+      for (let i = 1; i < stepCount; i++) {
+        const t = i / stepCount;
+        const x = px(normalized.x1 + (normalized.x2 - normalized.x1) * t);
+        const y = py(normalized.y1 + (normalized.y2 - normalized.y1) * t);
+        append(touchPacket(ACTION_MOVE, x, y, screen), stepDelayMs);
       }
-      await sleep(dur / steps);
-      control.write(touchPacket(ACTION_UP, px(g.x2), py(g.y2), screen));
-      return;
+      append(
+        touchPacket(
+          ACTION_UP,
+          px(normalized.x2),
+          py(normalized.y2),
+          screen,
+        ),
+        stepDelayMs,
+      );
+      break;
     }
     case "touch": {
-      control.write(touchPacket(actionCode(g.action), px(g.x), py(g.y), screen, BigInt(g.pointerId ?? 0)));
-      return;
+      append(
+        touchPacket(
+          actionCode(normalized.action),
+          px(normalized.x),
+          py(normalized.y),
+          screen,
+          BigInt(normalized.pointerId ?? 0),
+        ),
+      );
+      break;
     }
     case "key": {
-      const metaState = g.metaState ?? 0;
-      if (g.action === "down") {
-        control.write(keyPacket(ACTION_DOWN, g.keycode, metaState));
-      } else if (g.action === "up") {
-        control.write(keyPacket(ACTION_UP, g.keycode, metaState));
+      const metaState = normalized.metaState ?? 0;
+      if (normalized.action === "down") {
+        append(keyPacket(ACTION_DOWN, normalized.keycode, metaState));
+      } else if (normalized.action === "up") {
+        append(keyPacket(ACTION_UP, normalized.keycode, metaState));
       } else {
-        control.write(keyPacket(ACTION_DOWN, g.keycode, metaState));
-        control.write(keyPacket(ACTION_UP, g.keycode, metaState));
+        append(keyPacket(ACTION_DOWN, normalized.keycode, metaState));
+        append(keyPacket(ACTION_UP, normalized.keycode, metaState));
       }
-      return;
+      break;
     }
     case "text":
-      control.write(textPacket(g.text));
-      return;
+      append(textPacket(normalized.text));
+      break;
     case "back":
-      control.write(backOrScreenOnPacket(ACTION_DOWN));
-      control.write(backOrScreenOnPacket(ACTION_UP));
-      return;
+      append(backOrScreenOnPacket(ACTION_DOWN));
+      append(backOrScreenOnPacket(ACTION_UP));
+      break;
     case "home":
-      control.write(keyPacket(ACTION_DOWN, KEY.home));
-      control.write(keyPacket(ACTION_UP, KEY.home));
-      return;
+      append(keyPacket(ACTION_DOWN, KEY.home));
+      append(keyPacket(ACTION_UP, KEY.home));
+      break;
     case "recents":
-      control.write(keyPacket(ACTION_DOWN, KEY.recents));
-      control.write(keyPacket(ACTION_UP, KEY.recents));
-      return;
+      append(keyPacket(ACTION_DOWN, KEY.recents));
+      append(keyPacket(ACTION_UP, KEY.recents));
+      break;
     case "power":
-      control.write(keyPacket(ACTION_DOWN, KEY.power));
-      control.write(keyPacket(ACTION_UP, KEY.power));
-      return;
+      append(keyPacket(ACTION_DOWN, KEY.power));
+      append(keyPacket(ACTION_UP, KEY.power));
+      break;
+  }
+
+  return {
+    gesture: normalized,
+    steps,
+    bytes: steps.reduce((total, step) => total + step.packet.length, 0),
+  };
+}
+
+export async function dispatch(
+  control: { write(packet: Buffer): unknown },
+  gesture: Gesture,
+  screen: Screen,
+): Promise<void> {
+  for (const step of compileGesture(gesture, screen).steps) {
+    if (step.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, step.delayMs));
+    }
+    control.write(step.packet);
   }
 }

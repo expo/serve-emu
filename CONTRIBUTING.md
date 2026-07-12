@@ -7,10 +7,13 @@ and include enough verification detail for reviewers to reproduce your results.
 
 ## Development Setup
 
-Requirements:
+Required for the device-free development and CI checks:
 
-- Bun 1.1+
+- Bun 1.3.13 (the version pinned by the repository)
 - Node.js 18+
+
+Optional prerequisites for manual runtime validation:
+
 - Android platform-tools with `adb` on `PATH`
 - A booted Android emulator or attached Android device
 - Chrome, Edge, or Safari 16.4+ for WebCodecs support
@@ -18,7 +21,7 @@ Requirements:
 Install dependencies:
 
 ```sh
-bun install
+bun install --frozen-lockfile
 ```
 
 Fetch the vendored scrcpy server and build the browser UI:
@@ -57,18 +60,31 @@ Prefer kebab-case for TypeScript and JavaScript filenames.
 
 ## Validation
 
-Before opening a pull request, run the aggregate repository check:
+Before opening a pull request, run the checks that match your change:
+
+```sh
+bun run --filter serve-emul test
+bun run --filter serve-emul coverage
+bun run --filter serve-emul typecheck
+bun run --filter serve-emul typecheck:ui
+bun run --filter serve-emul typecheck:tests
+bun run --filter serve-emul build
+```
+
+Run the same aggregate check used by CI before requesting review:
 
 ```sh
 bun run check
 ```
 
-It verifies generated documentation, runs the package tests, checks the server
-and browser TypeScript projects, and builds the production UI. Add focused
-commands while iterating, but do not omit the aggregate check from the final
-validation.
+The aggregate check verifies generated documentation, runs package coverage,
+checks the server, browser, and test TypeScript projects, builds the production
+UI, and exercises the packed package. The default CI suite is entirely
+device-free: fake clocks, timers, sockets, processes, and sessions exercise
+lifecycle and protocol behavior without an Android SDK, ADB, an emulator, or a
+connected device.
 
-For runtime changes, also test against a real device or emulator:
+For runtime changes, optionally supplement CI with a real device or emulator:
 
 ```sh
 adb devices
@@ -146,6 +162,12 @@ git commit -m "<scoped message>" -- path/to/file1 path/to/file2
 source of truth. Release tags should be named `v<version>`, for example
 `v0.1.0`.
 
+The npm package is CLI-only and intentionally has no supported JavaScript or
+TypeScript imports. Any future programmatic entry point must be added explicitly
+to `exports`, documented as a supported API, exercised from the packed tarball
+in a temporary consumer, and reviewed for its semver impact. Publishing source
+files does not make their deep-import paths public APIs.
+
 Choose the version bump with semver:
 
 - `patch` for fixes and small internal improvements
@@ -166,8 +188,9 @@ Before publishing, review `packages/serve-emul/CHANGELOG.md`, then run:
 bun run check
 ```
 
-That verifies generated documentation, runs the package tests, checks the
-server and UI TypeScript projects, and builds the production UI.
+That verifies generated documentation, runs package coverage, checks the server,
+UI, and test TypeScript projects, builds the production UI, and runs the
+packed-tarball consumer smoke test.
 
 Commit only the version and changelog files, then tag and publish:
 

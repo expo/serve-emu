@@ -51,6 +51,20 @@ Planned:
 
 Node.js 18+ can invoke the published package through `npx`, but local development and server runtime use Bun.
 
+## Package API
+
+As of 1.0.0, `serve-emul` is intentionally a CLI-only package. The only
+supported package surface is the installed `serve-emul` executable. There are
+no supported JavaScript or TypeScript import paths: both `import "serve-emul"`
+and deep imports such as `import "serve-emul/src/adb.ts"` are blocked by the
+package export map. Files shipped for the CLI are implementation details and
+carry no import-path stability guarantee.
+
+The documented HTTP and WebSocket endpoints remain supported runtime APIs once
+the CLI is running; they are not package imports. The planned
+`serve-emul/middleware` entry point is not available yet and must not be
+imported until it is explicitly exported and documented in a future release.
+
 ## Quick Start
 
 One-off run from npm:
@@ -75,7 +89,7 @@ bun run packages/serve-emul/src/cli.ts
 ## CLI
 
 ```text
-serve-emul [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms]
+serve-emul [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms] [--max-apk-upload-bytes N] [--max-media-upload-bytes N]
 serve-emul --avd <name> [--gpu <mode>] [--restart-avd]
 serve-emul --avd-list
 serve-emul --running-avds
@@ -93,6 +107,11 @@ serve-emul --running-avds
 | `--max-size` | `1280` | Downscale the longest edge to N pixels; `0` keeps native size. The emulator's software H.264 encoder sustains 60fps only below ~1 megapixel, hence the 1280 default |
 | `--key-frame-interval` | `10` | Ask the encoder for regular keyframes; `0` disables this codec option. Late joiners get keyframes on demand, so a long interval avoids periodic keyframe bursts |
 | `--repeat-frame-ms` | `0` | Re-encode the previous frame after N ms without screen changes (`16` ≈ steady 60fps on static screens, at extra CPU/bandwidth cost); `0` keeps the encoder default of one repeat per 100ms |
+| `--max-apk-upload-bytes` | `536870912` | Maximum APK file bytes accepted by the streaming multipart endpoint |
+| `--max-media-upload-bytes` | `1073741824` | Maximum media/file bytes accepted by the streaming multipart endpoint |
+| `--max-active-uploads` | `2` | Maximum upload operations reading, staging, or running through ADB concurrently |
+| `--max-queued-uploads` | `4` | Maximum uploads waiting for an active slot; further requests receive `429` |
+| `--upload-queue-timeout-ms` | `5000` | Maximum time an upload may wait for a slot before receiving `503` |
 | `--avd` | none | Launch this Android Virtual Device before streaming |
 | `--gpu` | `host` | Emulator GPU mode for `--avd` launches. `host` renders on the real GPU for smooth ~60fps; see [Smooth Emulator Playback](#smooth-emulator-playback) |
 | `--restart-avd` | false | Stop a running matching AVD before launching it |
@@ -162,6 +181,15 @@ Open `http://localhost:3300` after starting the CLI. The UI streams the device i
 - Orientation, night mode, font scale, network, GPS location, and route playback
 - Logcat filtering, pause/copy controls, app management, file import, and session replay
 
+The browser decoder treats every WebSocket reconnect, device video session, and
+hard decoder recovery as a new stream generation. Codec, latency, frame counts,
+and rendered state are cleared at each boundary; the UI reports `streaming`
+only after a frame from the current generation reaches the canvas. A connected
+session with no frame becomes `waiting for video`, while fresh packets that do
+not produce frames become `stream stalled`. Late events from older generations
+are ignored. Input sent while the video WebSocket is disconnected is dropped
+instead of being replayed against a later device session.
+
 ## HTTP API
 
 All examples assume the default port:
@@ -181,6 +209,12 @@ curl -X POST "$BASE/api/devices/select" \
   -H 'Content-Type: application/json' \
   -d '{"serial":"emulator-5554"}'
 ```
+
+`/health` includes bounded subprocess executor activity, queue depth, lane
+counts, deadlines, overload rejections, and output-limit totals. Device-grid
+refreshes reuse one `adb devices` snapshot while resolving running AVD names.
+Long install/import work uses a background lane; the default executor reserves
+one active slot and eight queue positions for interactive work such as GPS.
 
 AVD lifecycle helpers:
 
@@ -245,6 +279,15 @@ curl -X POST "$BASE/api/accessibility/tap" \
 curl -N "$BASE/api/logcat?package=com.example.app&search=error"
 ```
 
+Logcat subscriptions share one `adb logcat` child for the active device.
+New children start at the live tail instead of replaying the device's buffered
+history. Matching lines are delivered in short `logs` SSE batches; each
+subscriber has bounded line and byte queues, and batch payloads report
+queue/source drop counts. `/health` exposes the active child, subscriber count,
+queued bytes, limits, and cumulative delivery/drop totals under `logcat`.
+Pausing Logcat in the browser closes its SSE connection, so paused panels do
+not keep receiving and discarding device output.
+
 ### Device Settings
 
 ```sh
@@ -298,18 +341,44 @@ curl -X POST "$BASE/api/route/control" \
 curl -X DELETE "$BASE/api/route"
 ```
 
+The browser route importer accepts GPX, KML, GeoJSON, and waypoint JSON files
+up to 2 MiB. It rejects oversized files before reading them, parses in a
+cancellable Web Worker, and enforces the 10,000-waypoint, nesting, and
+complexity limits during traversal. Playback receives the complete validated
+waypoint sequence. Map display is separate: it caches projection by route and
+zoom, simplifies the line to at most 1,024 screen-space points, and pans it with
+one CSS transform per animation frame. The interaction target is one 16.7 ms
+frame at 60 Hz. Follow route is explicit; manually panning turns it off so the
+one-second status poll does not force the map center back onto the route.
+
 ### Sessions
 
-REST and WebSocket input events are recorded by default. Add `"record":false` to supported input payloads when an event should not be saved.
+REST and WebSocket input events are recorded by default. Add `"record":false`
+to supported input payloads when an event should not be saved. History uses a
+2,000-event, 1 MiB circular retention budget; `/health` contains only its
+compact count/byte/replay summary. Text is normalized to scrcpy's 300-byte
+UTF-8 control limit before both dispatch and recording.
 
 ```sh
-curl "$BASE/api/session"
+curl "$BASE/api/session?limit=6"
+curl "$BASE/api/session?limit=50&before=1200"
+curl "$BASE/api/session/export"
 curl -X POST "$BASE/api/session/replay" \
   -H 'Content-Type: application/json' \
   -d '{"multiplier":2}'
 curl -X POST "$BASE/api/session/replay/stop"
 curl -X DELETE "$BASE/api/session"
 ```
+
+Session pages are returned in chronological order with an exclusive
+`nextBefore` cursor and `hasMore` flag. The bounded full history is serialized
+only by the explicit export endpoint (and by the UI's Copy action), rather than
+on every poll. The UI requests only its six visible recent events and pauses
+polling while the Session panel or browser tab is hidden. `/health` exposes the
+last/max UTF-8 response bytes and JSON serialization time for health, session
+page, and export responses under `responseMetrics`. The health entry describes
+the previous completed `/health` response because the current body is measured
+after it is serialized.
 
 ### Apps And Files
 
@@ -336,6 +405,12 @@ curl -X POST "$BASE/api/apps/grant" \
 curl -X POST "$BASE/api/files/import" \
   -F file=@/path/to/image.png
 ```
+
+Uploads stream to private asynchronous temporary files and are removed after
+ADB completes. Actual bytes are enforced even without `Content-Length`; a
+device switch or server shutdown cancels work against the captured old device.
+Oversized requests receive `413`, and upload capacity errors are structured
+JSON responses. `/health` includes current upload queue metrics.
 
 ## WebSocket API
 

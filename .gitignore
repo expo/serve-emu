@@ -3,7 +3,7 @@ dist
 *.log
 .DS_Store
 .env*
-bun.lock
 *.bun-build
+coverage
 packages/serve-emul/vendor/scrcpy-server-v*
 package-lock.json

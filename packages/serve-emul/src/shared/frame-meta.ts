@@ -15,10 +15,9 @@
 //            its own clock.
 
 export const FRAME_META_MAGIC = 0x53454d55; // "SEMU"
-export const FRAME_META_VERSION = 2;
+const FRAME_META_VERSION = 2;
 export const FRAME_META_V1_HEADER_BYTES = 16;
-export const FRAME_META_V2_HEADER_BYTES = 24;
-export const FRAME_META_HEADER_BYTES = FRAME_META_V2_HEADER_BYTES;
+export const FRAME_META_HEADER_BYTES = 24;
 export const FRAME_FLAG_KEY = 1 << 0;
 
 export type ParsedFramePacket = {
@@ -60,9 +59,9 @@ export function parseFramePacket(raw: ArrayBuffer | Uint8Array): ParsedFramePack
       const isKey = (view.getUint8(5) & FRAME_FLAG_KEY) !== 0;
       const pts = view.getBigUint64(8, false);
       const timestamp = pts <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(pts) : null;
-      if (version === FRAME_META_VERSION && bytes.byteLength > FRAME_META_V2_HEADER_BYTES) {
+      if (version === FRAME_META_VERSION && bytes.byteLength > FRAME_META_HEADER_BYTES) {
         return {
-          data: bytes.subarray(FRAME_META_V2_HEADER_BYTES),
+          data: bytes.subarray(FRAME_META_HEADER_BYTES),
           isKey,
           timestamp,
           serverTsMs: Number(view.getBigUint64(16, false)) / 1000,

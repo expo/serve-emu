@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
-export const UPDATE_CHECK_CACHE = join(homedir(), ".cache", "serve-emul", "update-check.json");
+const UPDATE_CHECK_CACHE = join(homedir(), ".cache", "serve-emul", "update-check.json");
 
 export type UpdateCache = {
   checkedAt?: number;
@@ -44,7 +44,7 @@ export function isNewerVersion(latest: string, current: string): boolean {
   return false;
 }
 
-export async function readUpdateCache(cachePath = UPDATE_CHECK_CACHE): Promise<UpdateCache | null> {
+async function readUpdateCache(cachePath = UPDATE_CHECK_CACHE): Promise<UpdateCache | null> {
   try {
     return JSON.parse(await readFile(cachePath, "utf8")) as UpdateCache;
   } catch {
@@ -52,12 +52,12 @@ export async function readUpdateCache(cachePath = UPDATE_CHECK_CACHE): Promise<U
   }
 }
 
-export async function writeUpdateCache(cachePath: string, cache: UpdateCache) {
+async function writeUpdateCache(cachePath: string, cache: UpdateCache) {
   await mkdir(dirname(cachePath), { recursive: true });
   await writeFile(cachePath, `${JSON.stringify(cache)}\n`);
 }
 
-export async function fetchLatestVersion(packageName: string): Promise<string | null> {
+async function fetchLatestVersion(packageName: string): Promise<string | null> {
   const res = await fetch(`https://registry.npmjs.org/${packageName}/latest`, {
     signal: AbortSignal.timeout(1500),
   });
