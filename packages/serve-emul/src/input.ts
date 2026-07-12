@@ -112,6 +112,10 @@ function textBytes(text: string): Buffer {
   return Buffer.from(out.join(""), "utf8");
 }
 
+export function normalizeTextForControl(text: string): string {
+  return textBytes(text).toString("utf8");
+}
+
 export function normalizeGesture(gesture: Gesture): Gesture {
   return parseGesture(gesture);
 }
@@ -357,4 +361,17 @@ export function compileGesture(
     steps,
     bytes: steps.reduce((total, step) => total + step.packet.length, 0),
   };
+}
+
+export async function dispatch(
+  control: { write(packet: Buffer): unknown },
+  gesture: Gesture,
+  screen: Screen,
+): Promise<void> {
+  for (const step of compileGesture(gesture, screen).steps) {
+    if (step.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, step.delayMs));
+    }
+    control.write(step.packet);
+  }
 }

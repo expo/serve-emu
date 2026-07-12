@@ -88,6 +88,8 @@ import {
   SessionChangedError,
 } from "./device-session-context.ts";
 import { routePlaybackErrorResponse } from "./route-playback-api.ts";
+import { JsonResponseTracker } from "./json-response.ts";
+import { parseSessionPageQuery } from "./session-api.ts";
 import {
   SessionRecoveryWatchdog,
   SYSTEM_RECOVERY_WATCHDOG_CLOCK,
@@ -437,6 +439,9 @@ export async function startServer(
     DeviceContext,
     SessionRecoveryWatchdog<Client>
   >();
+  const responseMetrics = new JsonResponseTracker(
+    ["health", "sessionPage", "sessionExport"] as const,
+  );
   let stopRequested = false;
   console.log(
     `scrcpy ready: ${initialScrcpy.meta.deviceName} • ${initialScrcpy.meta.codecId} • ${initialScrcpy.meta.width}×${initialScrcpy.meta.height}`,
@@ -482,7 +487,8 @@ export async function startServer(
     lastVideoResetReason: context.lastVideoResetReason,
     location: context.lastLocation,
     route: context.route.snapshot(),
-    session: context.recorder.snapshot(),
+    session: context.recorder.summary(),
+    responseMetrics: responseMetrics.snapshot(),
     logcat: context.logcat.snapshot(),
     uploads: uploads.snapshot(),
     executor: getExecSnapshot(),
@@ -1740,7 +1746,7 @@ export async function startServer(
       }
 
       if (url.pathname === "/health") {
-        return Response.json(health(requestContext), {
+        return responseMetrics.response("health", health(requestContext), {
           status: requestContext.status === "streaming" ? 200 : 503,
         });
       }
@@ -1838,8 +1844,18 @@ export async function startServer(
       }
 
       if (url.pathname === "/api/session") {
-        if (req.method === "GET")
-          return Response.json(requestContext.recorder.snapshot());
+        if (req.method === "GET") {
+          try {
+            return responseMetrics.response(
+              "sessionPage",
+              requestContext.recorder.page(
+                parseSessionPageQuery(url.searchParams),
+              ),
+            );
+          } catch (err) {
+            return errorResponse(err);
+          }
+        }
         if (req.method === "DELETE") {
           try {
             sessions.assertCurrent(requestContext);
@@ -1849,6 +1865,16 @@ export async function startServer(
           }
         }
         return new Response("method not allowed", { status: 405 });
+      }
+
+      if (url.pathname === "/api/session/export") {
+        if (req.method !== "GET") {
+          return new Response("method not allowed", { status: 405 });
+        }
+        return responseMetrics.response(
+          "sessionExport",
+          requestContext.recorder.export(),
+        );
       }
 
       if (url.pathname === "/api/session/replay") {

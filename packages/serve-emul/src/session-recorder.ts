@@ -1,4 +1,4 @@
-import type { Gesture } from "./input.ts";
+import { normalizeTextForControl, type Gesture } from "./input.ts";
 import type { GeoFix } from "./location.ts";
 
 export type RecordedEvent =
@@ -29,6 +29,40 @@ export type SessionSnapshot = {
   replayCancelledAt: string | null;
   lastError: string | null;
 };
+
+export type SessionSummary = {
+  eventCount: number;
+  retainedBytes: number;
+  limits: { maxEvents: number; maxBytes: number };
+  droppedEvents: number;
+  oldestEventId: number | null;
+  newestEventId: number | null;
+  oldestEventAt: string | null;
+  newestEventAt: string | null;
+  recording: boolean;
+  replaying: boolean;
+  replayStartedAt: string | null;
+  replayCompletedAt: string | null;
+  lastError: string | null;
+};
+
+export type SessionPage = {
+  session: SessionSummary;
+  events: RecordedEvent[];
+  nextBefore: number | null;
+  hasMore: boolean;
+};
+
+export type SessionRecorderOptions = {
+  maxEvents?: number;
+  maxBytes?: number;
+  clock?: SessionReplayClock;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+};
+
+export const DEFAULT_MAX_SESSION_EVENTS = 2_000;
+export const DEFAULT_MAX_SESSION_BYTES = 1024 * 1024;
 
 export type ReplayHandlers = {
   dispatchGesture: (
@@ -89,7 +123,19 @@ type ActiveReplay = {
   completion: Promise<SessionSnapshot>;
 };
 
-const MAX_EVENTS = 2_000;
+const EMPTY_ARRAY_BYTES = 2;
+
+function cloneGesture(gesture: Gesture): Gesture {
+  return gesture.type === "text"
+    ? { type: "text", text: normalizeTextForControl(gesture.text) }
+    : { ...gesture };
+}
+
+function cloneEvent(event: RecordedEvent): RecordedEvent {
+  return event.kind === "gesture"
+    ? { ...event, gesture: cloneGesture(event.gesture) }
+    : { ...event, location: { ...event.location } };
+}
 
 function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error
@@ -129,8 +175,12 @@ function validateMultiplier(multiplier: number): void {
 
 export class SessionRecorder {
   #events: RecordedEvent[] = [];
+  #retainedBytes = EMPTY_ARRAY_BYTES;
+  #droppedEvents = 0;
+  #maxEvents: number;
+  #maxBytes: number;
   #nextId = 1;
-  #lastEventMs = 0;
+  #lastEventMs: number | null = null;
   #recording = true;
   #replaying = false;
   #replayStatus: SessionSnapshot["replayStatus"] = "idle";
@@ -143,9 +193,40 @@ export class SessionRecorder {
   #closed = false;
   #admissionEpoch = 0;
   #clock: SessionReplayClock;
+  #legacySleep: (ms: number) => Promise<void>;
+  #legacyStopReplay = false;
 
-  constructor(clock: SessionReplayClock = SYSTEM_REPLAY_CLOCK) {
-    this.#clock = clock;
+  constructor(
+    clockOrOptions: SessionReplayClock | SessionRecorderOptions =
+      SYSTEM_REPLAY_CLOCK,
+  ) {
+    const options =
+      "delay" in clockOrOptions
+        ? { clock: clockOrOptions }
+        : clockOrOptions;
+    this.#clock =
+      options.clock ??
+      (options.now || options.sleep
+        ? {
+            now: options.now ?? Date.now,
+            delay: async (ms, signal) => {
+              if (signal.aborted) throw abortReason(signal);
+              await (options.sleep ?? ((value) => abortableDelay(value, signal)))(ms);
+              if (signal.aborted) throw abortReason(signal);
+            },
+          }
+        : SYSTEM_REPLAY_CLOCK);
+    this.#legacySleep =
+      options.sleep ??
+      ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.#maxEvents = options.maxEvents ?? DEFAULT_MAX_SESSION_EVENTS;
+    this.#maxBytes = options.maxBytes ?? DEFAULT_MAX_SESSION_BYTES;
+    if (!Number.isSafeInteger(this.#maxEvents) || this.#maxEvents <= 0) {
+      throw new Error("maxEvents must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(this.#maxBytes) || this.#maxBytes < 2) {
+      throw new Error("maxBytes must be a safe integer of at least 2");
+    }
   }
 
   get isReplaying(): boolean {
@@ -164,7 +245,7 @@ export class SessionRecorder {
     this.#record({ kind: "location", location, source });
   }
 
-  clear(): SessionSnapshot {
+  clear(): SessionSummary {
     if (this.#closed) {
       throw new SessionReplayConflictError("session recorder is closed");
     }
@@ -175,13 +256,17 @@ export class SessionRecorder {
     }
     this.#admissionEpoch++;
     this.#events = [];
-    this.#lastEventMs = 0;
-    this.#replayStatus = "idle";
-    this.#replayStartedAt = null;
-    this.#replayCompletedAt = null;
-    this.#replayCancelledAt = null;
+    this.#retainedBytes = EMPTY_ARRAY_BYTES;
+    this.#droppedEvents = 0;
+    this.#lastEventMs = null;
+    if (!this.#replaying) {
+      this.#replayStatus = "idle";
+      this.#replayStartedAt = null;
+      this.#replayCompletedAt = null;
+      this.#replayCancelledAt = null;
+    }
     this.#lastError = null;
-    return this.snapshot();
+    return this.summary();
   }
 
   async cancelAndWait(): Promise<SessionSnapshot> {
@@ -206,7 +291,7 @@ export class SessionRecorder {
 
   snapshot(): SessionSnapshot {
     return {
-      events: this.#events,
+      events: this.#events.map(cloneEvent),
       recording: this.#recording,
       replaying: this.#replaying,
       replayStatus: this.#replayStatus,
@@ -215,6 +300,103 @@ export class SessionRecorder {
       replayCancelledAt: this.#replayCancelledAt,
       lastError: this.#lastError,
     };
+  }
+
+  summary(): SessionSummary {
+    const snapshot = this.snapshot();
+    const { events } = snapshot;
+    const oldest = events[0] ?? null;
+    const newest = events.at(-1) ?? null;
+    return {
+      eventCount: events.length,
+      retainedBytes: this.#retainedBytes,
+      limits: { maxEvents: this.#maxEvents, maxBytes: this.#maxBytes },
+      droppedEvents: this.#droppedEvents,
+      oldestEventId: oldest?.id ?? null,
+      newestEventId: newest?.id ?? null,
+      oldestEventAt: oldest?.at ?? null,
+      newestEventAt: newest?.at ?? null,
+      recording: snapshot.recording,
+      replaying: snapshot.replaying,
+      replayStartedAt: snapshot.replayStartedAt,
+      replayCompletedAt: snapshot.replayCompletedAt,
+      lastError: snapshot.lastError,
+    };
+  }
+
+  page({ limit, before }: { limit: number; before?: number }): SessionPage {
+    if (!Number.isSafeInteger(limit) || limit <= 0) {
+      throw new Error("limit must be a positive safe integer");
+    }
+    if (before !== undefined && (!Number.isSafeInteger(before) || before <= 0)) {
+      throw new Error("before must be a positive safe integer");
+    }
+    const eligible = before === undefined
+      ? this.#events
+      : this.#events.filter((event) => event.id < before);
+    const events = eligible.slice(-limit).map(cloneEvent);
+    const hasMore = eligible.length > events.length;
+    return {
+      session: this.summary(),
+      events,
+      nextBefore: hasMore ? events[0]?.id ?? null : null,
+      hasMore,
+    };
+  }
+
+  export(): { session: SessionSummary; events: RecordedEvent[] } {
+    return { session: this.summary(), events: this.#events.map(cloneEvent) };
+  }
+
+  async replay(
+    handlers: {
+      dispatchGesture: (gesture: Gesture) => Promise<void> | void;
+      setLocation: (fix: GeoFix) => Promise<void> | void;
+    },
+    multiplier = 1,
+  ): Promise<SessionSummary> {
+    if (this.#closed) {
+      throw new SessionReplayConflictError("session recorder is closed");
+    }
+    if (this.#replaying) {
+      throw new SessionReplayConflictError("session replay is already running");
+    }
+    if (this.#events.length === 0) {
+      throw new SessionReplayValidationError("session has no recorded events");
+    }
+    validateMultiplier(multiplier);
+    const events = this.#events.map(cloneEvent);
+    this.#replaying = true;
+    this.#legacyStopReplay = false;
+    this.#replayStartedAt = new Date(this.#clock.now()).toISOString();
+    this.#replayCompletedAt = null;
+    this.#lastError = null;
+    try {
+      for (const event of events) {
+        await this.#legacySleep(Math.max(0, event.delayMs / multiplier));
+        if (this.#legacyStopReplay) break;
+        if (event.kind === "gesture") {
+          await handlers.dispatchGesture(cloneGesture(event.gesture));
+        } else {
+          await handlers.setLocation({ ...event.location });
+        }
+      }
+      this.#replayCompletedAt = new Date(this.#clock.now()).toISOString();
+      this.#replaying = false;
+      return this.summary();
+    } catch (err) {
+      this.#lastError = err instanceof Error ? err.message : String(err);
+      throw err;
+    } finally {
+      this.#replaying = false;
+      this.#legacyStopReplay = false;
+    }
+  }
+
+  stopReplay(): SessionSummary {
+    this.#legacyStopReplay = true;
+    this.#activeReplay?.controller.abort();
+    return this.summary();
   }
 
   startReplay(handlers: ReplayHandlers, multiplier = 1): SessionReplayRun {
@@ -233,7 +415,7 @@ export class SessionRecorder {
     }
     validateMultiplier(multiplier);
 
-    const events = [...this.#events];
+    const events = this.#events.map(cloneEvent);
     const replay: ActiveReplay = {
       id: this.#nextReplayId++,
       controller: new AbortController(),
@@ -321,7 +503,10 @@ export class SessionRecorder {
   ): void {
     if (this.#closed || !this.#recording || this.#replaying) return;
     const now = this.#clock.now();
-    const delayMs = this.#lastEventMs ? Math.max(0, now - this.#lastEventMs) : 0;
+    const delayMs =
+      this.#lastEventMs !== null
+        ? Math.max(0, now - this.#lastEventMs)
+        : 0;
     this.#lastEventMs = now;
     const base = {
       id: this.#nextId++,
@@ -329,13 +514,26 @@ export class SessionRecorder {
       delayMs,
       source: event.source,
     };
-    this.#events.push(
+    const recorded: RecordedEvent =
       event.kind === "gesture"
-        ? { ...base, kind: "gesture", gesture: event.gesture }
-        : { ...base, kind: "location", location: event.location },
-    );
-    if (this.#events.length > MAX_EVENTS) {
-      this.#events.splice(0, this.#events.length - MAX_EVENTS);
+        ? { ...base, kind: "gesture", gesture: cloneGesture(event.gesture) }
+        : { ...base, kind: "location", location: { ...event.location } };
+    const bytes = Buffer.byteLength(JSON.stringify(recorded), "utf8");
+    if (EMPTY_ARRAY_BYTES + bytes > this.#maxBytes) {
+      this.#droppedEvents++;
+      return;
+    }
+    this.#events.push(recorded);
+    this.#retainedBytes += bytes + (this.#events.length > 1 ? 1 : 0);
+    while (
+      this.#events.length > this.#maxEvents ||
+      this.#retainedBytes > this.#maxBytes
+    ) {
+      const removed = this.#events.shift()!;
+      this.#retainedBytes -=
+        Buffer.byteLength(JSON.stringify(removed), "utf8") +
+        (this.#events.length > 0 ? 1 : 0);
+      this.#droppedEvents++;
     }
   }
 }
