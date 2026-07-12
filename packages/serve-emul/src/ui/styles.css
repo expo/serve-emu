@@ -328,6 +328,11 @@ input[type="checkbox"] {
   user-select: none;
   pointer-events: none;
 }
+.map-world {
+  position: absolute;
+  inset: 0;
+  will-change: transform;
+}
 .map-marker {
   position: absolute;
   left: 0;
