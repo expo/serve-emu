@@ -63,7 +63,11 @@ describe("staged app management uploads", () => {
           "-r",
           "/private/tmp/serve-emul-upload/upload",
         ],
-        opts: { timeout: 120_000, signal: controller.signal },
+        opts: {
+          timeout: 120_000,
+          signal: controller.signal,
+          lane: "background",
+        },
       },
     ]);
   });

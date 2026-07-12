@@ -1,4 +1,5 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
+import { execText } from "./exec.ts";
 
 export type GeoFix = {
   latitude: number;
@@ -6,27 +7,6 @@ export type GeoFix = {
   altitude?: number;
   satellites?: number;
   velocity?: number;
-};
-
-type LocationOutputStream = {
-  setEncoding: (encoding: "utf8") => unknown;
-  on: (event: "data", listener: (chunk: string) => void) => unknown;
-};
-
-export type LocationChildProcess = {
-  stdout: LocationOutputStream;
-  stderr: LocationOutputStream;
-  once: {
-    (event: "error", listener: (error: Error) => void): unknown;
-    (event: "exit", listener: (status: number | null) => void): unknown;
-  };
-  kill: (signal: "SIGKILL") => unknown;
-};
-
-export type LocationCommandDeps = {
-  spawn?: (args: string[]) => LocationChildProcess;
-  setTimeout?: (callback: () => void, timeoutMs: number) => unknown;
-  clearTimeout?: (handle: unknown) => void;
 };
 
 function finiteNumber(value: unknown, name: string): number {
@@ -110,88 +90,40 @@ export function setEmulatorLocation(serial: string, fix: GeoFix): void {
   assertGeoFixOutput(r.status, output);
 }
 
-function abortReason(signal: AbortSignal): Error {
-  return signal.reason instanceof Error
-    ? signal.reason
-    : new DOMException("location update aborted", "AbortError");
-}
-
-export function setEmulatorLocationAsync(
+export async function setEmulatorLocationAsync(
   serial: string,
   fix: GeoFix,
-  signal?: AbortSignal,
-  deps: LocationCommandDeps = {},
+  signalOrExec?: AbortSignal | typeof execText,
+  runExecOverride?: typeof execText,
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(abortReason(signal));
-      return;
-    }
-    const args = geoFixArgs(serial, fix);
-    const child = deps.spawn
-      ? deps.spawn(args)
-      : (spawn("adb", args, {
-          stdio: ["ignore", "pipe", "pipe"],
-        }) as unknown as LocationChildProcess);
-    const scheduleTimeout =
-      deps.setTimeout ?? ((callback, timeoutMs) => setTimeout(callback, timeoutMs));
-    const cancelTimeout =
-      deps.clearTimeout ??
-      ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
-    let output = "";
-    let settled = false;
-    let timeout: unknown | null = null;
-    const cleanup = () => {
-      if (timeout !== null) cancelTimeout(timeout);
-      timeout = null;
-      signal?.removeEventListener("abort", onAbort);
-    };
-    const finish = (fn: () => void) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      fn();
-    };
-    const kill = () => {
-      try {
-        child.kill("SIGKILL");
-      } catch {}
-    };
-    const onAbort = () =>
-      finish(() => {
-        kill();
-        reject(abortReason(signal!));
-      });
-
-    signal?.addEventListener("abort", onAbort, { once: true });
-    timeout = scheduleTimeout(
-      () =>
-        finish(() => {
-          kill();
-          reject(new Error("adb emu geo fix timed out"));
-        }),
-      5_000,
-    );
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      output += chunk;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      output += chunk;
-    });
-    child.once("error", (err) => finish(() => reject(err)));
-    child.once("exit", (status) =>
-      finish(() => {
-        const text = output.trim();
-        try {
-          assertGeoFixOutput(status, text);
-          resolve();
-        } catch (err) {
-          reject(err);
-        }
-      }),
-    );
+  const signal =
+    signalOrExec instanceof AbortSignal ? signalOrExec : undefined;
+  const runExec =
+    runExecOverride ??
+    (typeof signalOrExec === "function" ? signalOrExec : execText);
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error("location update aborted");
+  }
+  const result = await runExec("adb", geoFixArgs(serial, fix), {
+    timeout: 5_000,
+    maxBuffer: 64 * 1024,
+    lane: "interactive",
+    signal,
   });
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error("location update aborted");
+  }
+  if (result.timedOut) throw new Error("adb emu geo fix timed out");
+  const output = `${result.stdout}${result.stderr}`.trim();
+  if (result.error) {
+    throw new Error(
+      `adb emu geo fix failed: ${output || result.error.message}`,
+      { cause: result.error },
+    );
+  }
+  assertGeoFixOutput(result.status, output);
 }

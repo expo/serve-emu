@@ -16,7 +16,8 @@ describe("generation cancellation", () => {
     );
     setTimeout(() => controller.abort(reason), 20);
 
-    await expect(running).rejects.toBe(reason);
+    const result = await running;
+    expect(result.error?.cause).toBe(reason);
     expect(Date.now() - startedMs).toBeLessThan(1_500);
     const probe = await execText(
       process.execPath,

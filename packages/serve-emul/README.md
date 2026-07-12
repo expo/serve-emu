@@ -154,6 +154,12 @@ curl -X POST "$BASE/api/devices/select" \
   -d '{"serial":"emulator-5554"}'
 ```
 
+`/health` includes bounded subprocess executor activity, queue depth, lane
+counts, deadlines, overload rejections, and output-limit totals. Device-grid
+refreshes reuse one `adb devices` snapshot while resolving running AVD names.
+Long install/import work uses a background lane; the default executor reserves
+one active slot and eight queue positions for interactive work such as GPS.
+
 AVD lifecycle helpers:
 
 ```sh

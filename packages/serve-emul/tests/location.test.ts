@@ -86,48 +86,38 @@ describe("setEmulatorLocationAsync", () => {
   });
 
   test("aborting an active update kills adb and cleans timer and signal listeners", async () => {
-    const child = new FakeLocationChild();
-    const signal = new TrackingAbortSignal();
-    const clearedTimers: unknown[] = [];
-    let timeoutCallback: (() => void) | undefined;
-    let spawnedArgs: string[] | undefined;
+    const controller = new AbortController();
+    let observedSignal: AbortSignal | undefined;
     const update = setEmulatorLocationAsync(
       "emulator-5554",
       { latitude: 51.5, longitude: -0.12 },
-      signal as unknown as AbortSignal,
-      {
-        spawn: (args) => {
-          spawnedArgs = args;
-          return child;
-        },
-        setTimeout: (callback) => {
-          timeoutCallback = callback;
-          return 42;
-        },
-        clearTimeout: (handle) => clearedTimers.push(handle),
-      },
+      controller.signal,
+      (async (_cmd, _args, opts) => {
+        observedSignal = opts.signal;
+        await new Promise<void>((resolve) =>
+          opts.signal?.addEventListener("abort", () => resolve(), {
+            once: true,
+          }),
+        );
+        return {
+          status: null,
+          signal: "SIGKILL",
+          stdout: "",
+          stderr: "",
+          timedOut: false,
+          error: new Error("command was aborted", {
+            cause: opts.signal?.reason,
+          }),
+        };
+      }) as typeof import("../src/exec.ts").execText,
     );
 
-    expect(spawnedArgs?.slice(0, 4)).toEqual([
-      "-s",
-      "emulator-5554",
-      "emu",
-      "geo",
-    ]);
-    expect(signal.listeners.size).toBe(1);
-    signal.abort();
+    expect(observedSignal).toBe(controller.signal);
+    controller.abort(new DOMException("test abort", "AbortError"));
 
     await expect(update).rejects.toMatchObject({
       name: "AbortError",
       message: "test abort",
     });
-    expect(child.killSignals).toEqual(["SIGKILL"]);
-    expect(clearedTimers).toEqual([42]);
-    expect(signal.listeners.size).toBe(0);
-
-    child.emitExit(0);
-    timeoutCallback?.();
-    expect(child.killSignals).toEqual(["SIGKILL"]);
-    expect(clearedTimers).toEqual([42]);
   });
 });

@@ -62,6 +62,7 @@ async function adb(
   const result = await runExec("adb", ["-s", serial, ...args], {
     timeout,
     signal,
+    lane: "background",
   });
   if (signal?.aborted) {
     throw signal.reason instanceof Error

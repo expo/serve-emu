@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
 import type { ServerWebSocket } from "bun";
-import { execText } from "./exec.ts";
+import { execText, getExecSnapshot } from "./exec.ts";
 import {
   getFontScale,
   getNetworkStatus,
@@ -485,6 +485,7 @@ export async function startServer(
     route: context.route.snapshot(),
     session: context.recorder.snapshot(),
     uploads: uploads.snapshot(),
+    executor: getExecSnapshot(),
     clientsDetail: Array.from(context.clients, (client) => ({
       id: client.id,
       frameMeta: client.frameMeta,

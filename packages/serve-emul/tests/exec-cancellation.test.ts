@@ -81,9 +81,9 @@ test("execText aborts a running child and releases its executor slot", async () 
     const abortedAt = Date.now();
     controller.abort(new Error("cancel running command"));
 
-    await expect(
-      within(running, BOUNDED_COMPLETION_MS),
-    ).rejects.toThrow("cancel running command");
+    const aborted = await within(running, BOUNDED_COMPLETION_MS);
+    expect(aborted.error?.message).toBe("command was aborted");
+    expect(aborted.error?.cause).toBe(controller.signal.reason);
     expect(Date.now() - abortedAt).toBeLessThan(BOUNDED_COMPLETION_MS);
 
     await expectExecutorStillWorks();
@@ -126,7 +126,9 @@ test("execText reaps a child that exceeds maxBuffer before releasing its slot", 
     BOUNDED_COMPLETION_MS,
   );
 
-  expect(result.error?.message).toBe("maxBuffer exceeded");
+  expect(result.error?.message).toBe(
+    "combined stdout and stderr exceed 1024 bytes",
+  );
   expect(result.signal).toBe("SIGKILL");
   await expectExecutorStillWorks();
 });
@@ -164,17 +166,16 @@ test("aborting a command queued at the concurrency gate does not consume a slot"
     void queued.catch(() => {});
     queuedController.abort(new Error("cancel queued command"));
 
-    await expect(
-      within(queued, BOUNDED_COMPLETION_MS),
-    ).rejects.toThrow("cancel queued command");
+    const aborted = await within(queued, BOUNDED_COMPLETION_MS);
+    expect(aborted.error?.message).toBe("command was aborted");
+    expect(aborted.error?.cause).toBe(queuedController.signal.reason);
     expect(await pathExists(queuedPath)).toBe(false);
 
     // Free exactly one of the four occupied slots. If the cancelled waiter was
     // left in the queue, it absorbs this release and the probe cannot start.
     holderControllers[0].abort(new Error("free one executor slot"));
-    await expect(
-      within(holders[0], BOUNDED_COMPLETION_MS),
-    ).rejects.toThrow("free one executor slot");
+    const released = await within(holders[0], BOUNDED_COMPLETION_MS);
+    expect(released.error?.cause).toBe(holderControllers[0].signal.reason);
 
     probeController = new AbortController();
     const probeTimeout = setTimeout(
