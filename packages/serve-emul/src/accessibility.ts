@@ -47,6 +47,32 @@ const SELECTOR_STRING_FIELDS = [
 const MAX_SELECTOR_TEXT_BYTES = 512;
 const DUMP_ATTEMPTS = 3;
 
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("accessibility snapshot aborted");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortError(signal));
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError(signal!));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -189,33 +215,63 @@ function boolAttr(value: string | undefined): boolean {
   return value === "true";
 }
 
-async function dumpXml(serial: string): Promise<string> {
+async function dumpXml(serial: string, signal?: AbortSignal): Promise<string> {
   const path = `/sdcard/window-${Date.now()}.xml`;
   let lastError = "uiautomator dump failed";
-  for (let attempt = 1; attempt <= DUMP_ATTEMPTS; attempt++) {
-    const dump = await execText("adb", ["-s", serial, "shell", "uiautomator", "dump", path], {
-      timeout: 8_000,
-    });
-    if (dump.status !== 0) {
-      lastError = (dump.stderr || dump.stdout || `uiautomator dump failed with status ${dump.status}`).trim();
-      await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
-      continue;
+  let cleanupNeeded = false;
+  try {
+    for (let attempt = 1; attempt <= DUMP_ATTEMPTS; attempt++) {
+      throwIfAborted(signal);
+      cleanupNeeded = true;
+      const dump = await execText(
+        "adb",
+        ["-s", serial, "shell", "uiautomator", "dump", path],
+        { timeout: 8_000, signal },
+      );
+      if (dump.status !== 0) {
+        lastError = (
+          dump.stderr ||
+          dump.stdout ||
+          `uiautomator dump failed with status ${dump.status}`
+        ).trim();
+        await delay(150 * attempt, signal);
+        continue;
+      }
+      const result = await execText(
+        "adb",
+        ["-s", serial, "shell", "cat", path],
+        {
+          maxBuffer: 16 * 1024 * 1024,
+          timeout: 8_000,
+          signal,
+        },
+      );
+      if (result.status === 0) return result.stdout;
+      lastError = (
+        result.stderr ||
+        result.stdout ||
+        "uiautomator dump read failed"
+      ).trim();
+      await delay(150 * attempt, signal);
     }
-    const result = await execText("adb", ["-s", serial, "shell", "cat", path], {
-      maxBuffer: 16 * 1024 * 1024,
-      timeout: 8_000,
-    });
-    void execText("adb", ["-s", serial, "shell", "rm", path], { timeout: 2_000 });
-    if (result.status === 0) return result.stdout;
-    lastError = (result.stderr || result.stdout || "uiautomator dump read failed").trim();
-    await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
+    throw new Error(lastError);
+  } finally {
+    if (cleanupNeeded) {
+      try {
+        await execText("adb", ["-s", serial, "shell", "rm", path], {
+          timeout: 2_000,
+        });
+      } catch {}
+    }
   }
-  void execText("adb", ["-s", serial, "shell", "rm", path], { timeout: 2_000 });
-  throw new Error(lastError);
 }
 
-export async function getAccessibilitySnapshot(serial: string): Promise<AccessibilitySnapshot> {
-  const xml = await dumpXml(serial);
+export async function getAccessibilitySnapshot(
+  serial: string,
+  signal?: AbortSignal,
+): Promise<AccessibilitySnapshot> {
+  const xml = await dumpXml(serial, signal);
+  throwIfAborted(signal);
   const nodes: AccessibilityNode[] = [];
   let index = 0;
   for (const match of xml.matchAll(/<node\b[^>]*>/g)) {
@@ -234,5 +290,6 @@ export async function getAccessibilitySnapshot(serial: string): Promise<Accessib
       bounds,
     });
   }
+  throwIfAborted(signal);
   return { ok: true, capturedAt: new Date().toISOString(), nodes };
 }

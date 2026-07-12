@@ -190,12 +190,17 @@ async function main() {
     throw err;
   });
 
-  const stop = async () => {
-    try {
-      await stopServer();
-    } finally {
-      emulatorLaunch?.stop();
-    }
+  let stopping: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopping) return stopping;
+    stopping = (async () => {
+      try {
+        await stopServer();
+      } finally {
+        emulatorLaunch?.stop();
+      }
+    })();
+    return stopping;
   };
   process.once("SIGINT", () => {
     void stop().finally(() => process.exit(0));
