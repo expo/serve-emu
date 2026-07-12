@@ -88,6 +88,11 @@ import {
   SessionChangedError,
 } from "./device-session-context.ts";
 import { routePlaybackErrorResponse } from "./route-playback-api.ts";
+import {
+  SessionRecoveryWatchdog,
+  SYSTEM_RECOVERY_WATCHDOG_CLOCK,
+  type RecoveryWatchdogClock,
+} from "./session-recovery-watchdog.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -173,6 +178,8 @@ type Client = {
   droppedFrames: number;
   backpressureEvents: number;
   awaitingKeyFrame: boolean;
+  awaitingKeyFrameSinceMs: number | null;
+  lastKeyFrameRequestMs: number | null;
 };
 
 type DeviceContext = ActiveDeviceSession<Client>;
@@ -182,6 +189,7 @@ const DROP_FRAME_BUFFERED_BYTES = 512 * 1024;
 const CLOSE_CLIENT_BUFFERED_BYTES = 16 * 1024 * 1024;
 const VIDEO_RESET_COOLDOWN_MS = 500;
 const FIRST_FRAME_RESET_MS = 5000;
+const SOURCE_STALL_RESET_MS = 2500;
 const AWAITING_KEYFRAME_RESET_MS = 2500;
 const MAX_JSON_BODY_BYTES = 8 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
@@ -212,6 +220,7 @@ export type ServerDependencies = {
     signal: AbortSignal,
   ) => Promise<void>;
   createInputQueue?: (session: ScrcpySession) => ControlInputQueue;
+  recoveryClock?: RecoveryWatchdogClock;
 };
 
 export async function startServer(
@@ -248,6 +257,8 @@ export async function startServer(
     dependencies.createInputQueue ??
     ((session: ScrcpySession) =>
       new ControlInputQueue({ socket: session.controlSocket }));
+  const recoveryClock =
+    dependencies.recoveryClock ?? SYSTEM_RECOVERY_WATCHDOG_CLOCK;
 
   const host = opts.host ?? DEFAULT_HOST;
   const authToken = opts.token && opts.token.length > 0 ? opts.token : null;
@@ -310,12 +321,27 @@ export async function startServer(
     throw err;
   }
   const sessions = new DeviceSessionManager(initialContext);
+  const recoveries = new WeakMap<
+    DeviceContext,
+    SessionRecoveryWatchdog<Client>
+  >();
   let stopRequested = false;
   console.log(
     `scrcpy ready: ${initialScrcpy.meta.deviceName} • ${initialScrcpy.meta.codecId} • ${initialScrcpy.meta.width}×${initialScrcpy.meta.height}`,
   );
 
-  const health = (context = sessions.current) => ({
+  const health = (context = sessions.current) => {
+    const now = recoveryClock.now();
+    const recovery = recoveries.get(context);
+    const recoverySnapshot = recovery?.snapshot(now) ?? {
+      sourceFps: 0,
+      lastFrameMs: null,
+      sourceFrameAgeMs: Math.max(0, now - context.startedMs),
+      awaitingClients: 0,
+      oldestAwaitingAgeMs: null,
+      lastResetAttemptMs: null,
+    };
+    return {
     ok: context.status === "streaming",
     status: context.status,
     generation: context.generation,
@@ -325,7 +351,16 @@ export async function startServer(
     size: { width: context.screen.width, height: context.screen.height },
     clients: context.clients.size,
     frames: context.frameCount,
-    sourceFps: context.sourceFps,
+    sourceFps: recoverySnapshot.sourceFps,
+    sourceFrameAgeMs: recoverySnapshot.sourceFrameAgeMs,
+    keyFrameRecovery: {
+      awaitingClients: recoverySnapshot.awaitingClients,
+      oldestAwaitingAgeMs: recoverySnapshot.oldestAwaitingAgeMs,
+      lastResetAttemptAt:
+        recoverySnapshot.lastResetAttemptMs === null
+          ? null
+          : new Date(recoverySnapshot.lastResetAttemptMs).toISOString(),
+    },
     frameStats: context.frameStats.summary(),
     configPackets: context.configPacketCount,
     droppedFrames: context.totalDroppedFrames,
@@ -344,17 +379,30 @@ export async function startServer(
       backpressureEvents: client.backpressureEvents,
       bufferedBytes: client.ws.getBufferedAmount(),
       awaitingKeyFrame: client.awaitingKeyFrame,
+      awaitingKeyFrameSinceAt:
+        client.awaitingKeyFrameSinceMs === null
+          ? null
+          : new Date(client.awaitingKeyFrameSinceMs).toISOString(),
+      awaitingKeyFrameAgeMs:
+        client.awaitingKeyFrameSinceMs === null
+          ? null
+          : Math.max(0, now - client.awaitingKeyFrameSinceMs),
+      lastKeyFrameRequestAt:
+        client.lastKeyFrameRequestMs === null
+          ? null
+          : new Date(client.lastKeyFrameRequestMs).toISOString(),
     })),
     startedAt: context.startedAt,
     stoppedAt: context.stoppedAt,
     lastFrameAt:
-      context.lastFrameMs > 0
-        ? new Date(context.lastFrameMs).toISOString()
-        : null,
+      recoverySnapshot.lastFrameMs === null
+        ? null
+        : new Date(recoverySnapshot.lastFrameMs).toISOString(),
     lastError: context.lastError,
     lastErrorCode: context.lastErrorCode,
     lastErrorMeta: context.lastErrorMeta,
-  });
+  };
+  };
 
   const deviceGrid = async (
     context: DeviceContext,
@@ -975,11 +1023,43 @@ export async function startServer(
     }
   };
 
+  const createRecovery = (context: DeviceContext) =>
+    new SessionRecoveryWatchdog<Client>({
+      clock: recoveryClock,
+      clients: () => context.clients,
+      startedMs: recoveryClock.now(),
+      intervalMs: 1_000,
+      sessionResetCooldownMs: VIDEO_RESET_COOLDOWN_MS,
+      firstFrameResetMs: FIRST_FRAME_RESET_MS,
+      sourceStallResetMs: SOURCE_STALL_RESET_MS,
+      awaitingKeyFrameResetMs: AWAITING_KEYFRAME_RESET_MS,
+      requestReset: (reason, now) => {
+        if (!sessions.isCurrent(context) || context.status !== "streaming") {
+          return false;
+        }
+        try {
+          const accepted = context.inputQueue.enqueuePacket(
+            resetVideoPacket(),
+            { coalesceKey: "reset-video" },
+          );
+          void accepted.completion.catch(() => {});
+          context.lastVideoResetMs = now;
+          context.videoResetRequests++;
+          context.lastVideoResetAt = new Date(now).toISOString();
+          context.lastVideoResetReason = reason;
+          return true;
+        } catch {
+          return false;
+        }
+      },
+    });
+
   const dropUntilKeyFrame = (client: Client) => {
     client.droppedFrames++;
     client.context.totalDroppedFrames++;
-    client.awaitingKeyFrame = true;
-    void requestVideoReset(client.context, "client backpressure").catch(() => {});
+    const recovery = recoveries.get(client.context);
+    recovery?.markAwaiting(client);
+    recovery?.requestVideoReset("client backpressure");
   };
 
   const sendFrame = (client: Client, data: Buffer, isKeyFrame: boolean) => {
@@ -989,7 +1069,6 @@ export async function startServer(
         client.context.totalDroppedFrames++;
         return;
       }
-      client.awaitingKeyFrame = false;
     }
 
     const buffered = client.ws.getBufferedAmount();
@@ -1004,7 +1083,16 @@ export async function startServer(
       dropUntilKeyFrame(client);
       return;
     }
-    const sent = client.ws.send(data);
+    let sent: number;
+    try {
+      sent = client.ws.send(data);
+    } catch {
+      client.context.clients.delete(client);
+      try {
+        client.ws.close(1011, "frame send failed");
+      } catch {}
+      return;
+    }
     if (sent === -1) {
       client.backpressureEvents++;
       client.context.totalBackpressureEvents++;
@@ -1016,6 +1104,7 @@ export async function startServer(
       return;
     }
     client.sentFrames++;
+    if (isKeyFrame) recoveries.get(client.context)?.keyFrameAccepted(client);
   };
   const startFramePump = (context: DeviceContext) => {
     context.cachedConfig = null;
@@ -1035,16 +1124,15 @@ export async function startServer(
               context.screen.height = f.height;
               context.cachedConfig = null;
               for (const c of context.clients) {
-                c.awaitingKeyFrame = true;
+                recoveries.get(context)?.markAwaiting(c);
                 sendJson(c.ws, {
                   type: "video-session",
                   size: { width: f.width, height: f.height },
                 });
               }
-              void requestVideoReset(
-                context,
+              recoveries.get(context)?.requestVideoReset(
                 `video session resized to ${f.width}×${f.height}`,
-              ).catch(() => {});
+              );
             }
             continue;
           }
@@ -1054,7 +1142,7 @@ export async function startServer(
             continue;
           }
           context.frameCount++;
-          context.lastFrameMs = Date.now();
+          recoveries.get(context)?.recordFrame();
           context.frameStats.record(f.data.length, f.isKey);
           const config = f.isKey ? context.cachedConfig : null;
           let rawOut: Buffer | null = null;
@@ -1125,39 +1213,12 @@ export async function startServer(
   };
 
   const activateContext = (context: DeviceContext) => {
+    const recovery = createRecovery(context);
+    recoveries.set(context, recovery);
+    context.registerCleanup(() => recovery.stop());
     startFramePump(context);
     attachSessionHandlers(context);
-    context.setWatchdog(
-      setInterval(() => {
-        if (!sessions.isCurrent(context)) return;
-        context.sourceFps = context.frameCount - context.lastFpsFrameCount;
-        context.lastFpsFrameCount = context.frameCount;
-        if (context.status !== "streaming" || context.clients.size === 0)
-          return;
-        const now = Date.now();
-        if (
-          context.frameCount === 0 &&
-          now - context.startedMs > FIRST_FRAME_RESET_MS
-        ) {
-          void requestVideoReset(
-            context,
-            "first video frame not received",
-          ).catch(() => {});
-          return;
-        }
-        if (
-          Array.from(context.clients).some(
-            (client) => client.awaitingKeyFrame,
-          ) &&
-          now - (context.lastFrameMs || context.startedMs) >
-            AWAITING_KEYFRAME_RESET_MS
-        ) {
-          void requestVideoReset(context, "client awaiting keyframe").catch(
-            () => {},
-          );
-        }
-      }, 1000),
-    );
+    recovery.start();
   };
 
   const switchSession = async (serial: string) => {
@@ -1992,6 +2053,11 @@ export async function startServer(
       open(ws) {
         const context = ws.data.context;
         if (!sessions.isCurrent(context)) {
+          sendJson(ws, {
+            ok: false,
+            code: "session_changed",
+            error: "device session changed",
+          });
           ws.close(1012, "device session changed");
           return;
         }
@@ -2003,11 +2069,15 @@ export async function startServer(
           sentFrames: 0,
           droppedFrames: 0,
           backpressureEvents: 0,
-          awaitingKeyFrame: true,
+          awaitingKeyFrame: false,
+          awaitingKeyFrameSinceMs: null,
+          lastKeyFrameRequestMs: null,
         };
         context.clients.add(handle);
         ws.data.handle = handle;
-        void requestVideoReset(context, "client opened").catch(() => {});
+        const recovery = recoveries.get(context);
+        recovery?.markAwaiting(handle);
+        recovery?.requestVideoReset("client opened");
       },
       message(ws, raw) {
         const context = ws.data.context;
