@@ -25,6 +25,7 @@ import {
   type AccessibilitySnapshot,
 } from "./accessibility.ts";
 import {
+  AppManagementError,
   clearAppData,
   forceStopApp,
   grantPermission,
@@ -93,6 +94,18 @@ import {
   SYSTEM_RECOVERY_WATCHDOG_CLOCK,
   type RecoveryWatchdogClock,
 } from "./session-recovery-watchdog.ts";
+import {
+  MultipartUploadError,
+  stageMultipartUpload,
+} from "./multipart-upload.ts";
+import { HttpBodyError, readJsonLimited } from "./request-body.ts";
+import {
+  MAX_UPLOAD_QUEUE_TIMEOUT_MS,
+  UploadManager,
+  UploadManagerError,
+  type UploadContext,
+  type UploadManagerOptions,
+} from "./upload-manager.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -114,9 +127,20 @@ export type ServerOpts = {
   maxSize?: number;
   keyFrameInterval?: number;
   repeatFrameMs?: number;
+  maxApkUploadBytes?: number;
+  maxMediaUploadBytes?: number;
+  maxActiveUploads?: number;
+  maxQueuedUploads?: number;
+  uploadQueueTimeoutMs?: number;
 };
 
 export const DEFAULT_HOST = "127.0.0.1";
+export const DEFAULT_MAX_APK_UPLOAD_BYTES = 512 * 1024 * 1024;
+export const DEFAULT_MAX_MEDIA_UPLOAD_BYTES = 1024 * 1024 * 1024;
+export const DEFAULT_MAX_ACTIVE_UPLOADS = 2;
+export const DEFAULT_MAX_QUEUED_UPLOADS = 4;
+export const DEFAULT_UPLOAD_QUEUE_TIMEOUT_MS = 5_000;
+const MULTIPART_BODY_OVERHEAD_BYTES = 1024 * 1024;
 const SESSION_COOKIE = "semu_session";
 
 /** Constant-time string compare that never throws on length mismatch. */
@@ -221,7 +245,26 @@ export type ServerDependencies = {
   ) => Promise<void>;
   createInputQueue?: (session: ScrcpySession) => ControlInputQueue;
   recoveryClock?: RecoveryWatchdogClock;
+  createUploadManager?: (options: UploadManagerOptions) => UploadManager;
+  stageMultipartUpload?: typeof stageMultipartUpload;
+  installApk?: typeof installApk;
+  importMediaFile?: typeof importMediaFile;
 };
+
+function serverLimit(
+  value: number | undefined,
+  fallback: number,
+  name: string,
+  allowZero = false,
+): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < (allowZero ? 0 : 1)) {
+    throw new Error(
+      `${name} must be ${allowZero ? "a non-negative" : "a positive"} safe integer`,
+    );
+  }
+  return resolved;
+}
 
 export async function startServer(
   opts: ServerOpts,
@@ -259,6 +302,64 @@ export async function startServer(
       new ControlInputQueue({ socket: session.controlSocket }));
   const recoveryClock =
     dependencies.recoveryClock ?? SYSTEM_RECOVERY_WATCHDOG_CLOCK;
+  const stageUpload =
+    dependencies.stageMultipartUpload ?? stageMultipartUpload;
+  const installStagedApk = dependencies.installApk ?? installApk;
+  const importStagedMedia = dependencies.importMediaFile ?? importMediaFile;
+  const maxApkUploadBytes = serverLimit(
+    opts.maxApkUploadBytes,
+    DEFAULT_MAX_APK_UPLOAD_BYTES,
+    "maxApkUploadBytes",
+  );
+  const maxMediaUploadBytes = serverLimit(
+    opts.maxMediaUploadBytes,
+    DEFAULT_MAX_MEDIA_UPLOAD_BYTES,
+    "maxMediaUploadBytes",
+  );
+  const maxActiveUploads = serverLimit(
+    opts.maxActiveUploads,
+    DEFAULT_MAX_ACTIVE_UPLOADS,
+    "maxActiveUploads",
+  );
+  const maxQueuedUploads = serverLimit(
+    opts.maxQueuedUploads,
+    DEFAULT_MAX_QUEUED_UPLOADS,
+    "maxQueuedUploads",
+    true,
+  );
+  const uploadQueueTimeoutMs = serverLimit(
+    opts.uploadQueueTimeoutMs,
+    DEFAULT_UPLOAD_QUEUE_TIMEOUT_MS,
+    "uploadQueueTimeoutMs",
+    true,
+  );
+  if (uploadQueueTimeoutMs > MAX_UPLOAD_QUEUE_TIMEOUT_MS) {
+    throw new Error(
+      `uploadQueueTimeoutMs must be at most ${MAX_UPLOAD_QUEUE_TIMEOUT_MS}`,
+    );
+  }
+  const maxUploadFileBytes = Math.max(
+    maxApkUploadBytes,
+    maxMediaUploadBytes,
+  );
+  if (
+    maxUploadFileBytes >
+    Number.MAX_SAFE_INTEGER - MULTIPART_BODY_OVERHEAD_BYTES * 2
+  ) {
+    throw new Error("upload byte limit is too large");
+  }
+  const maxRequestBodySize = Math.max(
+    maxUploadFileBytes + MULTIPART_BODY_OVERHEAD_BYTES * 2,
+    MAX_ROUTE_BODY_BYTES,
+  );
+  const uploads = (
+    dependencies.createUploadManager ??
+    ((options: UploadManagerOptions) => new UploadManager(options))
+  )({
+    maxActive: maxActiveUploads,
+    maxQueued: maxQueuedUploads,
+    queueTimeoutMs: uploadQueueTimeoutMs,
+  });
 
   const host = opts.host ?? DEFAULT_HOST;
   const authToken = opts.token && opts.token.length > 0 ? opts.token : null;
@@ -301,14 +402,26 @@ export async function startServer(
     serial: string,
     generation: number,
     scrcpy: ScrcpySession,
-  ): DeviceContext =>
-    new ActiveDeviceSession<Client>({
+  ): DeviceContext => {
+    const context = new ActiveDeviceSession<Client>({
       serial,
       generation,
       scrcpy,
       applyLocation: setLocation,
       inputQueue: createInputQueue(scrcpy),
     });
+    context.registerCleanup(() =>
+      uploads.cancelGeneration(
+        generation,
+        new UploadManagerError(
+          "device-session-changed",
+          `device session ${generation} is no longer active`,
+          { serial, generation },
+        ),
+      ),
+    );
+    return context;
+  };
 
   const initialScrcpy = await openScrcpy(opts.serial, opts.signal);
   let initialContext: DeviceContext;
@@ -371,6 +484,7 @@ export async function startServer(
     location: context.lastLocation,
     route: context.route.snapshot(),
     session: context.recorder.snapshot(),
+    uploads: uploads.snapshot(),
     clientsDetail: Array.from(context.clients, (client) => ({
       id: client.id,
       frameMeta: client.frameMeta,
@@ -534,9 +648,7 @@ export async function startServer(
     context?: DeviceContext,
     requireUsableContext = true,
   ): Promise<unknown> => {
-    const contentLength = Number(req.headers.get("content-length") ?? "0");
-    if (contentLength > maxBytes) throw new Error("request body too large");
-    const value = await req.json();
+    const value = await readJsonLimited(req, maxBytes);
     if (context) {
       if (requireUsableContext) sessions.assertCurrent(context);
       else sessions.assertPublished(context);
@@ -552,7 +664,35 @@ export async function startServer(
         { status: 409 },
       );
     }
-    return Response.json({ ok: false, error }, { status: fallbackStatus });
+    let status = fallbackStatus;
+    let code: string | undefined;
+    if (err instanceof HttpBodyError) {
+      status = err.status;
+      code = err.code;
+    } else if (err instanceof MultipartUploadError) {
+      status = err.status;
+      code = err.code;
+    } else if (err instanceof UploadManagerError) {
+      const mapped = {
+        "queue-full": { status: 429, code: "upload-queue-full" },
+        "queue-timeout": { status: 503, code: "upload-queue-timeout" },
+        "upload-cancelled": { status: 499, code: "upload-cancelled" },
+        "device-session-changed": {
+          status: 409,
+          code: "device-session-changed",
+        },
+        closed: { status: 503, code: "upload-service-closed" },
+      } as const;
+      status = mapped[err.code].status;
+      code = mapped[err.code].code;
+    } else if (err instanceof AppManagementError) {
+      status = err.code === "adb-timeout" ? 504 : 502;
+      code = err.code;
+    }
+    return Response.json(
+      { ok: false, ...(code ? { code } : {}), error },
+      { status },
+    );
   };
 
   const inputErrorPayload = (
@@ -568,8 +708,9 @@ export async function startServer(
   const inputErrorResponse = (
     err: unknown,
     status: "rejected" | "failed",
-  ) =>
-    Response.json(inputErrorPayload(err, status), {
+  ) => {
+    if (err instanceof HttpBodyError) return errorResponse(err);
+    return Response.json(inputErrorPayload(err, status), {
       status:
         err instanceof ControlInputError &&
         err.code === "control-queue-overloaded"
@@ -578,6 +719,7 @@ export async function startServer(
             ? 503
             : 400,
     });
+  };
 
   const runForContext = async <T>(
     context: DeviceContext,
@@ -968,35 +1110,88 @@ export async function startServer(
     }
   };
 
-  const installEndpoint = async (context: DeviceContext, req: Request) => {
+  const uploadEndpoint = async (
+    context: DeviceContext,
+    req: Request,
+    options: {
+      fieldName: "apk" | "file";
+      maxFileBytes: number;
+      action: (
+        serial: string,
+        file: Awaited<ReturnType<typeof stageUpload>>,
+        signal: AbortSignal,
+      ) => Promise<unknown>;
+    },
+  ) => {
     try {
-      const form = await req.formData();
-      sessions.assertCurrent(context);
-      const file = form.get("apk");
-      if (!(file instanceof File))
-        throw new Error("multipart field apk must be a file");
-      const result = await installApk(context.serial, file);
-      sessions.assertCurrent(context);
+      const uploadContext: UploadContext = {
+        serial: context.serial,
+        generation: context.generation,
+      };
+      const result = await uploads.run(
+        {
+          context: uploadContext,
+          requestSignal: req.signal,
+          sessionSignal: context.signal,
+        },
+        async ({ context: acceptedContext, signal }) => {
+          const staged = await stageUpload(req, {
+            fieldName: options.fieldName,
+            maxFileBytes: options.maxFileBytes,
+            maxBodyBytes:
+              options.maxFileBytes + MULTIPART_BODY_OVERHEAD_BYTES,
+            signal,
+          });
+          try {
+            sessions.assertCurrent(context);
+            if (
+              acceptedContext.serial !== context.serial ||
+              acceptedContext.generation !== context.generation
+            ) {
+              throw new UploadManagerError(
+                "device-session-changed",
+                "device session changed during upload",
+                acceptedContext,
+              );
+            }
+            return await options.action(context.serial, staged, signal);
+          } finally {
+            try {
+              await staged.cleanup();
+            } catch (error) {
+              throw new MultipartUploadError(
+                "upload-cleanup-failed",
+                "failed to clean up multipart upload",
+                { cause: error },
+              );
+            }
+          }
+        },
+      );
       return Response.json(result);
-    } catch (err) {
-      return errorResponse(err);
+    } catch (error) {
+      if (req.body && !req.body.locked) {
+        await req.body.cancel(error).catch(() => {});
+      }
+      return errorResponse(error);
     }
   };
 
-  const fileImportEndpoint = async (context: DeviceContext, req: Request) => {
-    try {
-      const form = await req.formData();
-      sessions.assertCurrent(context);
-      const file = form.get("file");
-      if (!(file instanceof File))
-        throw new Error("multipart field file must be a file");
-      const result = await importMediaFile(context.serial, file);
-      sessions.assertCurrent(context);
-      return Response.json(result);
-    } catch (err) {
-      return errorResponse(err);
-    }
-  };
+  const installEndpoint = (context: DeviceContext, req: Request) =>
+    uploadEndpoint(context, req, {
+      fieldName: "apk",
+      maxFileBytes: maxApkUploadBytes,
+      action: (serial, file, signal) =>
+        installStagedApk(serial, file, signal),
+    });
+
+  const fileImportEndpoint = (context: DeviceContext, req: Request) =>
+    uploadEndpoint(context, req, {
+      fieldName: "file",
+      maxFileBytes: maxMediaUploadBytes,
+      action: (serial, file, signal) =>
+        importStagedMedia(serial, file, signal),
+    });
 
   const enqueueVideoReset = (context: DeviceContext, reason: string) => {
     sessions.assertCurrent(context);
@@ -1222,6 +1417,17 @@ export async function startServer(
   };
 
   const switchSession = async (serial: string) => {
+    const previous = sessions.current;
+    if (serial !== previous.serial) {
+      await uploads.cancelGeneration(
+        previous.generation,
+        new UploadManagerError(
+          "device-session-changed",
+          "device switched",
+          { serial: previous.serial, generation: previous.generation },
+        ),
+      );
+    }
     const context = await sessions.switch(
       serial,
       async (targetSerial, generation, signal) => {
@@ -1274,6 +1480,7 @@ export async function startServer(
   const serverOptions: Parameters<typeof Bun.serve<WsData>>[0] = {
     port: opts.port,
     hostname: host,
+    maxRequestBodySize,
     async fetch(req, srv) {
       const requestContext = sessions.current;
       const url = new URL(req.url);
@@ -2050,6 +2257,7 @@ export async function startServer(
       return new Response("not found", { status: 404 });
     },
     websocket: {
+      maxPayloadLength: MAX_WS_MESSAGE_BYTES,
       open(ws) {
         const context = ws.data.context;
         if (!sessions.isCurrent(context)) {
@@ -2151,6 +2359,12 @@ export async function startServer(
   } catch (err) {
     stopRequested = true;
     await sessions.close("server startup failed");
+    await uploads.close(
+      new UploadManagerError("closed", "server startup failed", {
+        serial: sessions.current.serial,
+        generation: sessions.current.generation,
+      }),
+    );
     throw err;
   }
 
@@ -2159,7 +2373,15 @@ export async function startServer(
     if (stopTask) return stopTask;
     stopRequested = true;
     server.stop(true);
-    stopTask = sessions.close("server stopping");
+    const context = sessions.current;
+    const error = new UploadManagerError("closed", "server is stopping", {
+      serial: context.serial,
+      generation: context.generation,
+    });
+    stopTask = Promise.all([
+      sessions.close("server stopping"),
+      uploads.close(error),
+    ]).then(() => {});
     return stopTask;
   };
 

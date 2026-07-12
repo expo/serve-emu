@@ -4,7 +4,15 @@ import { randomBytes } from "node:crypto";
 import { pickDevice } from "./adb.ts";
 import { listAvds, listRunningAvds, startEmulator } from "./emulator.ts";
 import { SCRCPY_DEFAULTS } from "./scrcpy.ts";
-import { DEFAULT_HOST, startServer } from "./server.ts";
+import {
+  DEFAULT_HOST,
+  DEFAULT_MAX_ACTIVE_UPLOADS,
+  DEFAULT_MAX_APK_UPLOAD_BYTES,
+  DEFAULT_MAX_MEDIA_UPLOAD_BYTES,
+  DEFAULT_MAX_QUEUED_UPLOADS,
+  DEFAULT_UPLOAD_QUEUE_TIMEOUT_MS,
+  startServer,
+} from "./server.ts";
 import { getUpdateNotice } from "./update-check.ts";
 import packageJson from "../package.json";
 
@@ -22,6 +30,11 @@ const { values } = parseArgs({
     "max-size": { type: "string", default: String(SCRCPY_DEFAULTS.maxSize) },
     "key-frame-interval": { type: "string", default: String(SCRCPY_DEFAULTS.keyFrameInterval) },
     "repeat-frame-ms": { type: "string", default: String(SCRCPY_DEFAULTS.repeatFrameMs) },
+    "max-apk-upload-bytes": { type: "string", default: String(DEFAULT_MAX_APK_UPLOAD_BYTES) },
+    "max-media-upload-bytes": { type: "string", default: String(DEFAULT_MAX_MEDIA_UPLOAD_BYTES) },
+    "max-active-uploads": { type: "string", default: String(DEFAULT_MAX_ACTIVE_UPLOADS) },
+    "max-queued-uploads": { type: "string", default: String(DEFAULT_MAX_QUEUED_UPLOADS) },
+    "upload-queue-timeout-ms": { type: "string", default: String(DEFAULT_UPLOAD_QUEUE_TIMEOUT_MS) },
     avd: { type: "string" },
     "avd-list": { type: "boolean" },
     "running-avds": { type: "boolean" },
@@ -102,6 +115,11 @@ Options:
                          screen change, so static screens keep producing frames
                          (16 ≈ steady 60fps at the cost of extra CPU/bandwidth;
                          0 keeps the encoder default of one repeat per 100ms)
+      --max-apk-upload-bytes <n>    Maximum streamed APK bytes (default: ${DEFAULT_MAX_APK_UPLOAD_BYTES})
+      --max-media-upload-bytes <n>  Maximum streamed media bytes (default: ${DEFAULT_MAX_MEDIA_UPLOAD_BYTES})
+      --max-active-uploads <n>      Concurrent uploads (default: ${DEFAULT_MAX_ACTIVE_UPLOADS})
+      --max-queued-uploads <n>      Queued uploads (default: ${DEFAULT_MAX_QUEUED_UPLOADS})
+      --upload-queue-timeout-ms <ms> Upload queue wait limit (default: ${DEFAULT_UPLOAD_QUEUE_TIMEOUT_MS})
       --avd <name>       Launch this Android Virtual Device before streaming
       --gpu <mode>       Emulator GPU mode for --avd launches (default: host).
                          host uses the real GPU for smooth ~60fps; the AVD's
@@ -156,6 +174,11 @@ async function main() {
   const maxSize = numberOption("max-size", SCRCPY_DEFAULTS.maxSize);
   const keyFrameInterval = numberOption("key-frame-interval", SCRCPY_DEFAULTS.keyFrameInterval);
   const repeatFrameMs = numberOption("repeat-frame-ms", SCRCPY_DEFAULTS.repeatFrameMs);
+  const maxApkUploadBytes = numberOption("max-apk-upload-bytes", DEFAULT_MAX_APK_UPLOAD_BYTES);
+  const maxMediaUploadBytes = numberOption("max-media-upload-bytes", DEFAULT_MAX_MEDIA_UPLOAD_BYTES);
+  const maxActiveUploads = numberOption("max-active-uploads", DEFAULT_MAX_ACTIVE_UPLOADS);
+  const maxQueuedUploads = numberOption("max-queued-uploads", DEFAULT_MAX_QUEUED_UPLOADS);
+  const uploadQueueTimeoutMs = numberOption("upload-queue-timeout-ms", DEFAULT_UPLOAD_QUEUE_TIMEOUT_MS);
 
   const host = values.host ?? DEFAULT_HOST;
   const loopback = isLoopbackHost(host);
@@ -216,6 +239,11 @@ async function main() {
     maxSize,
     keyFrameInterval,
     repeatFrameMs,
+    maxApkUploadBytes,
+    maxMediaUploadBytes,
+    maxActiveUploads,
+    maxQueuedUploads,
+    uploadQueueTimeoutMs,
   });
   try {
     activeServer = await startupTask;
