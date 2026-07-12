@@ -46,6 +46,7 @@ import {
 } from "./shared/frame-meta.ts";
 import {
   startScrcpy,
+  type StartOpts as ScrcpyStartOpts,
   type ScrcpySession,
   ScrcpyStreamError,
 } from "./scrcpy.ts";
@@ -91,6 +92,7 @@ const UI_DIR = join(__dirname, "..", "dist", "ui");
 export type ServerOpts = {
   serial: string;
   port: number;
+  signal?: AbortSignal;
   /** Address to bind. Defaults to loopback (127.0.0.1). */
   host?: string;
   /**
@@ -187,8 +189,12 @@ export type ServerDependencies = {
     serial: string,
     signal?: AbortSignal,
   ) => Promise<ScrcpySession>;
+  /** @deprecated Prefer openScrcpy. Kept for lifecycle-test compatibility. */
+  startScrcpy?: (opts: ScrcpyStartOpts) => Promise<ScrcpySession>;
   serve?: typeof Bun.serve;
   listDevices?: typeof listAllDevices;
+  /** @deprecated Prefer listDevices. */
+  listAllDevices?: typeof listAllDevices;
   startEmulator?: typeof startEmulator;
   stopEmulator?: typeof stopEmulator;
   listRunningAvds?: typeof listRunningAvds;
@@ -208,10 +214,9 @@ export async function startServer(
   opts: ServerOpts,
   dependencies: ServerDependencies = {},
 ) {
-  const openScrcpy =
-    dependencies.openScrcpy ??
+  const openScrcpy = dependencies.openScrcpy ??
     ((serial: string, signal?: AbortSignal) =>
-      startScrcpy({
+      (dependencies.startScrcpy ?? startScrcpy)({
         serial,
         signal,
         maxFps: opts.maxFps,
@@ -221,7 +226,8 @@ export async function startServer(
         repeatFrameMs: opts.repeatFrameMs,
       }));
   const serve = dependencies.serve ?? Bun.serve;
-  const listDevices = dependencies.listDevices ?? listAllDevices;
+  const listDevices =
+    dependencies.listDevices ?? dependencies.listAllDevices ?? listAllDevices;
   const launchEmulator = dependencies.startEmulator ?? startEmulator;
   const killEmulator = dependencies.stopEmulator ?? stopEmulator;
   const listActiveAvds = dependencies.listRunningAvds ?? listRunningAvds;
@@ -284,7 +290,7 @@ export async function startServer(
       applyLocation: setLocation,
     });
 
-  const initialScrcpy = await openScrcpy(opts.serial);
+  const initialScrcpy = await openScrcpy(opts.serial, opts.signal);
   let initialContext: DeviceContext;
   try {
     initialContext = createContext(opts.serial, 0, initialScrcpy);

@@ -175,27 +175,19 @@ async function main() {
     }
   }
 
-  const { server, stop: stopServer } = await startServer({
-    serial,
-    port,
-    host,
-    token,
-    maxFps,
-    bitRate,
-    maxSize,
-    keyFrameInterval,
-    repeatFrameMs,
-  }).catch((err) => {
-    emulatorLaunch?.stop();
-    throw err;
-  });
-
+  type ActiveServer = Awaited<ReturnType<typeof startServer>>;
+  const lifecycleController = new AbortController();
+  let activeServer: ActiveServer | null = null;
+  let startupTask: Promise<ActiveServer> | null = null;
   let stopping: Promise<void> | null = null;
   const stop = (): Promise<void> => {
     if (stopping) return stopping;
+    lifecycleController.abort(new Error("serve-emul stopping"));
     stopping = (async () => {
       try {
-        await stopServer();
+        const started =
+          activeServer ?? (await startupTask?.catch(() => null)) ?? null;
+        await started?.stop();
       } finally {
         emulatorLaunch?.stop();
       }
@@ -203,11 +195,43 @@ async function main() {
     return stopping;
   };
   process.once("SIGINT", () => {
-    void stop().finally(() => process.exit(0));
+    void stop()
+      .catch((err) => console.error("Shutdown cleanup failed:", err))
+      .finally(() => process.exit(0));
   });
   process.once("SIGTERM", () => {
-    void stop().finally(() => process.exit(0));
+    void stop()
+      .catch((err) => console.error("Shutdown cleanup failed:", err))
+      .finally(() => process.exit(0));
   });
+
+  startupTask = startServer({
+    serial,
+    port,
+    host,
+    token,
+    signal: lifecycleController.signal,
+    maxFps,
+    bitRate,
+    maxSize,
+    keyFrameInterval,
+    repeatFrameMs,
+  });
+  try {
+    activeServer = await startupTask;
+  } catch (err) {
+    emulatorLaunch?.stop();
+    if (lifecycleController.signal.aborted) {
+      await stop();
+      return;
+    }
+    throw err;
+  }
+  if (lifecycleController.signal.aborted) {
+    await stop();
+    return;
+  }
+  const { server } = activeServer;
 
   const base = `http://${displayHost(host)}:${server.port}`;
   if (token) {

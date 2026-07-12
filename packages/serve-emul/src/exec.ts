@@ -90,11 +90,15 @@ function run<T extends string | Buffer>(
     let outLen = 0;
     let settled = false;
     let timedOut = false;
+    let abortReason: Error | null = null;
+    let terminationError: Error | null = null;
+    let reapTimer: ReturnType<typeof setTimeout> | null = null;
 
     const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
 
     const cleanup = () => {
       if (timer) clearTimeout(timer);
+      if (reapTimer) clearTimeout(reapTimer);
       opts.signal?.removeEventListener("abort", onAbort);
     };
 
@@ -104,6 +108,15 @@ function run<T extends string | Buffer>(
           try {
             child.kill("SIGKILL");
           } catch {}
+          reapTimer = setTimeout(
+            () =>
+              finish(
+                null,
+                "SIGKILL",
+                new Error("command did not exit after timeout"),
+              ),
+            1_000,
+          );
         }, opts.timeout)
       : null;
 
@@ -111,6 +124,10 @@ function run<T extends string | Buffer>(
       if (settled) return;
       settled = true;
       cleanup();
+      if (abortReason) {
+        reject(abortReason);
+        return;
+      }
       const stdoutBuf = Buffer.concat(outChunks);
       resolve({
         status,
@@ -118,17 +135,22 @@ function run<T extends string | Buffer>(
         stdout: (encoding === "buffer" ? stdoutBuf : stdoutBuf.toString("utf8")) as T,
         stderr: Buffer.concat(errChunks).toString("utf8"),
         timedOut,
-        error,
+        error: error ?? terminationError,
       });
     };
     const onAbort = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
+      if (settled || abortReason) return;
+      abortReason = abortError(opts.signal!);
+      if (timer) clearTimeout(timer);
       try {
         child.kill("SIGKILL");
       } catch {}
-      reject(abortError(opts.signal!));
+      // Hold the executor slot until the process is reaped. The bounded
+      // fallback prevents a broken child implementation from hanging cleanup.
+      reapTimer = setTimeout(
+        () => finish(null, "SIGKILL", abortReason),
+        1_000,
+      );
     };
     opts.signal?.addEventListener("abort", onAbort, { once: true });
     if (opts.signal?.aborted) {
@@ -137,12 +159,18 @@ function run<T extends string | Buffer>(
     }
 
     child.stdout.on("data", (d: Buffer) => {
+      if (terminationError) return;
       outLen += d.length;
       if (outLen > maxBuffer) {
+        terminationError = new Error("maxBuffer exceeded");
+        if (timer) clearTimeout(timer);
         try {
           child.kill("SIGKILL");
         } catch {}
-        finish(null, null, new Error("maxBuffer exceeded"));
+        reapTimer = setTimeout(
+          () => finish(null, "SIGKILL", terminationError),
+          1_000,
+        );
         return;
       }
       outChunks.push(d);
