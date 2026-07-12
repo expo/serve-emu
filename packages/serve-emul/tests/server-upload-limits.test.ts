@@ -57,6 +57,10 @@ function fakeSession(serial: string, onClose?: () => void): FakeSession {
   };
   controlSocket.write = () => true;
   let closeCalls = 0;
+  let resolveFrame!: (frame: null) => void;
+  const frame = new Promise<null>((resolve) => {
+    resolveFrame = resolve;
+  });
   const session = {
     transport: "scrcpy",
     meta: {
@@ -72,9 +76,10 @@ function fakeSession(serial: string, onClose?: () => void): FakeSession {
     scid: "00000001",
     localPort: 27_200,
     serial,
-    readFrame: () => new Promise<never>(() => {}),
+    readFrame: () => frame,
     close: () => {
       closeCalls++;
+      resolveFrame(null);
       onClose?.();
     },
   } as unknown as ScrcpySession;

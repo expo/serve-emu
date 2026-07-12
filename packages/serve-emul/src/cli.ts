@@ -115,16 +115,11 @@ Options:
                          screen change, so static screens keep producing frames
                          (16 ≈ steady 60fps at the cost of extra CPU/bandwidth;
                          0 keeps the encoder default of one repeat per 100ms)
-      --max-apk-upload-bytes <n>
-                         Maximum streamed APK file bytes (default: ${DEFAULT_MAX_APK_UPLOAD_BYTES})
-      --max-media-upload-bytes <n>
-                         Maximum streamed media/file bytes (default: ${DEFAULT_MAX_MEDIA_UPLOAD_BYTES})
-      --max-active-uploads <n>
-                         Maximum concurrent upload operations (default: ${DEFAULT_MAX_ACTIVE_UPLOADS})
-      --max-queued-uploads <n>
-                         Maximum uploads waiting for a slot (default: ${DEFAULT_MAX_QUEUED_UPLOADS})
-      --upload-queue-timeout-ms <ms>
-                         Maximum time an upload may wait for a slot (default: ${DEFAULT_UPLOAD_QUEUE_TIMEOUT_MS})
+      --max-apk-upload-bytes <n>    Maximum streamed APK bytes (default: ${DEFAULT_MAX_APK_UPLOAD_BYTES})
+      --max-media-upload-bytes <n>  Maximum streamed media bytes (default: ${DEFAULT_MAX_MEDIA_UPLOAD_BYTES})
+      --max-active-uploads <n>      Concurrent uploads (default: ${DEFAULT_MAX_ACTIVE_UPLOADS})
+      --max-queued-uploads <n>      Queued uploads (default: ${DEFAULT_MAX_QUEUED_UPLOADS})
+      --upload-queue-timeout-ms <ms> Upload queue wait limit (default: ${DEFAULT_UPLOAD_QUEUE_TIMEOUT_MS})
       --avd <name>       Launch this Android Virtual Device before streaming
       --gpu <mode>       Emulator GPU mode for --avd launches (default: host).
                          host uses the real GPU for smooth ~60fps; the AVD's
@@ -203,11 +198,42 @@ async function main() {
     }
   }
 
-  const { server, stop: stopServer } = await startServer({
+  type ActiveServer = Awaited<ReturnType<typeof startServer>>;
+  const lifecycleController = new AbortController();
+  let activeServer: ActiveServer | null = null;
+  let startupTask: Promise<ActiveServer> | null = null;
+  let stopping: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopping) return stopping;
+    lifecycleController.abort(new Error("serve-emul stopping"));
+    stopping = (async () => {
+      try {
+        const started =
+          activeServer ?? (await startupTask?.catch(() => null)) ?? null;
+        await started?.stop();
+      } finally {
+        emulatorLaunch?.stop();
+      }
+    })();
+    return stopping;
+  };
+  process.once("SIGINT", () => {
+    void stop()
+      .catch((err) => console.error("Shutdown cleanup failed:", err))
+      .finally(() => process.exit(0));
+  });
+  process.once("SIGTERM", () => {
+    void stop()
+      .catch((err) => console.error("Shutdown cleanup failed:", err))
+      .finally(() => process.exit(0));
+  });
+
+  startupTask = startServer({
     serial,
     port,
     host,
     token,
+    signal: lifecycleController.signal,
     maxFps,
     bitRate,
     maxSize,
@@ -218,33 +244,22 @@ async function main() {
     maxActiveUploads,
     maxQueuedUploads,
     uploadQueueTimeoutMs,
-  }).catch((err) => {
-    emulatorLaunch?.stop();
-    throw err;
   });
-
-  let stopTask: Promise<void> | null = null;
-  const stop = () => {
-    if (stopTask) return stopTask;
-    stopTask = (async () => {
-      await stopServer();
-      emulatorLaunch?.stop();
-    })();
-    return stopTask;
-  };
-  const exitAfterStop = () => {
-    void stop().then(
-      () => process.exit(0),
-      (error) => {
-        console.error(
-          `error: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        process.exit(1);
-      },
-    );
-  };
-  process.once("SIGINT", exitAfterStop);
-  process.once("SIGTERM", exitAfterStop);
+  try {
+    activeServer = await startupTask;
+  } catch (err) {
+    emulatorLaunch?.stop();
+    if (lifecycleController.signal.aborted) {
+      await stop();
+      return;
+    }
+    throw err;
+  }
+  if (lifecycleController.signal.aborted) {
+    await stop();
+    return;
+  }
+  const { server } = activeServer;
 
   const base = `http://${displayHost(host)}:${server.port}`;
   if (token) {

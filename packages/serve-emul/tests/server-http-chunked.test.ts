@@ -9,6 +9,10 @@ function fakeSession(): ScrcpySession {
     write(packet: Buffer): boolean;
   };
   controlSocket.write = () => true;
+  let resolveFrame!: (frame: null) => void;
+  const frame = new Promise<null>((resolve) => {
+    resolveFrame = resolve;
+  });
   return {
     transport: "scrcpy",
     meta: {
@@ -24,8 +28,10 @@ function fakeSession(): ScrcpySession {
     scid: "00000001",
     localPort: 27_200,
     serial: "device-test",
-    readFrame: () => new Promise<never>(() => {}),
-    close() {},
+    readFrame: () => frame,
+    close() {
+      resolveFrame(null);
+    },
   };
 }
 

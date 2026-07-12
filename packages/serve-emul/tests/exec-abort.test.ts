@@ -12,12 +12,7 @@ describe("abortable exec", () => {
     });
     setTimeout(() => controller.abort(reason), 20);
 
-    const result = await running;
-
-    expect(result.error).toBe(reason);
-    expect(result.status).toBeNull();
-    expect(result.signal).toBe("SIGKILL");
-    expect(result.timedOut).toBe(false);
+    await expect(running).rejects.toBe(reason);
   });
 
   test("removes an aborted queued command without consuming a permit", async () => {
@@ -37,18 +32,12 @@ describe("abortable exec", () => {
     });
     queuedController.abort(reason);
 
-    const queuedResult = await queued;
-    expect(queuedResult).toMatchObject({
-      status: null,
-      signal: null,
-      timedOut: false,
-      error: reason,
-    });
+    await expect(queued).rejects.toBe(reason);
 
     for (const controller of activeControllers) {
       controller.abort(new Error("test cleanup"));
     }
-    const results = await Promise.all(active);
+    const results = await Promise.allSettled(active);
     expect(results).toHaveLength(4);
 
     const next = await execText(process.execPath, ["-e", "console.log('ok')"]);
