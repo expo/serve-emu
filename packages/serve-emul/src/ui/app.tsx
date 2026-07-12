@@ -1,14 +1,21 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  createContext,
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 import { StatusBar } from "./components/status-bar";
-import { AppManagementPanel } from "./components/app-management-panel";
-import { AccessibilityPanel, type AccessibilityNode } from "./components/accessibility-panel";
-import { DevicePanel, FontScalePanel, NetworkPanel, NightModePanel, OrientationPanel } from "./components/device-panel";
+import type { AccessibilityNode } from "./components/accessibility-panel";
+import { DevicePanel } from "./components/device-panel";
 import { DeviceStream } from "./components/device-stream";
 import { ControlBar, type HardwareKey } from "./components/control-bar";
-import { LogcatPanel } from "./components/logcat-panel";
-import { LocationPanel } from "./components/location-panel";
-import { SessionPanel } from "./components/session-panel";
-import { useStream } from "./lib/use-stream";
+import { SideTools } from "./components/side-tools";
+import { useStream, type DeviceSize, type Sender } from "./lib/use-stream";
 
 // Android KeyEvent meta state bits (AMETA_*).
 const AMETA_SHIFT_ON = 0x1;
@@ -43,10 +50,55 @@ const SHORTCUT_KEYCODES: Record<string, number> = {
   KeyY: 53, // redo
 };
 
+type StreamControls = {
+  canvasRef: RefObject<HTMLCanvasElement>;
+  send: Sender;
+  deviceSize: DeviceSize | null;
+};
+
+const StreamControlsContext = createContext<StreamControls | null>(null);
+
+const StableDevicePanel = memo(DevicePanel);
+const StableControlBar = memo(ControlBar);
+
+function useStreamControls(): StreamControls {
+  const controls = useContext(StreamControlsContext);
+  if (!controls) throw new Error("StreamControlsContext is missing");
+  return controls;
+}
+
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const keyboardProxyRef = useRef<HTMLInputElement>(null);
   const { state, send } = useStream(canvasRef);
+  const deviceWidth = state.deviceSize?.width;
+  const deviceHeight = state.deviceSize?.height;
+  const controls = useMemo<StreamControls>(
+    () => ({
+      canvasRef,
+      send,
+      deviceSize:
+        deviceWidth === undefined || deviceHeight === undefined
+          ? null
+          : { width: deviceWidth, height: deviceHeight },
+    }),
+    [send, deviceWidth, deviceHeight],
+  );
+
+  return (
+    <>
+      <StatusBar status={state.status} deviceSize={state.deviceSize} fps={state.fps} stats={state.stats} />
+      <StreamControlsContext.Provider value={controls}>
+        <AppShell />
+      </StreamControlsContext.Provider>
+    </>
+  );
+}
+
+const AppShell = memo(function AppShell() {
+  const { canvasRef, send, deviceSize } = useStreamControls();
+  const keyboardProxyRef = useRef<HTMLInputElement>(null);
+  const renderCountRef = useRef(0);
+  renderCountRef.current += 1;
   const [accessibilityEnabled, setAccessibilityEnabled] = useState(false);
   const [accessibilityNodes, setAccessibilityNodes] = useState<AccessibilityNode[]>([]);
   const [highlightedAccessibilityId, setHighlightedAccessibilityId] = useState<string | null>(null);
@@ -133,8 +185,10 @@ export function App() {
 
   return (
     <>
-      <StatusBar status={state.status} deviceSize={state.deviceSize} fps={state.fps} stats={state.stats} />
-      <main className={devicesOpen ? "app-layout devices-open" : "app-layout devices-collapsed"}>
+      <main
+        className={devicesOpen ? "app-layout devices-open" : "app-layout devices-collapsed"}
+        data-app-shell-renders={renderCountRef.current}
+      >
         <aside className="device-sidebar" aria-label="Devices sidebar">
           <div className="device-sidebar-header">
             <button
@@ -148,7 +202,7 @@ export function App() {
             </button>
             {devicesOpen ? <span>Devices</span> : null}
           </div>
-          {devicesOpen ? <DevicePanel /> : null}
+          {devicesOpen ? <StableDevicePanel /> : null}
         </aside>
         <div className="device">
           <DeviceStream
@@ -158,7 +212,7 @@ export function App() {
             accessibilityNodes={accessibilityNodes}
             highlightedAccessibilityId={highlightedAccessibilityId}
             onAccessibilityHover={setHighlightedAccessibilityId}
-            deviceSize={state.deviceSize}
+            deviceSize={deviceSize}
             keyboardProxyRef={keyboardProxyRef}
             keyboardActive={keyboardActive}
           />
@@ -174,28 +228,20 @@ export function App() {
           />
         </div>
         <aside className="side-panel">
-          <NetworkPanel />
-          <NightModePanel />
-          <FontScalePanel />
-          <OrientationPanel />
-          <AccessibilityPanel
-            enabled={accessibilityEnabled}
-            nodes={accessibilityNodes}
-            highlightedId={highlightedAccessibilityId}
-            onEnabledChange={setAccessibilityEnabled}
-            onNodesChange={setAccessibilityNodes}
-            onHighlight={setHighlightedAccessibilityId}
+          <SideTools
+            accessibilityEnabled={accessibilityEnabled}
+            accessibilityNodes={accessibilityNodes}
+            highlightedAccessibilityId={highlightedAccessibilityId}
+            onAccessibilityEnabledChange={setAccessibilityEnabled}
+            onAccessibilityNodesChange={setAccessibilityNodes}
+            onAccessibilityHighlight={setHighlightedAccessibilityId}
           />
-          <LocationPanel />
-          <AppManagementPanel />
-          <LogcatPanel />
-          <SessionPanel />
         </aside>
       </main>
-      <ControlBar onPress={onPress} />
+      <StableControlBar onPress={onPress} />
     </>
   );
-}
+});
 
 function SidebarIcon({ collapsed }: { collapsed: boolean }) {
   return (
