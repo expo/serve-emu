@@ -38,6 +38,7 @@
     "start": "bun run src/cli.ts",
     "build:ui": "vite build",
     "build": "bun run build:ui",
+    "test": "bun test",
     "typecheck": "tsc --noEmit",
     "typecheck:ui": "tsc -p src/ui --noEmit",
     "prepublishOnly": "bun run build"

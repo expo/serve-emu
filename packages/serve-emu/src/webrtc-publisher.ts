@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import type nodeDataChannel from "node-datachannel";
 import type {
   DataChannel,
+  H264RtpPacketizer,
   PeerConnection,
   RtpPacketizationConfig,
   Track,
@@ -32,10 +33,8 @@ export type WebRtcPublisherOptions = {
 type NodeDataChannel = typeof nodeDataChannel;
 
 const requireModule = createRequire(import.meta.url);
-const PAYLOAD_TYPE_H264 = 96;
 const RTP_CLOCK_RATE = 90_000;
 const ICE_GATHERING_TIMEOUT_MS = 3_000;
-const MAX_TRACK_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 let loggerInitialized = false;
 let nativeRepairAttempted = false;
@@ -57,6 +56,51 @@ function parseOffer(value: unknown): WebRtcOffer {
     throw new Error("serve-emu WebRTC currently supports only H.264");
   }
   return { type: "offer", sdp: offer.sdp, codec: "h264" };
+}
+
+// The browser (offerer) owns the payload-type numbering: RTP we send must use a
+// payload type its offer maps to H264, or it will be decoded as another codec.
+// Our packetizer fragments NALUs, so packetization-mode=1 entries are preferred.
+export function selectH264Media(offerSdp: string): { payloadType: number; mid: string } {
+  let inVideoSection = false;
+  let mid: string | null = null;
+  const h264PayloadTypes: number[] = [];
+  const fmtpByPayloadType = new Map<number, string>();
+  for (const line of offerSdp.split(/\r?\n/)) {
+    if (line.startsWith("m=")) {
+      inVideoSection = line.startsWith("m=video");
+      continue;
+    }
+    if (!inVideoSection) continue;
+    const midLine = /^a=mid:(\S+)/.exec(line);
+    if (midLine && mid === null) mid = midLine[1]!;
+    const rtpmap = /^a=rtpmap:(\d+) H264\/90000/i.exec(line);
+    if (rtpmap) h264PayloadTypes.push(Number(rtpmap[1]));
+    const fmtp = /^a=fmtp:(\d+) (.+)$/.exec(line);
+    if (fmtp) fmtpByPayloadType.set(Number(fmtp[1]), fmtp[2]!.toLowerCase());
+  }
+  if (h264PayloadTypes.length === 0 || mid === null) {
+    throw new Error("WebRTC offer does not include an H.264 video media section");
+  }
+  const score = (payloadType: number): number => {
+    const fmtp = fmtpByPayloadType.get(payloadType) ?? "";
+    let value = 0;
+    if (fmtp.includes("packetization-mode=1")) value += 4;
+    const profile = /profile-level-id=([0-9a-f]{6})/.exec(fmtp)?.[1];
+    if (profile?.startsWith("42e0")) value += 2; // constrained baseline
+    else if (profile?.startsWith("42")) value += 1; // baseline
+    return value;
+  };
+  const payloadType = h264PayloadTypes.reduce((best, pt) => (score(pt) > score(best) ? pt : best));
+  return { payloadType, mid };
+}
+
+export function injectVideoSsrc(sdp: string, mid: string, ssrc: number): string {
+  const lines = sdp.split("\r\n");
+  const midIndex = lines.indexOf(`a=mid:${mid}`);
+  if (midIndex === -1 || lines.some((l) => l.startsWith("a=ssrc:"))) return sdp;
+  lines.splice(midIndex + 1, 0, `a=ssrc:${ssrc} cname:serve-emu`);
+  return lines.join("\r\n");
 }
 
 function stringFromMessage(message: string | Buffer | ArrayBuffer): string | null {
@@ -228,16 +272,16 @@ export class WebRtcPublisher {
 
 class WebRtcPeer {
   readonly id: number;
-  readonly track: Track;
   readonly pc: PeerConnection;
-  readonly rtpConfig: RtpPacketizationConfig;
   closed = false;
+  private track: Track | null = null;
+  private rtpConfig: RtpPacketizationConfig | null = null;
+  private packetizer: H264RtpPacketizer | null = null;
   private dataChannel: DataChannel | null = null;
   private trackOpen = false;
   private awaitingKeyFrame = true;
   private sentFrames = 0;
   private droppedFrames = 0;
-  private backpressureEvents = 0;
   private inputMessages = 0;
   private lastFrameAt: string | null = null;
   private lastState = "new";
@@ -258,37 +302,20 @@ class WebRtcPeer {
     },
   ) {
     this.id = params.id;
+    // Auto-negotiation must stay off: the browser is the offerer, and any local
+    // mutation (addTrack, createDataChannel) would otherwise generate a local
+    // offer and wedge the connection in have-local-offer before the remote
+    // offer arrives.
     this.pc = new params.ndc.PeerConnection(`serve-emu-${params.id}`, {
       iceServers: iceUrlsForNodeDataChannel(params.settings.iceServers),
       iceTransportPolicy: params.settings.iceTransportPolicy,
       forceMediaTransport: true,
+      disableAutoNegotiation: true,
     });
 
-    const video = new params.ndc.Video("video", "SendOnly");
-    video.addH264Codec(PAYLOAD_TYPE_H264);
-    video.setBitrate(Math.max(100, Math.round(params.bitRate / 1000)));
-
-    this.rtpConfig = new params.ndc.RtpPacketizationConfig(
-      randomSsrc(),
-      "serve-emu",
-      PAYLOAD_TYPE_H264,
-      RTP_CLOCK_RATE,
-    );
-    const packetizer = new params.ndc.H264RtpPacketizer("StartSequence", this.rtpConfig);
-    this.track = this.pc.addTrack(video);
-    this.track.setMediaHandler(packetizer);
-
-    this.track.onOpen(() => {
-      this.trackOpen = true;
-      this.awaitingKeyFrame = true;
-      this.params.onKeyframeRequest("WebRTC track opened");
-    });
-    this.track.onClosed(() => this.close());
-    this.track.onError((err) => {
-      this.lastError = err;
-      this.close();
-    });
-
+    // Fallback only — answer() adds the publishing track itself; attachTrack
+    // ignores this callback once a track is attached.
+    this.pc.onTrack((track) => this.attachTrack(track));
     this.pc.onDataChannel((channel) => this.attachDataChannel(channel));
     this.pc.onStateChange((state) => {
       this.lastState = state;
@@ -302,16 +329,56 @@ class WebRtcPeer {
   }
 
   async answer(offer: WebRtcOffer): Promise<WebRtcAnswer> {
+    const { payloadType, mid } = selectH264Media(offer.sdp);
+    const ssrc = randomSsrc();
+    this.rtpConfig = new this.params.ndc.RtpPacketizationConfig(
+      ssrc,
+      "serve-emu",
+      payloadType,
+      RTP_CLOCK_RATE,
+    );
+    this.packetizer = new this.params.ndc.H264RtpPacketizer("StartSequence", this.rtpConfig);
+    // setRemoteDescription reciprocates the offer's recvonly video m-line and
+    // emits the SendOnly track we publish on via onTrack (see attachTrack).
+    // Adding our own track instead races the reciprocation and libdatachannel
+    // can close it mid-negotiation, so we leave track creation to the library.
     this.pc.setRemoteDescription(offer.sdp, "offer");
     const localDescription = await this.createLocalAnswer();
     await this.waitForIceGathering();
     const finalDescription = this.pc.localDescription() ?? localDescription;
     if (!finalDescription?.sdp) throw new Error("WebRTC answer was not created");
-    return { type: finalDescription.type, sdp: finalDescription.sdp };
+    // libdatachannel does not declare an SSRC for reciprocated tracks, and
+    // without an a=ssrc line the browser cannot route our RTP and silently
+    // discards every packet — inject the SSRC the packetizer stamps.
+    const sdp = injectVideoSsrc(finalDescription.sdp, mid, ssrc);
+    return { type: finalDescription.type, sdp };
+  }
+
+  private attachTrack(track: Track): void {
+    if (this.closed) {
+      try {
+        track.close();
+      } catch {}
+      return;
+    }
+    if (this.track) return;
+    this.track = track;
+    if (this.packetizer) track.setMediaHandler(this.packetizer);
+    track.onOpen(() => {
+      this.trackOpen = true;
+      this.awaitingKeyFrame = true;
+      this.params.onKeyframeRequest("WebRTC track opened");
+    });
+    track.onClosed(() => this.close());
+    track.onError((err) => {
+      this.lastError = err;
+      this.close();
+    });
   }
 
   sendFrame(payload: Buffer, isKeyFrame: boolean): void {
-    if (this.closed || !this.trackOpen || !this.track.isOpen()) return;
+    const track = this.track;
+    if (this.closed || !track || !this.rtpConfig || !this.trackOpen || !track.isOpen()) return;
     if (this.awaitingKeyFrame) {
       if (!isKeyFrame) {
         this.droppedFrames++;
@@ -320,21 +387,12 @@ class WebRtcPeer {
       this.awaitingKeyFrame = false;
     }
 
-    const buffered = this.track.bufferedAmount();
-    if (buffered > MAX_TRACK_BUFFERED_BYTES) {
-      this.backpressureEvents++;
-      this.droppedFrames++;
-      this.awaitingKeyFrame = true;
-      this.params.onKeyframeRequest("WebRTC track backpressure");
-      return;
-    }
-
     const elapsedMs = Date.now() - this.createdMs;
     this.lastRtpTimestamp = Math.max(this.lastRtpTimestamp + 1, Math.round(elapsedMs * 90));
     this.rtpConfig.timestamp = this.lastRtpTimestamp;
 
     try {
-      if (this.track.sendMessageBinary(payload)) {
+      if (track.sendMessageBinary(payload)) {
         this.sentFrames++;
         this.lastFrameAt = new Date().toISOString();
       } else {
@@ -353,7 +411,7 @@ class WebRtcPeer {
       this.dataChannel?.close();
     } catch {}
     try {
-      this.track.close();
+      this.track?.close();
     } catch {}
     try {
       this.pc.close();
@@ -370,9 +428,7 @@ class WebRtcPeer {
       dataChannelOpen: this.dataChannel?.isOpen() ?? false,
       sentFrames: this.sentFrames,
       droppedFrames: this.droppedFrames,
-      backpressureEvents: this.backpressureEvents,
       inputMessages: this.inputMessages,
-      bufferedBytes: this.closed ? 0 : this.track.bufferedAmount(),
       awaitingKeyFrame: this.awaitingKeyFrame,
       lastFrameAt: this.lastFrameAt,
       lastError: this.lastError,
