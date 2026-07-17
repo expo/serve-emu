@@ -7,6 +7,7 @@ export type ForegroundApp = {
   label: string | null;
   versionName: string | null;
   versionCode: string | null;
+  minSdk: number | null;
   debuggable: boolean | null;
 };
 
@@ -80,14 +81,16 @@ function packageDetails(serial: string, packageName: string) {
     const dump = adbShell(serial, ["dumpsys", "package", packageName], 5_000);
     const versionName = dump.match(/versionName=([^\s]+)/)?.[1] ?? null;
     const versionCode = dump.match(/versionCode=(\d+)/)?.[1] ?? null;
+    const minSdkRaw = dump.match(/minSdk=(\d+)/)?.[1];
+    const minSdk = minSdkRaw ? Number(minSdkRaw) : null;
     const label =
       dump.match(/application-label(?:-[a-zA-Z]+)?:'([^']+)'/)?.[1] ??
       dump.match(/labelRes=0x[0-9a-fA-F]+ nonLocalizedLabel=([^\n]+)/)?.[1]?.trim() ??
       null;
     const debuggable = /pkgFlags=\[[^\]]*\bDEBUGGABLE\b/.test(dump) || /\bDEBUGGABLE\b/.test(dump);
-    return { label, versionName, versionCode, debuggable };
+    return { label, versionName, versionCode, minSdk, debuggable };
   } catch {
-    return { label: null, versionName: null, versionCode: null, debuggable: null };
+    return { label: null, versionName: null, versionCode: null, minSdk: null, debuggable: null };
   }
 }
 
@@ -101,6 +104,7 @@ export function getForegroundApp(serial: string): ForegroundApp {
       label: null,
       versionName: null,
       versionCode: null,
+      minSdk: null,
       debuggable: null,
     };
   }
