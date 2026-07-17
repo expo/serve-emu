@@ -22,7 +22,8 @@ import {
 import { getForegroundApp } from "./app-info.ts";
 import { getNightMode, isNightMode, setNightMode } from "./ui-mode.ts";
 import { startScrcpy, type ScrcpySession } from "./scrcpy.ts";
-import { dispatch, parseGesture, resetVideoPacket, type Gesture, type Screen } from "./input.ts";
+import { ControlInputError, ControlInputQueue } from "./control-input-queue.ts";
+import { parseGesture, resetVideoPacket, type Gesture, type Screen } from "./input.ts";
 import { parseGeoFix, setEmulatorLocationAsync, type GeoFix } from "./location.ts";
 import { parseRoutePlaybackRequest, RoutePlayback } from "./route-playback.ts";
 import { SessionRecorder } from "./session-recorder.ts";
@@ -133,6 +134,7 @@ export async function createApp(opts: AppOptions) {
     maxSize: opts.maxSize,
     keyFrameInterval: opts.keyFrameInterval,
   });
+  const controlInput = new ControlInputQueue({ socket: session.controlSocket });
 
   const clients = new Set<Client>();
   const screen: Screen = { width: session.meta.width, height: session.meta.height };
@@ -183,6 +185,7 @@ export async function createApp(opts: AppOptions) {
     location: lastLocation,
     route: routePlayback.snapshot(),
     session: sessionRecorder.snapshot(),
+    controlInput: controlInput.snapshot(),
     clientsDetail: Array.from(clients, (client) => ({
       id: client.id,
       frameMeta: client.frameMeta,
@@ -214,6 +217,7 @@ export async function createApp(opts: AppOptions) {
     stoppedAt = new Date().toISOString();
     if (watchdog) clearInterval(watchdog);
     routePlayback.close();
+    controlInput.close(new Error(reason));
     session.close();
     closeClients(nextStatus === "error" ? 1011 : 1000, reason);
   };
@@ -272,10 +276,40 @@ export async function createApp(opts: AppOptions) {
     Array.isArray(value) ||
     (value as Record<string, unknown>).record !== false;
 
+  const inputErrorPayload = (err: unknown) => ({
+    ok: false as const,
+    ...(err instanceof ControlInputError ? { code: err.code } : {}),
+    error: err instanceof Error ? err.message : String(err),
+  });
+
+  const inputErrorResponse = (err: unknown) =>
+    Response.json(inputErrorPayload(err), {
+      status:
+        err instanceof ControlInputError && err.code === "control-queue-overloaded"
+          ? 429
+          : err instanceof ControlInputError
+            ? 503
+            : 400,
+    });
+
   const dispatchGesture = async (gesture: Gesture, source: string, record = true) => {
     if (status !== "streaming") throw new Error(`session is ${status}`);
-    await dispatch(session.controlSocket, gesture, screen);
-    if (record) sessionRecorder.recordGesture(gesture, source);
+    const accepted = controlInput.enqueue(gesture, { ...screen });
+    if (record) sessionRecorder.recordGesture(accepted.gesture, source);
+    try {
+      await accepted.completion;
+    } catch (err) {
+      if (
+        status === "streaming" &&
+        !(err instanceof ControlInputError && err.code === "control-queue-overloaded")
+      ) {
+        markTerminal(
+          "error",
+          `scrcpy control input failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      throw err;
+    }
   };
 
   const applyLocation = async (fix: GeoFix, source: string, record = true) => {
@@ -392,10 +426,7 @@ export async function createApp(opts: AppOptions) {
       await dispatchGesture(gesture, source, shouldRecord(payload));
       return Response.json({ ok: true });
     } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
+      return inputErrorResponse(err);
     }
   };
 
@@ -413,10 +444,7 @@ export async function createApp(opts: AppOptions) {
       await dispatchGesture(gesture, "rest:key", shouldRecord(payload));
       return Response.json({ ok: true });
     } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
+      return inputErrorResponse(err);
     }
   };
 
@@ -470,12 +498,25 @@ export async function createApp(opts: AppOptions) {
   const requestVideoReset = (reason: string) => {
     const now = Date.now();
     if (now - lastVideoResetMs < VIDEO_RESET_COOLDOWN_MS) return;
-    lastVideoResetMs = now;
-    videoResetRequests++;
-    lastVideoResetAt = new Date(now).toISOString();
-    lastVideoResetReason = reason;
     try {
-      session.controlSocket.write(resetVideoPacket());
+      const accepted = controlInput.enqueuePacket(resetVideoPacket(), {
+        coalesceKey: "reset-video",
+      });
+      lastVideoResetMs = now;
+      videoResetRequests++;
+      lastVideoResetAt = new Date(now).toISOString();
+      lastVideoResetReason = reason;
+      void accepted.completion.catch((err) => {
+        if (
+          status === "streaming" &&
+          !(err instanceof ControlInputError && err.code === "control-queue-overloaded")
+        ) {
+          markTerminal(
+            "error",
+            `scrcpy control input failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      });
     } catch {}
   };
 
@@ -963,9 +1004,9 @@ export async function createApp(opts: AppOptions) {
           .then(() => {
             if (acknowledge) sendJson(socket, { ok: true });
           })
-          .catch((err) => sendJson(socket, { ok: false, error: String(err) }));
+          .catch((err) => sendJson(socket, inputErrorPayload(err)));
       } catch (err) {
-        sendJson(socket, { ok: false, error: String(err) });
+        sendJson(socket, inputErrorPayload(err));
       }
     });
 
@@ -984,6 +1025,7 @@ export async function createApp(opts: AppOptions) {
     closeClients(1001, "server stopping");
     if (watchdog) clearInterval(watchdog);
     routePlayback.close();
+    controlInput.close(new Error("server stopping"));
     session.close();
   };
 
