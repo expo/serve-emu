@@ -105,6 +105,7 @@ export type ForegroundApp = {
   label: string | null;
   versionName: string | null;
   versionCode: string | null;
+  minSdk: number | null;
   debuggable: boolean | null;
 };
 export type ForegroundResponse = ApiSuccess<{ app: ForegroundApp }>;
@@ -688,6 +689,7 @@ function parseForegroundApp(value: unknown): ForegroundApp {
     label: nullableString(item.label, "foreground app.label"),
     versionName: nullableString(item.versionName, "foreground app.versionName"),
     versionCode: nullableString(item.versionCode, "foreground app.versionCode"),
+    minSdk: item.minSdk === null ? null : number(item.minSdk, "foreground app.minSdk"),
     debuggable: nullableBoolean(item.debuggable, "foreground app.debuggable"),
   };
 }

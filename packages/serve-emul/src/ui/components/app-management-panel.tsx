@@ -17,6 +17,7 @@ type ForegroundApp = {
   label: string | null;
   versionName: string | null;
   versionCode: string | null;
+  minSdk: number | null;
   debuggable: boolean | null;
 };
 
@@ -156,6 +157,10 @@ export function AppManagementPanel() {
                 {foreground.versionName || "—"}
                 {foreground.versionCode ? ` (${foreground.versionCode})` : ""}
               </dd>
+            </div>
+            <div>
+              <dt>Minimum SDK</dt>
+              <dd>{foreground.minSdk ?? "—"}</dd>
             </div>
             <div>
               <dt>PID</dt>
