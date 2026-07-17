@@ -483,9 +483,6 @@ export async function createApp(opts: AppOptions) {
     client.droppedFrames++;
     totalDroppedFrames++;
     client.awaitingKeyFrame = true;
-    console.warn(
-      `client ${client.id} backpressure: dropping frames until keyframe (buffered ${client.socket.bufferedAmount} B, ${client.droppedFrames} dropped)`,
-    );
     requestVideoReset("client backpressure");
   };
 
