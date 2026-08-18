@@ -1,7 +1,7 @@
 {
   "name": "serve-emul",
   "version": "0.0.5",
-  "description": "The `npx serve` of Android devices — stream a booted emulator or attached device over a WebSocket H.264 feed decoded in the browser with WebCodecs.",
+  "description": "The `npx serve` of Android devices — stream a booted emulator or attached device over WebSocket/WebCodecs or WebRTC H.264.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/middleware.js",
@@ -19,6 +19,10 @@
     "./stream-socket": {
       "types": "./dist/stream-socket.d.ts",
       "import": "./dist/stream-socket.js"
+    },
+    "./stream-settings": {
+      "types": "./dist/stream-settings.d.ts",
+      "import": "./dist/stream-settings.js"
     }
   },
   "sideEffects": false,
@@ -84,9 +88,13 @@
   ],
   "dependencies": {
     "@fastify/busboy": "^3.2.0",
+    "node-datachannel": "^0.32.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
+  "trustedDependencies": [
+    "node-datachannel"
+  ],
   "devDependencies": {
     "@swc/cli": "^0.8.1",
     "@swc/core": "^1.15.43",

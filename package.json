@@ -12,6 +12,9 @@
     "check": "bun run --filter serve-emul check",
     "release": "bun run --filter serve-emul release"
   },
+  "trustedDependencies": [
+    "node-datachannel"
+  ],
   "devDependencies": {
     "typescript": "^5.6.0",
     "@types/bun": "latest"

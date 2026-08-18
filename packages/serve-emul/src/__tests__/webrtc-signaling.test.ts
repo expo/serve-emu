@@ -1,0 +1,80 @@
+import { describe, expect, test } from "bun:test";
+import {
+  WebRtcSignalingError,
+  parseWebRtcCloseRequest,
+  parseWebRtcOffer,
+} from "../webrtc-signaling.ts";
+
+const SESSION_ID = "00000000-0000-4000-8000-000000000000";
+
+describe("WebRTC signaling validation", () => {
+  test("accepts an H.264 offer with TURN configuration", () => {
+    expect(
+      parseWebRtcOffer({
+        type: "offer",
+        sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 109\r\n",
+        sessionId: SESSION_ID,
+        codec: "h264",
+        iceServers: [
+          {
+            urls: ["turn:turn.example:3478?transport=udp"],
+            username: "user",
+            credential: "secret",
+          },
+        ],
+      }),
+    ).toEqual({
+      type: "offer",
+      sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 109\r\n",
+      sessionId: SESSION_ID,
+      codec: "h264",
+      iceServers: [
+        {
+          urls: ["turn:turn.example:3478?transport=udp"],
+          username: "user",
+          credential: "secret",
+        },
+      ],
+    });
+  });
+
+  test("rejects unsupported codecs and invalid ICE URLs", () => {
+    expect(() =>
+      parseWebRtcOffer({
+        type: "offer",
+        sdp: "v=0",
+        sessionId: SESSION_ID,
+        codec: "vp8",
+      }),
+    ).toThrow(WebRtcSignalingError);
+    expect(() =>
+      parseWebRtcOffer({
+        type: "offer",
+        sdp: "v=0",
+        sessionId: SESSION_ID,
+        iceServers: [{ urls: ["https://example.test"] }],
+      }),
+    ).toThrow(WebRtcSignalingError);
+  });
+
+  test("requires valid UUID session IDs", () => {
+    expect(() =>
+      parseWebRtcOffer({
+        type: "offer",
+        sdp: "v=0",
+        sessionId: "not-a-uuid",
+      }),
+    ).toThrow("Invalid WebRTC session ID");
+    expect(parseWebRtcCloseRequest({ sessionId: SESSION_ID })).toEqual({ sessionId: SESSION_ID });
+  });
+
+  test("bounds the offer SDP size", () => {
+    expect(() =>
+      parseWebRtcOffer({
+        type: "offer",
+        sdp: "v".repeat(241 * 1024),
+        sessionId: SESSION_ID,
+      }),
+    ).toThrow("Invalid WebRTC offer SDP");
+  });
+});
