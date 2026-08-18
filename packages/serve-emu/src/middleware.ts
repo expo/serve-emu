@@ -27,11 +27,28 @@ import { parseGeoFix, setEmulatorLocationAsync, type GeoFix } from "./location.t
 import { parseRoutePlaybackRequest, RoutePlayback } from "./route-playback.ts";
 import { SessionRecorder } from "./session-recorder.ts";
 import type { StreamSocket } from "./stream-socket.ts";
+import {
+  DEFAULT_STREAM_SETTINGS,
+  redactedStreamSettings,
+  type StreamSettings,
+} from "./stream-settings.ts";
+import {
+  MAX_WEBRTC_SIGNALING_BODY_BYTES,
+  WebRtcSignalingError,
+  parseWebRtcCloseRequest,
+  parseWebRtcOffer,
+} from "./webrtc-signaling.ts";
+import { createWebRtcPublisher, type WebRtcPublisher } from "./webrtc-publisher.ts";
 
 export { fromBunSocket, fromWsSocket } from "./stream-socket.ts";
 export type { StreamSocket, WsWebSocketLike } from "./stream-socket.ts";
 export { pickDevice } from "./adb.ts";
 export type { ScrcpySession } from "./scrcpy.ts";
+export type {
+  StreamSettings,
+  WebRtcIceServer,
+  WebRtcIceTransportPolicy,
+} from "./stream-settings.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // `src/middleware.ts` and `dist/middleware.mjs` both resolve to `<pkg>/dist/ui`.
@@ -43,6 +60,7 @@ export type AppOptions = {
   bitRate?: number;
   maxSize?: number;
   keyFrameInterval?: number;
+  streamSettings?: StreamSettings;
 };
 
 type SessionStatus = "streaming" | "stopped" | "error";
@@ -50,6 +68,7 @@ type SessionStatus = "streaming" | "stopped" | "error";
 type Client = {
   id: number;
   socket: StreamSocket;
+  video: boolean;
   frameMeta: boolean;
   sentFrames: number;
   droppedFrames: number;
@@ -68,12 +87,23 @@ const VIDEO_RESET_COOLDOWN_MS = 1500;
 const STALE_VIDEO_RESET_MS = 2500;
 const MAX_JSON_BODY_BYTES = 8 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
+const MAX_WEBRTC_CLOSE_BODY_BYTES = 4 * 1024;
 const MAX_LOGCAT_QUERY_BYTES = 200;
 // After a device's scrcpy start fails, wait this long before retrying so a
 // flapping device doesn't get hammered on every request.
 const SPAWN_RETRY_COOLDOWN_MS = 5_000;
 
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+const WEBRTC_CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Cache-Control": "no-store",
+};
+const WEBRTC_JSON_HEADERS = {
+  ...WEBRTC_CORS_HEADERS,
+  "Content-Type": "application/json; charset=utf-8",
+};
 
 const STATIC_CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -136,6 +166,7 @@ export async function createApp(opts: AppOptions) {
 
   const clients = new Set<Client>();
   const screen: Screen = { width: session.meta.width, height: session.meta.height };
+  const streamSettings = opts.streamSettings ?? DEFAULT_STREAM_SETTINGS;
   const startedMs = Date.now();
   const startedAt = new Date(startedMs).toISOString();
   let status: SessionStatus = "streaming";
@@ -156,6 +187,7 @@ export async function createApp(opts: AppOptions) {
   let watchdog: ReturnType<typeof setInterval> | null = null;
   let lastLocation: (GeoFix & { appliedAt: string }) | null = null;
   let nextClientId = 1;
+  let webRtcPublisher: WebRtcPublisher | null = null;
   const sessionRecorder = new SessionRecorder();
   const routePlayback = new RoutePlayback({
     applyLocation: (fix) => setEmulatorLocationAsync(opts.serial, fix),
@@ -172,6 +204,7 @@ export async function createApp(opts: AppOptions) {
     codec: session.meta.codecId,
     size: { width: screen.width, height: screen.height },
     clients: clients.size,
+    videoClients: Array.from(clients).filter((client) => client.video).length,
     frames: frameCount,
     sourceFps,
     configPackets: configPacketCount,
@@ -183,8 +216,11 @@ export async function createApp(opts: AppOptions) {
     location: lastLocation,
     route: routePlayback.snapshot(),
     session: sessionRecorder.snapshot(),
+    stream: redactedStreamSettings(streamSettings),
+    webrtc: webRtcPublisher?.snapshot() ?? null,
     clientsDetail: Array.from(clients, (client) => ({
       id: client.id,
+      video: client.video,
       frameMeta: client.frameMeta,
       sentFrames: client.sentFrames,
       droppedFrames: client.droppedFrames,
@@ -214,6 +250,7 @@ export async function createApp(opts: AppOptions) {
     stoppedAt = new Date().toISOString();
     if (watchdog) clearInterval(watchdog);
     routePlayback.close();
+    webRtcPublisher?.close();
     session.close();
     closeClients(nextStatus === "error" ? 1011 : 1000, reason);
   };
@@ -264,6 +301,31 @@ export async function createApp(opts: AppOptions) {
     const contentLength = Number(req.headers.get("content-length") ?? "0");
     if (contentLength > maxBytes) throw new Error("request body too large");
     return req.json();
+  };
+
+  const readBodyText = async (req: Request, maxBytes: number): Promise<string> => {
+    const contentLength = Number(req.headers.get("content-length") ?? "0");
+    if (contentLength > maxBytes) {
+      throw new WebRtcSignalingError("WebRTC signaling body is too large", 413, "request_too_large");
+    }
+    const body = Buffer.from(await req.arrayBuffer());
+    if (body.byteLength > maxBytes) {
+      throw new WebRtcSignalingError("WebRTC signaling body is too large", 413, "request_too_large");
+    }
+    return body.toString("utf8");
+  };
+
+  const parseJsonBody = (body: string, code: string): unknown => {
+    try {
+      return JSON.parse(body);
+    } catch {
+      throw new WebRtcSignalingError("Invalid JSON body", 400, code);
+    }
+  };
+
+  const isJsonRequest = (req: Request): boolean => {
+    const contentType = req.headers.get("content-type");
+    return contentType?.split(";", 1)[0]?.trim().toLowerCase() === "application/json";
   };
 
   const shouldRecord = (value: unknown) =>
@@ -479,6 +541,32 @@ export async function createApp(opts: AppOptions) {
     } catch {}
   };
 
+  if (streamSettings.transport === "webrtc") {
+    if (session.meta.codecId !== "h264") {
+      session.close();
+      routePlayback.close();
+      throw new Error(
+        `WebRTC transport currently supports only H.264, but scrcpy selected ${session.meta.codecId}.`,
+      );
+    }
+    try {
+      webRtcPublisher = await createWebRtcPublisher({
+        settings: streamSettings,
+        onInput: (payload, peerId) => {
+          const gesture = parseGesture(payload);
+          void dispatchGesture(gesture, `webrtc:${peerId}`, shouldRecord(payload)).catch((err) => {
+            console.warn(`WebRTC input failed: ${errMsg(err)}`);
+          });
+        },
+        onKeyframeRequest: requestVideoReset,
+      });
+    } catch (err) {
+      session.close();
+      routePlayback.close();
+      throw err;
+    }
+  }
+
   const dropUntilKeyFrame = (client: Client) => {
     client.droppedFrames++;
     totalDroppedFrames++;
@@ -539,6 +627,7 @@ export async function createApp(opts: AppOptions) {
             screen.height = f.height;
             cachedConfig = null;
             for (const c of clients) {
+              if (!c.video) continue;
               c.awaitingKeyFrame = true;
               sendJson(c.socket, { type: "video-session", size: { width: f.width, height: f.height } });
             }
@@ -554,9 +643,11 @@ export async function createApp(opts: AppOptions) {
         frameCount++;
         lastFrameMs = Date.now();
         const config = f.isKey ? cachedConfig : null;
+        webRtcPublisher?.sendFrame(f, config);
         let rawOut: Buffer | null = null;
         let framedOut: Buffer | null = null;
         for (const c of clients) {
+          if (!c.video) continue;
           if (c.awaitingKeyFrame && !f.isKey) {
             c.droppedFrames++;
             totalDroppedFrames++;
@@ -576,7 +667,7 @@ export async function createApp(opts: AppOptions) {
   watchdog = setInterval(() => {
     sourceFps = frameCount - lastFpsFrameCount;
     lastFpsFrameCount = frameCount;
-    if (status !== "streaming" || clients.size === 0) return;
+    if (status !== "streaming" || (clients.size === 0 && !webRtcPublisher?.activePeerCount)) return;
     const lastFrameSeenMs = lastFrameMs || startedMs;
     if (Date.now() - lastFrameSeenMs > STALE_VIDEO_RESET_MS) {
       requestVideoReset("source stream stalled");
@@ -604,7 +695,10 @@ export async function createApp(opts: AppOptions) {
         codec: session.meta.codecId,
         size: { width: screen.width, height: screen.height },
         status,
+        lastFrameAt: lastFrameMs > 0 ? new Date(lastFrameMs).toISOString() : null,
+        lastError,
         clients: clients.size,
+        stream: streamSettings,
       });
     }
 
@@ -629,6 +723,70 @@ export async function createApp(opts: AppOptions) {
 
     if (url.pathname === "/health") {
       return Response.json(health(), { status: status === "streaming" ? 200 : 503 });
+    }
+
+    if (url.pathname === "/webrtc/offer") {
+      if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: WEBRTC_CORS_HEADERS });
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405, headers: WEBRTC_CORS_HEADERS });
+      let sessionId: string | undefined;
+      try {
+        if (streamSettings.transport !== "webrtc" || !webRtcPublisher) {
+          throw new WebRtcSignalingError(
+            "WebRTC transport is not enabled. Start serve-emu with --transport webrtc.",
+            400,
+            "webrtc_not_enabled",
+          );
+        }
+        if (!isJsonRequest(req)) {
+          throw new WebRtcSignalingError(
+            "WebRTC offers require application/json",
+            415,
+            "unsupported_media_type",
+          );
+        }
+        const offer = parseWebRtcOffer(
+          parseJsonBody(await readBodyText(req, MAX_WEBRTC_SIGNALING_BODY_BYTES), "invalid_offer"),
+        );
+        sessionId = offer.sessionId;
+        const answer = await webRtcPublisher.handleOffer(offer);
+        if (req.signal.aborted) {
+          webRtcPublisher.closeSession(offer.sessionId);
+          return new Response(null, { status: 499, headers: WEBRTC_CORS_HEADERS });
+        }
+        return Response.json(answer, { headers: WEBRTC_JSON_HEADERS });
+      } catch (err) {
+        if (sessionId) webRtcPublisher?.closeSession(sessionId);
+        const busy = err instanceof Error && err.message.includes("WebRTC signaling already in progress");
+        const status = err instanceof WebRtcSignalingError ? err.status : busy ? 409 : 500;
+        const code = err instanceof WebRtcSignalingError
+          ? err.code
+          : busy
+            ? "webrtc_session_busy"
+            : "webrtc_offer_failed";
+        return Response.json(
+          { error: code, message: errMsg(err) },
+          { status, headers: WEBRTC_JSON_HEADERS },
+        );
+      }
+    }
+
+    if (url.pathname === "/webrtc/close") {
+      if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: WEBRTC_CORS_HEADERS });
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405, headers: WEBRTC_CORS_HEADERS });
+      try {
+        const request = parseWebRtcCloseRequest(
+          parseJsonBody(await readBodyText(req, MAX_WEBRTC_CLOSE_BODY_BYTES), "invalid_close_request"),
+        );
+        webRtcPublisher?.closeSession(request.sessionId);
+        return new Response(null, { status: 204, headers: WEBRTC_CORS_HEADERS });
+      } catch (err) {
+        const status = err instanceof WebRtcSignalingError ? err.status : 400;
+        const code = err instanceof WebRtcSignalingError ? err.code : "invalid_close_request";
+        return Response.json(
+          { error: code, message: errMsg(err) },
+          { status, headers: WEBRTC_JSON_HEADERS },
+        );
+      }
     }
 
     if (url.pathname === "/api/logcat") {
@@ -925,9 +1083,10 @@ export async function createApp(opts: AppOptions) {
   /**
    * Register a freshly-connected video/gesture client. The caller owns the
    * transport upgrade and passes a {@link StreamSocket} plus the `frame-meta`
-   * flag (whether to prefix each frame with the SEMU metadata header).
+   * flag (whether to prefix each frame with the SEMU metadata header). WebRTC
+   * viewers can attach a `video=false` socket for low-latency input only.
    */
-  const attachWebSocket = (socket: StreamSocket, meta: { frameMeta: boolean }): void => {
+  const attachWebSocket = (socket: StreamSocket, meta: { frameMeta: boolean; video?: boolean }): void => {
     if (status !== "streaming") {
       socket.close(1013, `session is ${status}`);
       return;
@@ -935,6 +1094,7 @@ export async function createApp(opts: AppOptions) {
     const client: Client = {
       id: nextClientId++,
       socket,
+      video: meta.video ?? true,
       frameMeta: meta.frameMeta,
       sentFrames: 0,
       droppedFrames: 0,
@@ -942,7 +1102,7 @@ export async function createApp(opts: AppOptions) {
       awaitingKeyFrame: true,
     };
     clients.add(client);
-    requestVideoReset("client opened");
+    if (client.video) requestVideoReset("client opened");
 
     socket.onMessage((raw) => {
       if (raw.length > MAX_WS_MESSAGE_BYTES) {
@@ -982,6 +1142,7 @@ export async function createApp(opts: AppOptions) {
       stoppedAt = new Date().toISOString();
     }
     closeClients(1001, "server stopping");
+    webRtcPublisher?.close();
     if (watchdog) clearInterval(watchdog);
     routePlayback.close();
     session.close();
@@ -1113,7 +1274,9 @@ export function createRouter(defaults: RouterDefaults = {}) {
     const deviceScoped =
       url.pathname === "/api" ||
       url.pathname.startsWith("/api/") ||
-      url.pathname === "/health";
+      url.pathname === "/health" ||
+      url.pathname === "/webrtc/offer" ||
+      url.pathname === "/webrtc/close";
     if (!deviceScoped) {
       return serveStaticFile(url.pathname) ?? new Response("not found", { status: 404 });
     }
@@ -1133,14 +1296,14 @@ export function createRouter(defaults: RouterDefaults = {}) {
   // here, so the app should exist; close defensively if it raced away.
   const attachWebSocket = (
     socket: StreamSocket,
-    opts: { serial: string; frameMeta: boolean },
+    opts: { serial: string; frameMeta: boolean; video?: boolean },
   ): void => {
     const app = apps.get(opts.serial);
     if (!app) {
       socket.close(1011, "device not ready");
       return;
     }
-    app.attachWebSocket(socket, { frameMeta: opts.frameMeta });
+    app.attachWebSocket(socket, { frameMeta: opts.frameMeta, video: opts.video });
   };
 
   const stopAll = () => {

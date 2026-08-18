@@ -3,7 +3,12 @@ import { fromBunSocket, type BunSocketHandlers } from "./stream-socket.ts";
 
 export type ServerOpts = RouterDefaults & { port: number };
 
-type WsData = { serial: string; frameMeta: boolean; handlers?: BunSocketHandlers };
+type WsData = {
+  serial: string;
+  frameMeta: boolean;
+  video: boolean;
+  handlers?: BunSocketHandlers;
+};
 
 const jsonHeaders = { "Content-Type": "application/json; charset=utf-8" };
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
@@ -48,8 +53,9 @@ export async function startServer(opts: ServerOpts) {
             headers: jsonHeaders,
           });
         }
-        const frameMeta = url.searchParams.get("frame-meta") === "1";
-        const ok = srv.upgrade(req, { data: { serial: resolved.serial, frameMeta } });
+        const video = url.searchParams.get("video") !== "0";
+        const frameMeta = video && url.searchParams.get("frame-meta") === "1";
+        const ok = srv.upgrade(req, { data: { serial: resolved.serial, frameMeta, video } });
         if (ok) return undefined as unknown as Response;
         return new Response("upgrade failed", { status: 400 });
       }
@@ -61,6 +67,7 @@ export async function startServer(opts: ServerOpts) {
         router.attachWebSocket(fromBunSocket(ws), {
           serial: ws.data.serial,
           frameMeta: ws.data.frameMeta,
+          video: ws.data.video,
         });
       },
       message(ws, raw) {

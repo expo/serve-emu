@@ -2,6 +2,13 @@
 import { parseArgs } from "node:util";
 import { listAvds, listRunningAvds, startEmulator } from "./emulator.ts";
 import { startServer } from "./server.ts";
+import {
+  DEFAULT_WEBRTC_ICE_SERVERS,
+  parseIceUrlList,
+  type StreamSettings,
+  type WebRtcIceServer,
+  type WebRtcIceTransportPolicy,
+} from "./stream-settings.ts";
 
 const argv = Bun.argv.slice(2);
 const { values } = parseArgs({
@@ -16,6 +23,12 @@ const { values } = parseArgs({
     // bake in black letterbox columns the way 1024 (→460.8, rounded to 464) did.
     "max-size": { type: "string", default: "1280" },
     "key-frame-interval": { type: "string", default: "1" },
+    transport: { type: "string", default: "websocket" },
+    "stun-url": { type: "string" },
+    "turn-url": { type: "string" },
+    "turn-username": { type: "string" },
+    "turn-credential": { type: "string" },
+    "webrtc-ice-policy": { type: "string", default: "all" },
     avd: { type: "string" },
     "avd-list": { type: "boolean" },
     "running-avds": { type: "boolean" },
@@ -35,11 +48,78 @@ function numberOption(name: string, fallback: number): number {
   return n;
 }
 
+function stringOption(name: string): string | undefined {
+  const value = values[name as keyof typeof values];
+  return typeof value === "string" ? value : undefined;
+}
+
+function optionProvided(name: string): boolean {
+  return argv.some((arg) => arg === `--${name}` || arg.startsWith(`--${name}=`));
+}
+
+function streamSettingsFromOptions(): StreamSettings {
+  const transport = stringOption("transport") ?? "websocket";
+  if (transport !== "websocket" && transport !== "webrtc") {
+    throw new Error("--transport must be one of: websocket, webrtc.");
+  }
+
+  const webRtcOptionNames = [
+    "stun-url",
+    "turn-url",
+    "turn-username",
+    "turn-credential",
+    "webrtc-ice-policy",
+  ];
+  if (transport !== "webrtc" && webRtcOptionNames.some(optionProvided)) {
+    throw new Error("WebRTC options require --transport webrtc.");
+  }
+  if (transport === "websocket") return { transport };
+
+  const iceTransportPolicy = stringOption("webrtc-ice-policy") ?? "all";
+  if (iceTransportPolicy !== "all" && iceTransportPolicy !== "relay") {
+    throw new Error("--webrtc-ice-policy must be one of: all, relay.");
+  }
+
+  const stunUrl = stringOption("stun-url");
+  const turnUrl = stringOption("turn-url");
+  const turnUsername = stringOption("turn-username");
+  const turnCredential = stringOption("turn-credential");
+  if ((turnUsername !== undefined || turnCredential !== undefined) && turnUrl === undefined) {
+    throw new Error("--turn-username and --turn-credential require --turn-url.");
+  }
+  if (turnUrl !== undefined && (!turnUsername || !turnCredential)) {
+    throw new Error("--turn-url requires both --turn-username and --turn-credential.");
+  }
+  if (iceTransportPolicy === "relay" && turnUrl === undefined) {
+    throw new Error("--webrtc-ice-policy relay requires --turn-url.");
+  }
+
+  const iceServers: WebRtcIceServer[] =
+    stunUrl !== undefined
+      ? [{ urls: parseIceUrlList(stunUrl, "stun") }]
+      : DEFAULT_WEBRTC_ICE_SERVERS.map((server) => ({ ...server, urls: [...server.urls] }));
+  if (turnUrl !== undefined) {
+    iceServers.push({
+      urls: parseIceUrlList(turnUrl, "turn"),
+      username: turnUsername,
+      credential: turnCredential,
+    });
+  }
+
+  return {
+    transport,
+    codec: "h264",
+    iceServers,
+    iceTransportPolicy: iceTransportPolicy as WebRtcIceTransportPolicy,
+  };
+}
+
 if (values.help) {
-  console.log(`serve-emu — host an Android device over scrcpy + WebSocket
+  console.log(`serve-emu — host an Android device over scrcpy + WebSocket/WebRTC
 
 Usage:
   serve-emu [-p <port>] [-s <serial>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec]
+  serve-emu --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
   serve-emu --avd <name> [--restart-avd]
   serve-emu --avd-list
   serve-emu --running-avds
@@ -55,6 +135,18 @@ Options:
       --key-frame-interval <sec>
                          Ask the encoder for regular keyframes; 0 disables this
                          codec option (default: 1)
+      --transport <websocket|webrtc>
+                         Video transport for the browser UI (default: websocket)
+      --stun-url <url[,url...]>
+                         STUN URL(s) for WebRTC ICE; omitted = default public STUN
+      --turn-url <url[,url...]>
+                         TURN URL(s) for WebRTC ICE
+      --turn-username <value>
+                         TURN username for --turn-url
+      --turn-credential <value>
+                         TURN credential for --turn-url
+      --webrtc-ice-policy <all|relay>
+                         Browser/native ICE transport policy (default: all)
       --avd <name>       Launch this Android Virtual Device before streaming
       --restart-avd      Stop a running matching AVD before launching it
       --avd-list         Print available Android Virtual Device names
@@ -103,6 +195,7 @@ async function main() {
   const bitRate = numberOption("bit-rate", 8_000_000);
   const maxSize = numberOption("max-size", 1280);
   const keyFrameInterval = numberOption("key-frame-interval", 1);
+  const streamSettings = streamSettingsFromOptions();
 
   const started = await startServer({
     serial,
@@ -111,6 +204,7 @@ async function main() {
     bitRate,
     maxSize,
     keyFrameInterval,
+    streamSettings,
   }).catch((err) => {
     emulatorLaunch?.stop();
     throw err;
