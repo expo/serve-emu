@@ -1,7 +1,8 @@
 import { createRouter, type EmuApp, type RouterDefaults } from "./middleware.ts";
+import { isAllowedBrowserOrigin } from "./origin-policy.ts";
 import { fromBunSocket, type BunSocketHandlers } from "./stream-socket.ts";
 
-export type ServerOpts = RouterDefaults & { port: number };
+export type ServerOpts = RouterDefaults & { port: number; hostname?: string };
 
 type WsData = {
   serial: string;
@@ -22,7 +23,7 @@ const errMsg = (err: unknown): string => (err instanceof Error ? err.message : S
  * every device; the client selects one with `?device=<serial>`.
  */
 export async function startServer(opts: ServerOpts) {
-  const { port, ...defaults } = opts;
+  const { port, hostname = "127.0.0.1", ...defaults } = opts;
   const router = createRouter(defaults);
 
   // Eagerly start the default device so it streams immediately, the readiness
@@ -34,10 +35,14 @@ export async function startServer(opts: ServerOpts) {
 
   const server = Bun.serve<WsData>({
     port,
+    hostname,
     async fetch(req, srv) {
       const url = new URL(req.url);
 
       if (url.pathname === "/ws") {
+        if (!isAllowedBrowserOrigin(req, defaults)) {
+          return new Response("forbidden origin", { status: 403 });
+        }
         let resolved: { serial: string; app: EmuApp };
         try {
           resolved = await router.ensure(url.searchParams.get("device"));

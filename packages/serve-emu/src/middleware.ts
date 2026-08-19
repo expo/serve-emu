@@ -33,6 +33,11 @@ import {
   type StreamSettings,
 } from "./stream-settings.ts";
 import {
+  corsHeadersForRequest,
+  isAllowedBrowserOrigin,
+  type BrowserOriginPolicy,
+} from "./origin-policy.ts";
+import {
   MAX_WEBRTC_SIGNALING_BODY_BYTES,
   WebRtcSignalingError,
   parseWebRtcCloseRequest,
@@ -61,7 +66,7 @@ export type AppOptions = {
   maxSize?: number;
   keyFrameInterval?: number;
   streamSettings?: StreamSettings;
-};
+} & BrowserOriginPolicy;
 
 type SessionStatus = "streaming" | "stopped" | "error";
 
@@ -94,16 +99,6 @@ const MAX_LOGCAT_QUERY_BYTES = 200;
 const SPAWN_RETRY_COOLDOWN_MS = 5_000;
 
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
-const WEBRTC_CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "Content-Type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Cache-Control": "no-store",
-};
-const WEBRTC_JSON_HEADERS = {
-  ...WEBRTC_CORS_HEADERS,
-  "Content-Type": "application/json; charset=utf-8",
-};
 
 const STATIC_CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -184,6 +179,8 @@ export async function createApp(opts: AppOptions) {
   let lastVideoResetAt: string | null = null;
   let lastVideoResetReason: string | null = null;
   let lastVideoResetMs = 0;
+  let pendingVideoResetTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingVideoResetReason: string | null = null;
   let watchdog: ReturnType<typeof setInterval> | null = null;
   let lastLocation: (GeoFix & { appliedAt: string }) | null = null;
   let nextClientId = 1;
@@ -249,6 +246,9 @@ export async function createApp(opts: AppOptions) {
     lastError = reason;
     stoppedAt = new Date().toISOString();
     if (watchdog) clearInterval(watchdog);
+    if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
+    pendingVideoResetTimer = null;
+    pendingVideoResetReason = null;
     routePlayback.close();
     webRtcPublisher?.close();
     session.close();
@@ -529,9 +529,8 @@ export async function createApp(opts: AppOptions) {
     }
   };
 
-  const requestVideoReset = (reason: string) => {
+  const performVideoReset = (reason: string) => {
     const now = Date.now();
-    if (now - lastVideoResetMs < VIDEO_RESET_COOLDOWN_MS) return;
     lastVideoResetMs = now;
     videoResetRequests++;
     lastVideoResetAt = new Date(now).toISOString();
@@ -539,6 +538,30 @@ export async function createApp(opts: AppOptions) {
     try {
       session.controlSocket.write(resetVideoPacket());
     } catch {}
+  };
+
+  const requestVideoReset = (reason: string) => {
+    if (status !== "streaming") return;
+    const now = Date.now();
+    const remainingCooldownMs = VIDEO_RESET_COOLDOWN_MS - (now - lastVideoResetMs);
+    if (remainingCooldownMs <= 0) {
+      if (pendingVideoResetTimer) {
+        clearTimeout(pendingVideoResetTimer);
+        pendingVideoResetTimer = null;
+        pendingVideoResetReason = null;
+      }
+      performVideoReset(reason);
+      return;
+    }
+
+    pendingVideoResetReason = reason;
+    if (pendingVideoResetTimer) return;
+    pendingVideoResetTimer = setTimeout(() => {
+      pendingVideoResetTimer = null;
+      const pendingReason = pendingVideoResetReason;
+      pendingVideoResetReason = null;
+      if (pendingReason) performVideoReset(pendingReason);
+    }, remainingCooldownMs);
   };
 
   if (streamSettings.transport === "webrtc") {
@@ -552,12 +575,6 @@ export async function createApp(opts: AppOptions) {
     try {
       webRtcPublisher = await createWebRtcPublisher({
         settings: streamSettings,
-        onInput: (payload, peerId) => {
-          const gesture = parseGesture(payload);
-          void dispatchGesture(gesture, `webrtc:${peerId}`, shouldRecord(payload)).catch((err) => {
-            console.warn(`WebRTC input failed: ${errMsg(err)}`);
-          });
-        },
         onKeyframeRequest: requestVideoReset,
       });
     } catch (err) {
@@ -572,6 +589,13 @@ export async function createApp(opts: AppOptions) {
     totalDroppedFrames++;
     client.awaitingKeyFrame = true;
     requestVideoReset("client backpressure");
+  };
+
+  const hasWebSocketVideoClients = () => {
+    for (const client of clients) {
+      if (client.video) return true;
+    }
+    return false;
   };
 
   const sendFrame = (client: Client, data: Buffer, isKeyFrame: boolean) => {
@@ -667,7 +691,7 @@ export async function createApp(opts: AppOptions) {
   watchdog = setInterval(() => {
     sourceFps = frameCount - lastFpsFrameCount;
     lastFpsFrameCount = frameCount;
-    if (status !== "streaming" || (clients.size === 0 && !webRtcPublisher?.activePeerCount)) return;
+    if (status !== "streaming" || (!hasWebSocketVideoClients() && !webRtcPublisher?.activePeerCount)) return;
     const lastFrameSeenMs = lastFrameMs || startedMs;
     if (Date.now() - lastFrameSeenMs > STALE_VIDEO_RESET_MS) {
       requestVideoReset("source stream stalled");
@@ -685,21 +709,35 @@ export async function createApp(opts: AppOptions) {
     }
   });
 
+  const webRtcCorsHeaders = (req: Request) => corsHeadersForRequest(req, opts);
+  const webRtcJsonHeaders = (req: Request) => ({
+    ...webRtcCorsHeaders(req),
+    "Content-Type": "application/json; charset=utf-8",
+  });
+  const webRtcForbiddenOrigin = (req: Request) =>
+    Response.json(
+      { error: "forbidden_origin", message: "Request origin is not allowed for WebRTC signaling." },
+      { status: 403, headers: webRtcJsonHeaders(req) },
+    );
+
   const handleRequest = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
 
     if (url.pathname === "/api") {
-      return Response.json({
-        serial: opts.serial,
-        device: session.meta.deviceName,
-        codec: session.meta.codecId,
-        size: { width: screen.width, height: screen.height },
-        status,
-        lastFrameAt: lastFrameMs > 0 ? new Date(lastFrameMs).toISOString() : null,
-        lastError,
-        clients: clients.size,
-        stream: streamSettings,
-      });
+      return Response.json(
+        {
+          serial: opts.serial,
+          device: session.meta.deviceName,
+          codec: session.meta.codecId,
+          size: { width: screen.width, height: screen.height },
+          status,
+          lastFrameAt: lastFrameMs > 0 ? new Date(lastFrameMs).toISOString() : null,
+          lastError,
+          clients: clients.size,
+          stream: streamSettings,
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
     }
 
     if (url.pathname === "/api/devices") {
@@ -726,8 +764,9 @@ export async function createApp(opts: AppOptions) {
     }
 
     if (url.pathname === "/webrtc/offer") {
-      if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: WEBRTC_CORS_HEADERS });
-      if (req.method !== "POST") return new Response("method not allowed", { status: 405, headers: WEBRTC_CORS_HEADERS });
+      if (!isAllowedBrowserOrigin(req, opts)) return webRtcForbiddenOrigin(req);
+      if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: webRtcCorsHeaders(req) });
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405, headers: webRtcCorsHeaders(req) });
       let sessionId: string | undefined;
       try {
         if (streamSettings.transport !== "webrtc" || !webRtcPublisher) {
@@ -751,40 +790,36 @@ export async function createApp(opts: AppOptions) {
         const answer = await webRtcPublisher.handleOffer(offer);
         if (req.signal.aborted) {
           webRtcPublisher.closeSession(offer.sessionId);
-          return new Response(null, { status: 499, headers: WEBRTC_CORS_HEADERS });
+          return new Response(null, { status: 499, headers: webRtcCorsHeaders(req) });
         }
-        return Response.json(answer, { headers: WEBRTC_JSON_HEADERS });
+        return Response.json(answer, { headers: webRtcJsonHeaders(req) });
       } catch (err) {
         if (sessionId) webRtcPublisher?.closeSession(sessionId);
-        const busy = err instanceof Error && err.message.includes("WebRTC signaling already in progress");
-        const status = err instanceof WebRtcSignalingError ? err.status : busy ? 409 : 500;
-        const code = err instanceof WebRtcSignalingError
-          ? err.code
-          : busy
-            ? "webrtc_session_busy"
-            : "webrtc_offer_failed";
+        const status = err instanceof WebRtcSignalingError ? err.status : 500;
+        const code = err instanceof WebRtcSignalingError ? err.code : "webrtc_offer_failed";
         return Response.json(
           { error: code, message: errMsg(err) },
-          { status, headers: WEBRTC_JSON_HEADERS },
+          { status, headers: webRtcJsonHeaders(req) },
         );
       }
     }
 
     if (url.pathname === "/webrtc/close") {
-      if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: WEBRTC_CORS_HEADERS });
-      if (req.method !== "POST") return new Response("method not allowed", { status: 405, headers: WEBRTC_CORS_HEADERS });
+      if (!isAllowedBrowserOrigin(req, opts)) return webRtcForbiddenOrigin(req);
+      if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: webRtcCorsHeaders(req) });
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405, headers: webRtcCorsHeaders(req) });
       try {
         const request = parseWebRtcCloseRequest(
           parseJsonBody(await readBodyText(req, MAX_WEBRTC_CLOSE_BODY_BYTES), "invalid_close_request"),
         );
         webRtcPublisher?.closeSession(request.sessionId);
-        return new Response(null, { status: 204, headers: WEBRTC_CORS_HEADERS });
+        return new Response(null, { status: 204, headers: webRtcCorsHeaders(req) });
       } catch (err) {
         const status = err instanceof WebRtcSignalingError ? err.status : 400;
         const code = err instanceof WebRtcSignalingError ? err.code : "invalid_close_request";
         return Response.json(
           { error: code, message: errMsg(err) },
-          { status, headers: WEBRTC_JSON_HEADERS },
+          { status, headers: webRtcJsonHeaders(req) },
         );
       }
     }
@@ -1144,6 +1179,9 @@ export async function createApp(opts: AppOptions) {
     closeClients(1001, "server stopping");
     webRtcPublisher?.close();
     if (watchdog) clearInterval(watchdog);
+    if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
+    pendingVideoResetTimer = null;
+    pendingVideoResetReason = null;
     routePlayback.close();
     session.close();
   };

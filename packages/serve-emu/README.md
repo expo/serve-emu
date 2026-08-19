@@ -51,7 +51,7 @@ The `setup` step is also run lazily on first start, so you can skip it.
 ## CLI
 
 ```
-serve-emu [-p <port>] [-s <serial>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec]
+serve-emu [-p <port>] [--host <host>] [-s <serial>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec]
 serve-emu --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
 serve-emu --avd <name> [--restart-avd]
 serve-emu --avd-list
@@ -61,6 +61,7 @@ serve-emu --running-avds
 | flag | default | meaning |
 |---|---|---|
 | `-p, --port` | `3300` | HTTP port for the preview server |
+| `--host` | `127.0.0.1` | host interface to bind; pass `0.0.0.0` only when you intentionally expose the preview server |
 | `-s, --serial` | auto | adb device serial (only required when multiple devices are attached) |
 | `--max-fps` | `30` | cap source frame rate |
 | `--bit-rate` | `8000000` | H.264 bit rate in bps |
@@ -72,6 +73,7 @@ serve-emu --running-avds
 | `--turn-username` | none | TURN username; required with `--turn-url` |
 | `--turn-credential` | none | TURN credential; required with `--turn-url` |
 | `--webrtc-ice-policy` | `all` | ICE transport policy: `all` or `relay` |
+| `--allow-origin` | loopback + same-origin | extra browser origins allowed to use WebRTC signaling and WebSocket control; `*` restores permissive behavior for trusted networks only |
 | `--avd` | none | launch this Android Virtual Device before streaming |
 | `--restart-avd` | false | stop a running matching AVD before launching it |
 | `--avd-list` | false | list available Android Virtual Device names |
@@ -87,6 +89,8 @@ bun run packages/serve-emu/src/cli.ts --transport webrtc \
   --turn-username "$TURN_USERNAME" \
   --turn-credential "$TURN_CREDENTIAL"
 ```
+
+The browser must receive usable WebRTC ICE servers, so static TURN credentials are visible to anyone who can access the preview UI or same-origin `/api` response. Prefer short-lived TURN credentials for tunneled or shared environments.
 
 ## HTTP API
 

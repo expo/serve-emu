@@ -59,7 +59,7 @@
     "dev:ui": "vite",
     "start": "bun run src/cli.ts",
     "build:ui": "vite build",
-    "build:lib": "swc src -d dist --strip-leading-paths && tsc -p tsconfig.build.json && node scripts/fix-dist-imports.mjs",
+    "build:lib": "swc src -d dist --strip-leading-paths --ignore '**/*.test.ts' && tsc -p tsconfig.build.json && node scripts/fix-dist-imports.mjs",
     "build": "bun run clean && bun run build:ui && bun run build:lib",
     "clean": "rm -rf dist",
     "test": "bun test",

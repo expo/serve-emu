@@ -4,6 +4,12 @@ import { buildCodecString, scanAU } from "./h264";
 import { MsePlayer } from "./mse-player";
 import { withDevice } from "./device";
 import {
+  DEFAULT_STREAM_SETTINGS,
+  DEFAULT_WEBRTC_ICE_SERVERS,
+  type StreamSettings,
+  type WebRtcIceServer,
+} from "../../stream-settings";
+import {
   closeWebRtcSession,
   postWebRtcOffer,
   WebRtcSignalingBusyError,
@@ -22,21 +28,6 @@ export type Sender = (msg: Record<string, unknown>, ack?: boolean) => void;
 
 export type StreamTransport = "websocket" | "webrtc";
 
-export type WebRtcIceServer = {
-  urls: string[];
-  username?: string;
-  credential?: string;
-};
-
-export type StreamSettings =
-  | { transport: "websocket" }
-  | {
-      transport: "webrtc";
-      codec: "h264";
-      iceServers: WebRtcIceServer[];
-      iceTransportPolicy: RTCIceTransportPolicy;
-    };
-
 type ApiInfo = {
   size: DeviceSize;
   status?: "streaming" | "stopped" | "error";
@@ -53,10 +44,6 @@ const FRAME_META_MAGIC = 0x53454d55; // "SEMU"
 const FRAME_META_VERSION = 1;
 const FRAME_META_HEADER_BYTES = 16;
 const FRAME_FLAG_KEY = 1 << 0;
-const DEFAULT_WEBRTC_ICE_SERVERS: WebRtcIceServer[] = [
-  { urls: ["stun:stun.l.google.com:19302"] },
-  { urls: ["stun:stun1.l.google.com:19302"] },
-];
 const WEBRTC_ICE_GATHERING_TIMEOUT_MS = 3_000;
 const WEBRTC_SIGNALING_REQUEST_TIMEOUT_MS = 20_000;
 const WEBRTC_FIRST_FRAME_TIMEOUT_MS = 4_000;
@@ -158,11 +145,11 @@ export function useStream(
     fps: 0,
     deviceSize: null,
   });
-  const [streamSettings, setStreamSettings] = useState<StreamSettings | null>(null);
+  const [streamSettings, setStreamSettings] = useState<StreamSettings>(DEFAULT_STREAM_SETTINGS);
   const [webRtcRetryGeneration, setWebRtcRetryGeneration] = useState(0);
   const wsRef = useRef<WebSocket | null>(null);
   const webRtcTransportRetryAttemptRef = useRef(0);
-  const transport = streamSettings?.transport ?? null;
+  const transport = serial ? streamSettings.transport : null;
   const currentStreamSettingsKey = streamSettingsKey(streamSettings);
 
   const send = useCallback<Sender>((msg, ack = true) => {
@@ -173,7 +160,7 @@ export function useStream(
 
   useEffect(() => {
     if (!serial) {
-      setStreamSettings(null);
+      setStreamSettings(DEFAULT_STREAM_SETTINGS);
       setState((s) => ({ ...s, status: "waiting for device", fps: 0, deviceSize: null }));
       return;
     }
@@ -188,8 +175,6 @@ export function useStream(
         setStreamSettings((current) =>
           streamSettingsKey(current) === streamSettingsKey(d.stream ?? null) ? current : d.stream!,
         );
-      } else {
-        setStreamSettings((current) => current ?? { transport: "websocket" });
       }
       setState((s) => ({
         ...s,
@@ -211,8 +196,7 @@ export function useStream(
         })
         .catch(() => {
           if (!cancelled) {
-            setStreamSettings(null);
-            setState((s) => ({ ...s, status: "metadata unavailable" }));
+            setState((s) => (s.status === "streaming" ? s : { ...s, status: "metadata unavailable" }));
           }
         });
     };
@@ -594,7 +578,7 @@ export function useStream(
   }, [serial, transport]);
 
   useEffect(() => {
-    if (transport !== "webrtc" || !streamSettings || streamSettings.transport !== "webrtc") return;
+    if (transport !== "webrtc" || streamSettings.transport !== "webrtc") return;
     if (!serial) {
       setState((s) => ({ ...s, status: "waiting for device", deviceSize: null }));
       return;
@@ -618,6 +602,8 @@ export function useStream(
     let framePollTimer: number | undefined;
     let closePromise: Promise<void> | null = null;
     let firstFrameDecoded = false;
+    let trackReceived = false;
+    let connectionReady = false;
     let fpsCount = 0;
     let fpsTimer = performance.now();
     let lastVideoTime = -1;
@@ -663,11 +649,17 @@ export function useStream(
         firstFrameTimeout = undefined;
       }
       if (video.videoWidth > 0 && video.videoHeight > 0) {
-        setState((s) => ({
-          ...s,
-          status: "streaming",
-          deviceSize: { width: video.videoWidth, height: video.videoHeight },
-        }));
+        const width = video.videoWidth;
+        const height = video.videoHeight;
+        setState((s) => {
+          const sameSize = s.deviceSize?.width === width && s.deviceSize.height === height;
+          if (s.status === "streaming" && sameSize) return s;
+          return {
+            ...s,
+            status: "streaming",
+            deviceSize: sameSize ? s.deviceSize : { width, height },
+          };
+        });
       } else {
         setStatus("streaming");
       }
@@ -697,6 +689,24 @@ export function useStream(
         lastVideoTime = video.currentTime;
         markFrameDecoded();
       }, 250);
+    };
+
+    const armFirstFrameTimeout = () => {
+      if (
+        stopped ||
+        firstFrameDecoded ||
+        !trackReceived ||
+        !connectionReady ||
+        firstFrameTimeout !== undefined
+      ) {
+        return;
+      }
+      firstFrameTimeout = window.setTimeout(() => {
+        firstFrameTimeout = undefined;
+        if (stopped || firstFrameDecoded) return;
+        requestKeyframe();
+        retryTransport("WebRTC did not establish a video path.");
+      }, WEBRTC_FIRST_FRAME_TIMEOUT_MS);
     };
 
     const closePeer = () => {
@@ -747,22 +757,23 @@ export function useStream(
         preferH264(transceiver);
         pc.ontrack = (event) => {
           if (stopped) return;
+          trackReceived = true;
           firstFrameDecoded = false;
           event.track.onended = () => retryTransport("WebRTC video track ended.");
           video.srcObject = event.streams[0] ?? new MediaStream([event.track]);
           void video.play().catch(() => {});
           if (firstFrameTimeout !== undefined) window.clearTimeout(firstFrameTimeout);
-          firstFrameTimeout = window.setTimeout(() => {
-            firstFrameTimeout = undefined;
-            if (stopped || firstFrameDecoded) return;
-            requestKeyframe();
-            retryTransport("WebRTC did not establish a video path.");
-          }, WEBRTC_FIRST_FRAME_TIMEOUT_MS);
+          firstFrameTimeout = undefined;
           startFrameObserver();
+          armFirstFrameTimeout();
         };
         pc.onconnectionstatechange = () => {
           if (stopped || !pc) return;
-          if (pc.connectionState === "connected") setStatus("WebRTC connected");
+          if (pc.connectionState === "connected") {
+            connectionReady = true;
+            setStatus("WebRTC connected");
+            armFirstFrameTimeout();
+          }
           if (pc.connectionState === "failed") retryTransport("WebRTC connection failed.");
         };
 
@@ -782,7 +793,6 @@ export function useStream(
             sdp: local.sdp,
             sessionId,
             codec: streamSettings.codec,
-            iceServers,
           }),
         });
         if (!response.ok) {

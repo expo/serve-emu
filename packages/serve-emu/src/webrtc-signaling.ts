@@ -1,5 +1,3 @@
-import type { WebRtcIceServer } from "./stream-settings.ts";
-
 export const MAX_WEBRTC_SIGNALING_BODY_BYTES = 256 * 1024;
 
 export type WebRtcOffer = {
@@ -7,7 +5,6 @@ export type WebRtcOffer = {
   sdp: string;
   sessionId: string;
   codec?: "h264";
-  iceServers?: WebRtcIceServer[];
 };
 
 export type WebRtcAnswer = {
@@ -44,54 +41,6 @@ function requireSessionId(value: unknown): string {
   return value;
 }
 
-function optionalBoundedString(
-  value: unknown,
-  field: string,
-  maxLength: number,
-): string | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string" || value.length > maxLength) {
-    throw new WebRtcSignalingError(`Invalid ${field}`, 400, "invalid_offer");
-  }
-  return value;
-}
-
-function parseIceServers(value: unknown): WebRtcIceServer[] | undefined {
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.length > 16) {
-    throw new WebRtcSignalingError("Invalid ICE servers", 400, "invalid_offer");
-  }
-
-  return value.map((candidate) => {
-    if (
-      !isRecord(candidate) ||
-      !Array.isArray(candidate.urls) ||
-      candidate.urls.length === 0 ||
-      candidate.urls.length > 16
-    ) {
-      throw new WebRtcSignalingError("Invalid ICE server", 400, "invalid_offer");
-    }
-    const urls = candidate.urls.map((url) => {
-      if (
-        typeof url !== "string" ||
-        url.length === 0 ||
-        url.length > 2_048 ||
-        !/^(stun|stuns|turn|turns):/i.test(url)
-      ) {
-        throw new WebRtcSignalingError("Invalid ICE server URL", 400, "invalid_offer");
-      }
-      return url;
-    });
-    const username = optionalBoundedString(candidate.username, "ICE username", 1_024);
-    const credential = optionalBoundedString(candidate.credential, "ICE credential", 1_024);
-    return {
-      urls,
-      ...(username !== undefined ? { username } : {}),
-      ...(credential !== undefined ? { credential } : {}),
-    };
-  });
-}
-
 export function parseWebRtcOffer(value: unknown): WebRtcOffer {
   if (!isRecord(value) || value.type !== "offer") {
     throw new WebRtcSignalingError("Expected a WebRTC offer", 400, "invalid_offer");
@@ -102,12 +51,18 @@ export function parseWebRtcOffer(value: unknown): WebRtcOffer {
   if (value.codec !== undefined && value.codec !== "h264") {
     throw new WebRtcSignalingError("serve-emu WebRTC currently supports only H.264", 400, "invalid_offer");
   }
+  if (value.iceServers !== undefined) {
+    throw new WebRtcSignalingError(
+      "ICE servers must be configured by the serve-emu host",
+      400,
+      "client_ice_servers_unsupported",
+    );
+  }
   return {
     type: "offer",
     sdp: value.sdp,
     sessionId: requireSessionId(value.sessionId),
     ...(value.codec !== undefined ? { codec: "h264" as const } : {}),
-    ...(value.iceServers !== undefined ? { iceServers: parseIceServers(value.iceServers) } : {}),
   };
 }
 

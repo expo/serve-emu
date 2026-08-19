@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
 import { listAvds, listRunningAvds, startEmulator } from "./emulator.ts";
+import { parseAllowedOrigins } from "./origin-policy.ts";
 import { startServer } from "./server.ts";
 import {
   DEFAULT_WEBRTC_ICE_SERVERS,
@@ -15,6 +16,7 @@ const { values } = parseArgs({
   args: argv,
   options: {
     port: { type: "string", short: "p", default: "3300" },
+    host: { type: "string", default: "127.0.0.1" },
     serial: { type: "string", short: "s" },
     "max-fps": { type: "string", default: "30" },
     "bit-rate": { type: "string", default: "8000000" },
@@ -29,6 +31,7 @@ const { values } = parseArgs({
     "turn-username": { type: "string" },
     "turn-credential": { type: "string" },
     "webrtc-ice-policy": { type: "string", default: "all" },
+    "allow-origin": { type: "string" },
     avd: { type: "string" },
     "avd-list": { type: "boolean" },
     "running-avds": { type: "boolean" },
@@ -126,6 +129,7 @@ Usage:
 
 Options:
   -p, --port <port>      Port to listen on (default: 3300)
+      --host <host>      Host interface to bind (default: 127.0.0.1)
   -s, --serial <serial>  adb device serial (defaults to the only booted device)
       --max-fps <n>      Cap source frame rate (default: 30)
       --bit-rate <bps>   H.264 bit rate (default: 8000000)
@@ -147,6 +151,9 @@ Options:
                          TURN credential for --turn-url
       --webrtc-ice-policy <all|relay>
                          Browser/native ICE transport policy (default: all)
+      --allow-origin <origin[,origin...]>
+                         Extra browser origins allowed to signal/control; use *
+                         only for trusted networks
       --avd <name>       Launch this Android Virtual Device before streaming
       --restart-avd      Stop a running matching AVD before launching it
       --avd-list         Print available Android Virtual Device names
@@ -191,20 +198,27 @@ async function main() {
       })).serial
     : values.serial;
   const port = Number(values.port);
+  const host = stringOption("host") ?? "127.0.0.1";
   const maxFps = numberOption("max-fps", 30);
   const bitRate = numberOption("bit-rate", 8_000_000);
   const maxSize = numberOption("max-size", 1280);
   const keyFrameInterval = numberOption("key-frame-interval", 1);
   const streamSettings = streamSettingsFromOptions();
+  const allowOrigin = stringOption("allow-origin");
+  const allowedOrigins = allowOrigin
+    ? parseAllowedOrigins(allowOrigin)
+    : [];
 
   const started = await startServer({
     serial,
     port,
+    hostname: host,
     maxFps,
     bitRate,
     maxSize,
     keyFrameInterval,
     streamSettings,
+    allowedOrigins,
   }).catch((err) => {
     emulatorLaunch?.stop();
     throw err;
@@ -224,7 +238,8 @@ async function main() {
     process.exit(0);
   });
 
-  console.log(`serve-emu → http://localhost:${server.port}  (device: ${started.serial})`);
+  const displayHost = host === "0.0.0.0" || host === "::" ? "localhost" : host;
+  console.log(`serve-emu → http://${displayHost}:${server.port}  (device: ${started.serial})`);
 }
 
 await main().catch((err) => {
