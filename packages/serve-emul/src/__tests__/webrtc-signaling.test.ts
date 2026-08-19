@@ -8,37 +8,23 @@ import {
 const SESSION_ID = "00000000-0000-4000-8000-000000000000";
 
 describe("WebRTC signaling validation", () => {
-  test("accepts an H.264 offer with TURN configuration", () => {
+  test("accepts an H.264 offer", () => {
     expect(
       parseWebRtcOffer({
         type: "offer",
         sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 109\r\n",
         sessionId: SESSION_ID,
         codec: "h264",
-        iceServers: [
-          {
-            urls: ["turn:turn.example:3478?transport=udp"],
-            username: "user",
-            credential: "secret",
-          },
-        ],
       }),
     ).toEqual({
       type: "offer",
       sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 109\r\n",
       sessionId: SESSION_ID,
       codec: "h264",
-      iceServers: [
-        {
-          urls: ["turn:turn.example:3478?transport=udp"],
-          username: "user",
-          credential: "secret",
-        },
-      ],
     });
   });
 
-  test("rejects unsupported codecs and invalid ICE URLs", () => {
+  test("rejects unsupported codecs and client-supplied ICE servers", () => {
     expect(() =>
       parseWebRtcOffer({
         type: "offer",
@@ -52,9 +38,9 @@ describe("WebRTC signaling validation", () => {
         type: "offer",
         sdp: "v=0",
         sessionId: SESSION_ID,
-        iceServers: [{ urls: ["https://example.test"] }],
+        iceServers: [{ urls: ["turn:turn.example:3478"] }],
       }),
-    ).toThrow(WebRtcSignalingError);
+    ).toThrow("ICE servers must be configured by the serve-emu host");
   });
 
   test("requires valid UUID session IDs", () => {

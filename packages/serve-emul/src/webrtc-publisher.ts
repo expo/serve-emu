@@ -4,21 +4,22 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import type nodeDataChannel from "node-datachannel";
 import type {
-  DataChannel,
   H264RtpPacketizer,
   PeerConnection,
+  RtcpNackResponder,
+  RtcpSrReporter,
   RtpPacketizationConfig,
   Track,
 } from "node-datachannel";
 import type { VideoFrame } from "./scrcpy.ts";
 import type { StreamSettings, WebRtcIceServer } from "./stream-settings.ts";
-import type { WebRtcAnswer, WebRtcOffer } from "./webrtc-signaling.ts";
+import { WebRtcSignalingError, type WebRtcAnswer, type WebRtcOffer } from "./webrtc-signaling.ts";
 
 type NodeDataChannel = typeof nodeDataChannel;
+type MediaDirection = "sendrecv" | "sendonly" | "recvonly" | "inactive";
 
 export type WebRtcPublisherOptions = {
   settings: Extract<StreamSettings, { transport: "webrtc" }>;
-  onInput?: (payload: unknown, peerId: number, sessionId: string) => void;
   onKeyframeRequest: (reason: string) => void;
 };
 
@@ -47,46 +48,68 @@ function hasPacketizationMode1(fmtp: string): boolean {
 // H.264 payload type from the offer, and libdatachannel's packetizer emits
 // FU-A fragments, so packetization-mode=1 is mandatory.
 export function selectH264Media(offerSdp: string): H264Media {
-  let inVideoSection = false;
-  let mid: string | null = null;
-  const h264PayloadTypes: number[] = [];
-  const fmtpByPayloadType = new Map<number, string>();
+  let section: {
+    mid: string | null;
+    direction: MediaDirection;
+    h264PayloadTypes: number[];
+    fmtpByPayloadType: Map<number, string>;
+  } | null = null;
+  const candidates: H264Media[] = [];
+
+  const finishSection = () => {
+    if (!section?.mid || section.direction === "sendonly" || section.direction === "inactive") return;
+    const compatiblePayloadTypes = section.h264PayloadTypes.filter((payloadType) =>
+      hasPacketizationMode1(section!.fmtpByPayloadType.get(payloadType) ?? "")
+    );
+    if (compatiblePayloadTypes.length === 0) return;
+
+    const score = (payloadType: number): number => {
+      const fmtp = section!.fmtpByPayloadType.get(payloadType) ?? "";
+      const profile = /profile-level-id=([0-9a-f]{6})/i.exec(fmtp)?.[1]?.toLowerCase();
+      if (profile?.startsWith("42e0")) return 2;
+      if (profile?.startsWith("42")) return 1;
+      return 0;
+    };
+    const payloadType = compatiblePayloadTypes.reduce((best, pt) =>
+      score(pt) > score(best) ? pt : best
+    );
+    candidates.push({ payloadType, mid: section.mid });
+  };
 
   for (const line of offerSdp.split(/\r?\n/)) {
     if (line.startsWith("m=")) {
-      inVideoSection = line.startsWith("m=video");
+      finishSection();
+      section = line.startsWith("m=video")
+        ? {
+            mid: null,
+            direction: "sendrecv",
+            h264PayloadTypes: [],
+            fmtpByPayloadType: new Map(),
+          }
+        : null;
       continue;
     }
-    if (!inVideoSection) continue;
+    if (!section) continue;
 
     const midLine = /^a=mid:(\S+)/.exec(line);
-    if (midLine && mid === null) mid = midLine[1]!;
+    if (midLine) section.mid = midLine[1]!;
+
+    const directionLine = /^a=(sendrecv|sendonly|recvonly|inactive)$/.exec(line);
+    if (directionLine) section.direction = directionLine[1] as MediaDirection;
 
     const rtpmap = /^a=rtpmap:(\d+) H264\/90000/i.exec(line);
-    if (rtpmap) h264PayloadTypes.push(Number(rtpmap[1]));
+    if (rtpmap) section.h264PayloadTypes.push(Number(rtpmap[1]));
 
     const fmtp = /^a=fmtp:(\d+) (.+)$/.exec(line);
-    if (fmtp) fmtpByPayloadType.set(Number(fmtp[1]), fmtp[2]!.toLowerCase());
+    if (fmtp) section.fmtpByPayloadType.set(Number(fmtp[1]), fmtp[2]!.toLowerCase());
   }
+  finishSection();
 
-  const compatiblePayloadTypes = h264PayloadTypes.filter((payloadType) =>
-    hasPacketizationMode1(fmtpByPayloadType.get(payloadType) ?? "")
-  );
-  if (compatiblePayloadTypes.length === 0 || mid === null) {
+  const selected = candidates[0];
+  if (!selected) {
     throw new Error("WebRTC offer does not include H.264 packetization-mode=1 video");
   }
-
-  const score = (payloadType: number): number => {
-    const fmtp = fmtpByPayloadType.get(payloadType) ?? "";
-    const profile = /profile-level-id=([0-9a-f]{6})/i.exec(fmtp)?.[1]?.toLowerCase();
-    if (profile?.startsWith("42e0")) return 2;
-    if (profile?.startsWith("42")) return 1;
-    return 0;
-  };
-  const payloadType = compatiblePayloadTypes.reduce((best, pt) =>
-    score(pt) > score(best) ? pt : best
-  );
-  return { payloadType, mid };
+  return selected;
 }
 
 function sectionForMid(lines: string[], mid: string): { start: number; end: number; midIndex: number } | null {
@@ -112,18 +135,13 @@ export function injectVideoSsrc(sdp: string, mid: string, ssrc: number): string 
   const eol = sdpEol(sdp);
   const lines = sdp.split(/\r?\n/);
   const section = sectionForMid(lines, mid);
-  if (!section) return sdp;
+  if (!section) {
+    throw new Error(`WebRTC answer does not include the selected video mid "${mid}"`);
+  }
   const ssrcPrefix = `a=ssrc:${ssrc} `;
   if (lines.slice(section.start, section.end).some((line) => line.startsWith(ssrcPrefix))) return sdp;
   lines.splice(section.midIndex + 1, 0, `a=ssrc:${ssrc} cname:serve-emu`);
   return lines.join(eol);
-}
-
-function stringFromMessage(message: string | Buffer | ArrayBuffer): string | null {
-  if (typeof message === "string") return message;
-  if (Buffer.isBuffer(message)) return message.toString("utf8");
-  if (message instanceof ArrayBuffer) return Buffer.from(message).toString("utf8");
-  return null;
 }
 
 function iceUrlsForNodeDataChannel(servers: WebRtcIceServer[]): string[] {
@@ -249,36 +267,37 @@ export class WebRtcPublisher {
   }
 
   async handleOffer(offer: WebRtcOffer): Promise<WebRtcAnswer> {
-    if (this.pendingSessionId && this.pendingSessionId !== offer.sessionId) {
-      throw new Error("WebRTC signaling already in progress");
+    if (this.pendingSessionId) {
+      throw new WebRtcSignalingError(
+        "WebRTC signaling already in progress",
+        409,
+        "webrtc_session_busy",
+      );
     }
-
-    const previous = this.peers.get(offer.sessionId);
-    if (previous) previous.close();
-
-    const peer = new WebRtcPeer({
-      id: this.nextPeerId++,
-      sessionId: offer.sessionId,
-      ndc: this.ndc,
-      settings: {
-        ...this.options.settings,
-        iceServers: offer.iceServers ?? this.options.settings.iceServers,
-      },
-      onInput: this.options.onInput,
-      onKeyframeRequest: this.options.onKeyframeRequest,
-      onClose: (closedPeer) => {
-        if (this.peers.get(closedPeer.sessionId) === closedPeer) this.peers.delete(closedPeer.sessionId);
-      },
-    });
-    this.peers.set(offer.sessionId, peer);
     this.pendingSessionId = offer.sessionId;
+
+    let peer: WebRtcPeer | null = null;
     try {
+      const previous = this.peers.get(offer.sessionId);
+      if (previous) previous.close();
+
+      peer = new WebRtcPeer({
+        id: this.nextPeerId++,
+        sessionId: offer.sessionId,
+        ndc: this.ndc,
+        settings: this.options.settings,
+        onKeyframeRequest: this.options.onKeyframeRequest,
+        onClose: (closedPeer) => {
+          if (this.peers.get(closedPeer.sessionId) === closedPeer) this.peers.delete(closedPeer.sessionId);
+        },
+      });
+      this.peers.set(offer.sessionId, peer);
       const answer = await peer.answer(offer);
       if (peer.closed) throw new Error("WebRTC peer closed before answer was created");
       this.options.onKeyframeRequest("WebRTC peer opened");
       return answer;
     } catch (err) {
-      peer.close();
+      peer?.close();
       throw err;
     } finally {
       if (this.pendingSessionId === offer.sessionId) this.pendingSessionId = null;
@@ -321,18 +340,19 @@ class WebRtcPeer {
   private track: Track | null = null;
   private rtpConfig: RtpPacketizationConfig | null = null;
   private packetizer: H264RtpPacketizer | null = null;
-  private dataChannel: DataChannel | null = null;
+  private nackResponder: RtcpNackResponder | null = null;
+  private srReporter: RtcpSrReporter | null = null;
   private trackOpen = false;
   private awaitingKeyFrame = true;
   private sentFrames = 0;
   private droppedFrames = 0;
-  private inputMessages = 0;
   private lastFrameAt: string | null = null;
   private lastState = "new";
   private lastIceState = "new";
   private lastError: string | null = null;
   private readonly createdMs = Date.now();
   private lastRtpTimestamp = 0;
+  private selectedMid: string | null = null;
 
   constructor(
     private readonly params: {
@@ -340,7 +360,6 @@ class WebRtcPeer {
       sessionId: string;
       ndc: NodeDataChannel;
       settings: Extract<StreamSettings, { transport: "webrtc" }>;
-      onInput?: (payload: unknown, peerId: number, sessionId: string) => void;
       onKeyframeRequest: (reason: string) => void;
       onClose: (peer: WebRtcPeer) => void;
     },
@@ -357,10 +376,9 @@ class WebRtcPeer {
     });
 
     this.pc.onTrack((track) => this.attachTrack(track));
-    this.pc.onDataChannel((channel) => this.attachDataChannel(channel));
     this.pc.onStateChange((state) => {
       this.lastState = state;
-      if (state === "failed" || state === "closed" || state === "disconnected") {
+      if (state === "failed" || state === "closed") {
         this.close();
       }
     });
@@ -371,6 +389,7 @@ class WebRtcPeer {
 
   async answer(offer: WebRtcOffer): Promise<WebRtcAnswer> {
     const { payloadType, mid } = selectH264Media(offer.sdp);
+    this.selectedMid = mid;
     const ssrc = randomSsrc();
     this.rtpConfig = new this.params.ndc.RtpPacketizationConfig(
       ssrc,
@@ -378,7 +397,14 @@ class WebRtcPeer {
       payloadType,
       RTP_CLOCK_RATE,
     );
-    this.packetizer = new this.params.ndc.H264RtpPacketizer("StartSequence", this.rtpConfig);
+    const packetizer = new this.params.ndc.H264RtpPacketizer("StartSequence", this.rtpConfig);
+    const srReporter = new this.params.ndc.RtcpSrReporter(this.rtpConfig);
+    const nackResponder = new this.params.ndc.RtcpNackResponder();
+    packetizer.addToChain(srReporter);
+    srReporter.addToChain(nackResponder);
+    this.packetizer = packetizer;
+    this.srReporter = srReporter;
+    this.nackResponder = nackResponder;
     // setRemoteDescription reciprocates the offer's recvonly video m-line and
     // emits the SendOnly track we publish on via onTrack.
     this.pc.setRemoteDescription(offer.sdp, "offer");
@@ -396,6 +422,22 @@ class WebRtcPeer {
 
   private attachTrack(track: Track): void {
     if (this.closed) {
+      try {
+        track.close();
+      } catch {}
+      return;
+    }
+    let trackMid: string;
+    try {
+      trackMid = track.mid();
+    } catch (err) {
+      this.lastError = errorMessage(err);
+      try {
+        track.close();
+      } catch {}
+      return;
+    }
+    if (this.selectedMid && trackMid !== this.selectedMid) {
       try {
         track.close();
       } catch {}
@@ -453,9 +495,6 @@ class WebRtcPeer {
     if (this.closed) return;
     this.closed = true;
     try {
-      this.dataChannel?.close();
-    } catch {}
-    try {
       this.track?.close();
     } catch {}
     try {
@@ -467,14 +506,11 @@ class WebRtcPeer {
   snapshot() {
     return {
       id: this.id,
-      sessionId: this.sessionId,
       state: this.lastState,
       iceState: this.lastIceState,
       trackOpen: this.trackOpen,
-      dataChannelOpen: this.dataChannel?.isOpen() ?? false,
       sentFrames: this.sentFrames,
       droppedFrames: this.droppedFrames,
-      inputMessages: this.inputMessages,
       awaitingKeyFrame: this.awaitingKeyFrame,
       lastFrameAt: this.lastFrameAt,
       lastError: this.lastError,
@@ -515,23 +551,4 @@ class WebRtcPeer {
     });
   }
 
-  private attachDataChannel(channel: DataChannel): void {
-    this.dataChannel = channel;
-    channel.onMessage((message) => {
-      const text = stringFromMessage(message);
-      if (!text) return;
-      this.inputMessages++;
-      try {
-        this.params.onInput?.(JSON.parse(text), this.id, this.sessionId);
-      } catch (err) {
-        this.lastError = errorMessage(err);
-      }
-    });
-    channel.onClosed(() => {
-      if (this.dataChannel === channel) this.dataChannel = null;
-    });
-    channel.onError((err) => {
-      this.lastError = err;
-    });
-  }
 }
