@@ -5,7 +5,7 @@ The `npx serve` of Android devices.
 Host your Android emulator (or real device) for use with agent tools like Codex, Cursor, or Claude Desktop — locally, over your LAN, or tunnel anywhere.
 
 ```sh
-bunx serve-emu
+bunx @expo/serve-emu
 # → Preview at http://localhost:3300
 ```
 
@@ -28,7 +28,7 @@ v1. Working:
 - App management controls for APK install, launch, clear data, force stop, and permission grants
 - Full-resolution screenshot capture from the browser UI (download / copy) and `GET /api/screenshot`
 - Multi-device routing
-- Embeddable middleware (`serve-emu/middleware`)
+- Embeddable middleware (`@expo/serve-emu/middleware`)
 
 ## Requirements
 
@@ -41,7 +41,7 @@ v1. Working:
 
 ```sh
 bun install
-bun run --filter serve-emu setup    # downloads scrcpy-server-v4.0 into vendor/
+bun run --filter '@expo/serve-emu' setup    # downloads scrcpy-server-v4.0 into vendor/
 bun run packages/serve-emu/src/cli.ts
 # → http://localhost:3300
 ```

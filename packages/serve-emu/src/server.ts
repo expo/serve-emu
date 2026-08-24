@@ -33,11 +33,18 @@ export async function startServer(opts: ServerOpts) {
     `scrcpy ready: ${app.session.meta.deviceName} • ${app.session.meta.codecId} • ${app.session.meta.width}×${app.session.meta.height}`,
   );
 
-  const server = Bun.serve<WsData>({
+  const createBunServer = () => Bun.serve<WsData>({
     port,
     hostname,
     async fetch(req, srv) {
       const url = new URL(req.url);
+
+      if (url.pathname === "/readyz") {
+        return Response.json(
+          { status: "ready", device: serial },
+          { headers: { "Cache-Control": "no-store" } },
+        );
+      }
 
       if (url.pathname === "/ws") {
         if (!isAllowedBrowserOrigin(req, defaults)) {
@@ -83,6 +90,13 @@ export async function startServer(opts: ServerOpts) {
       },
     },
   });
+  let server: ReturnType<typeof createBunServer>;
+  try {
+    server = createBunServer();
+  } catch (err) {
+    router.stopAll();
+    throw err;
+  }
 
   const stop = () => {
     router.stopAll();

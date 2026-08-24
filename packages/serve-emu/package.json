@@ -1,5 +1,5 @@
 {
-  "name": "serve-emu",
+  "name": "@expo/serve-emu",
   "version": "0.0.3",
   "description": "The `npx serve` of Android devices — stream a booted emulator or attached device over WebSocket/WebCodecs or WebRTC H.264.",
   "license": "Apache-2.0",
@@ -27,14 +27,18 @@
   },
   "sideEffects": false,
   "author": "jiunshinn",
-  "homepage": "https://github.com/jiunshinn/serve-emu",
+  "homepage": "https://github.com/expo/serve-emu#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jiunshinn/serve-emu.git",
+    "url": "git+https://github.com/expo/serve-emu.git",
     "directory": "packages/serve-emu"
   },
   "bugs": {
-    "url": "https://github.com/jiunshinn/serve-emu/issues"
+    "url": "https://github.com/expo/serve-emu/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "keywords": [
     "android",
@@ -51,10 +55,11 @@
     "bun": ">=1.1.0"
   },
   "bin": {
-    "serve-emu": "./src/cli.ts"
+    "serve-emu": "./dist/cli.js"
   },
   "scripts": {
-    "setup": "bun run scripts/fetch-scrcpy.ts && bun run build:ui",
+    "vendor": "bun run scripts/fetch-scrcpy.ts",
+    "setup": "bun run vendor && bun run build:ui",
     "dev": "bun --watch run src/cli.ts",
     "dev:ui": "vite",
     "start": "bun run src/cli.ts",
@@ -65,11 +70,9 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "typecheck:ui": "tsc -p src/ui --noEmit",
-    "prepublishOnly": "bun run build"
+    "prepack": "bun run vendor && bun run build"
   },
   "files": [
-    "src",
-    "scripts",
     "vendor",
     "dist",
     "README.md",
