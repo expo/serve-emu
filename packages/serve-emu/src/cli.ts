@@ -152,8 +152,8 @@ Options:
       --webrtc-ice-policy <all|relay>
                          Browser/native ICE transport policy (default: all)
       --allow-origin <origin[,origin...]>
-                         Extra browser origins allowed to signal/control; use *
-                         only for trusted networks
+                         Extra browser origins allowed to signal, control, and
+                         stream logcat; use * only for trusted networks
       --avd <name>       Launch this Android Virtual Device before streaming
       --restart-avd      Stop a running matching AVD before launching it
       --avd-list         Print available Android Virtual Device names

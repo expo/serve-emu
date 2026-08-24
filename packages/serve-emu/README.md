@@ -73,7 +73,7 @@ serve-emu --running-avds
 | `--turn-username` | none | TURN username; required with `--turn-url` |
 | `--turn-credential` | none | TURN credential; required with `--turn-url` |
 | `--webrtc-ice-policy` | `all` | ICE transport policy: `all` or `relay` |
-| `--allow-origin` | loopback + same-origin | extra browser origins allowed to use WebRTC signaling and WebSocket control; `*` restores permissive behavior for trusted networks only |
+| `--allow-origin` | loopback + same-origin | extra browser origins allowed to use WebRTC signaling, WebSocket control, and logcat; `*` restores permissive behavior for trusted networks only |
 | `--avd` | none | launch this Android Virtual Device before streaming |
 | `--restart-avd` | false | stop a running matching AVD before launching it |
 | `--avd-list` | false | list available Android Virtual Device names |
