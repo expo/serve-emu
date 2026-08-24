@@ -44,14 +44,22 @@ main {
   overflow: hidden;
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6);
 }
-canvas {
+canvas,
+.stream-video {
   display: block;
   max-height: 80vh;
   max-width: 90vw;
   height: auto;
+  background: #000;
   cursor: default;
   user-select: none;
   touch-action: none;
+}
+.stream-video {
+  object-fit: contain;
+}
+.stream-hidden {
+  display: none !important;
 }
 .stream-surface {
   position: relative;

@@ -1,9 +1,15 @@
 import { createRouter, type EmuApp, type RouterDefaults } from "./middleware.ts";
+import { isAllowedBrowserOrigin } from "./origin-policy.ts";
 import { fromBunSocket, type BunSocketHandlers } from "./stream-socket.ts";
 
-export type ServerOpts = RouterDefaults & { port: number };
+export type ServerOpts = RouterDefaults & { port: number; hostname?: string };
 
-type WsData = { serial: string; frameMeta: boolean; handlers?: BunSocketHandlers };
+type WsData = {
+  serial: string;
+  frameMeta: boolean;
+  video: boolean;
+  handlers?: BunSocketHandlers;
+};
 
 const jsonHeaders = { "Content-Type": "application/json; charset=utf-8" };
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
@@ -17,7 +23,7 @@ const errMsg = (err: unknown): string => (err instanceof Error ? err.message : S
  * every device; the client selects one with `?device=<serial>`.
  */
 export async function startServer(opts: ServerOpts) {
-  const { port, ...defaults } = opts;
+  const { port, hostname = "127.0.0.1", ...defaults } = opts;
   const router = createRouter(defaults);
 
   // Eagerly start the default device so it streams immediately, the readiness
@@ -29,10 +35,14 @@ export async function startServer(opts: ServerOpts) {
 
   const server = Bun.serve<WsData>({
     port,
+    hostname,
     async fetch(req, srv) {
       const url = new URL(req.url);
 
       if (url.pathname === "/ws") {
+        if (!isAllowedBrowserOrigin(req, defaults)) {
+          return new Response("forbidden origin", { status: 403 });
+        }
         let resolved: { serial: string; app: EmuApp };
         try {
           resolved = await router.ensure(url.searchParams.get("device"));
@@ -48,8 +58,9 @@ export async function startServer(opts: ServerOpts) {
             headers: jsonHeaders,
           });
         }
-        const frameMeta = url.searchParams.get("frame-meta") === "1";
-        const ok = srv.upgrade(req, { data: { serial: resolved.serial, frameMeta } });
+        const video = url.searchParams.get("video") !== "0";
+        const frameMeta = video && url.searchParams.get("frame-meta") === "1";
+        const ok = srv.upgrade(req, { data: { serial: resolved.serial, frameMeta, video } });
         if (ok) return undefined as unknown as Response;
         return new Response("upgrade failed", { status: 400 });
       }
@@ -61,6 +72,7 @@ export async function startServer(opts: ServerOpts) {
         router.attachWebSocket(fromBunSocket(ws), {
           serial: ws.data.serial,
           frameMeta: ws.data.frameMeta,
+          video: ws.data.video,
         });
       },
       message(ws, raw) {
