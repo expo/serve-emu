@@ -51,6 +51,7 @@ const WEBRTC_BUSY_RETRY_INTERVAL_MS = 500;
 const WEBRTC_BUSY_RETRY_COUNT = 30;
 const WEBRTC_TRANSPORT_RETRY_BASE_MS = 500;
 const WEBRTC_TRANSPORT_RETRY_MAX_MS = 5_000;
+const WEBRTC_DISCONNECTED_GRACE_MS = 10_000;
 
 type FramePacket = {
   data: Uint8Array;
@@ -182,7 +183,7 @@ export function useStream(
         status:
           d.status && d.status !== "streaming"
             ? d.lastError || d.status
-            : d.lastFrameAt && lastFrameAgeMs > 3000
+            : s.status !== "streaming" && d.lastFrameAt && lastFrameAgeMs > 3000
               ? "stream stalled"
               : s.status,
       }));
@@ -598,6 +599,7 @@ export function useStream(
     let pc: RTCPeerConnection | null = null;
     let retryTimer: number | undefined;
     let firstFrameTimeout: number | undefined;
+    let disconnectedTimeout: number | undefined;
     let videoFrameCallback: number | undefined;
     let framePollTimer: number | undefined;
     let closePromise: Promise<void> | null = null;
@@ -711,6 +713,10 @@ export function useStream(
 
     const closePeer = () => {
       stopFrameObserver();
+      if (disconnectedTimeout !== undefined) {
+        window.clearTimeout(disconnectedTimeout);
+        disconnectedTimeout = undefined;
+      }
       video.srcObject = null;
       pc?.close();
     };
@@ -734,12 +740,10 @@ export function useStream(
       requestKeyframe();
       setStatus(`${message} Retrying...`);
       closePeer();
-      void closeRemoteSession().finally(() => {
-        if (stopped) return;
-        retryTimer = window.setTimeout(() => {
-          if (!stopped) setWebRtcRetryGeneration((generation) => generation + 1);
-        }, delay);
-      });
+      void closeRemoteSession();
+      retryTimer = window.setTimeout(() => {
+        if (!stopped) setWebRtcRetryGeneration((generation) => generation + 1);
+      }, delay);
     };
 
     const releaseOnPageHide = () => void closeRemoteSession(true);
@@ -771,10 +775,29 @@ export function useStream(
           if (stopped || !pc) return;
           if (pc.connectionState === "connected") {
             connectionReady = true;
+            if (disconnectedTimeout !== undefined) {
+              window.clearTimeout(disconnectedTimeout);
+              disconnectedTimeout = undefined;
+            }
             setStatus("WebRTC connected");
             armFirstFrameTimeout();
+          } else if (pc.connectionState === "disconnected") {
+            connectionReady = false;
+            if (firstFrameTimeout !== undefined) {
+              window.clearTimeout(firstFrameTimeout);
+              firstFrameTimeout = undefined;
+            }
+            setStatus("WebRTC reconnecting");
+            if (disconnectedTimeout === undefined) {
+              disconnectedTimeout = window.setTimeout(() => {
+                disconnectedTimeout = undefined;
+                if (stopped || !pc || pc.connectionState === "connected") return;
+                retryTransport("WebRTC remained disconnected.");
+              }, WEBRTC_DISCONNECTED_GRACE_MS);
+            }
+          } else if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+            retryTransport("WebRTC connection failed.");
           }
-          if (pc.connectionState === "failed") retryTransport("WebRTC connection failed.");
         };
 
         const offer = await pc.createOffer();
@@ -796,8 +819,14 @@ export function useStream(
           }),
         });
         if (!response.ok) {
+          const status = response.status;
           await response.body?.cancel();
-          failPermanently(`WebRTC offer failed: HTTP ${response.status}`);
+          const message = `WebRTC offer failed: HTTP ${status}.`;
+          if (status === 408 || status === 425 || status === 429 || status >= 500) {
+            retryTransport(message);
+          } else {
+            failPermanently(message);
+          }
           return;
         }
         const answer = (await response.json()) as RTCSessionDescriptionInit;
@@ -818,7 +847,7 @@ export function useStream(
       } catch (caught) {
         if (stopped || lifecycleController.signal.aborted) return;
         if (caught instanceof WebRtcSignalingBusyError) {
-          failPermanently(caught.message);
+          retryTransport(caught.message);
           return;
         }
         const message = caught instanceof WebRtcSignalingTimeoutError
@@ -835,6 +864,7 @@ export function useStream(
       lifecycleController.abort();
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
       if (firstFrameTimeout !== undefined) window.clearTimeout(firstFrameTimeout);
+      if (disconnectedTimeout !== undefined) window.clearTimeout(disconnectedTimeout);
       void closeRemoteSession(true);
       closePeer();
     };

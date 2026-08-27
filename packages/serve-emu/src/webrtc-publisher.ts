@@ -28,9 +28,12 @@ type H264Media = { payloadType: number; mid: string };
 const requireModule = createRequire(import.meta.url);
 const RTP_CLOCK_RATE = 90_000;
 const ICE_GATHERING_TIMEOUT_MS = 3_000;
+const CONNECTION_TIMEOUT_MS = 10_000;
+const DISCONNECTED_GRACE_MS = 10_000;
+const MAX_CANCELLED_SESSION_IDS = 64;
 
 let loggerInitialized = false;
-let nativeRepairAttempted = false;
+let nativeRepairPromise: Promise<void> | null = null;
 
 function randomSsrc(): number {
   return Math.floor(1 + Math.random() * 0x7ffffffe);
@@ -48,9 +51,12 @@ function hasPacketizationMode1(fmtp: string): boolean {
 // H.264 payload type from the offer, and libdatachannel's packetizer emits
 // FU-A fragments, so packetization-mode=1 is mandatory.
 export function selectH264Media(offerSdp: string): H264Media {
+  let sessionDirection: MediaDirection = "sendrecv";
+  let sawMediaSection = false;
   let section: {
     mid: string | null;
     direction: MediaDirection;
+    offeredPayloadTypes: Set<string>;
     h264PayloadTypes: number[];
     fmtpByPayloadType: Map<number, string>;
   } | null = null;
@@ -79,35 +85,51 @@ export function selectH264Media(offerSdp: string): H264Media {
   for (const line of offerSdp.split(/\r?\n/)) {
     if (line.startsWith("m=")) {
       finishSection();
-      section = line.startsWith("m=video")
+      sawMediaSection = true;
+      const parts = line.slice(2).trim().split(/\s+/);
+      const port = parts[1]?.split("/", 1)[0];
+      section = parts[0] === "video" && port !== "0"
         ? {
             mid: null,
-            direction: "sendrecv",
+            direction: sessionDirection,
+            offeredPayloadTypes: new Set(parts.slice(3)),
             h264PayloadTypes: [],
             fmtpByPayloadType: new Map(),
           }
         : null;
       continue;
     }
+
+    const directionLine = /^a=(sendrecv|sendonly|recvonly|inactive)$/.exec(line);
+    if (!sawMediaSection && directionLine) {
+      sessionDirection = directionLine[1] as MediaDirection;
+    }
     if (!section) continue;
 
     const midLine = /^a=mid:(\S+)/.exec(line);
     if (midLine) section.mid = midLine[1]!;
 
-    const directionLine = /^a=(sendrecv|sendonly|recvonly|inactive)$/.exec(line);
     if (directionLine) section.direction = directionLine[1] as MediaDirection;
 
     const rtpmap = /^a=rtpmap:(\d+) H264\/90000/i.exec(line);
-    if (rtpmap) section.h264PayloadTypes.push(Number(rtpmap[1]));
+    if (rtpmap && section.offeredPayloadTypes.has(rtpmap[1]!)) {
+      section.h264PayloadTypes.push(Number(rtpmap[1]));
+    }
 
-    const fmtp = /^a=fmtp:(\d+) (.+)$/.exec(line);
-    if (fmtp) section.fmtpByPayloadType.set(Number(fmtp[1]), fmtp[2]!.toLowerCase());
+    const fmtp = /^a=fmtp:(\d+)\s+(.+)$/.exec(line);
+    if (fmtp && section.offeredPayloadTypes.has(fmtp[1]!)) {
+      section.fmtpByPayloadType.set(Number(fmtp[1]), fmtp[2]!.toLowerCase());
+    }
   }
   finishSection();
 
   const selected = candidates[0];
   if (!selected) {
-    throw new Error("WebRTC offer does not include H.264 packetization-mode=1 video");
+    throw new WebRtcSignalingError(
+      "WebRTC offer does not include receivable H.264 packetization-mode=1 video",
+      400,
+      "unsupported_offer",
+    );
   }
   return selected;
 }
@@ -220,14 +242,16 @@ async function loadNodeDataChannel(): Promise<NodeDataChannel> {
   try {
     return requireNativeNodeDataChannel();
   } catch (err) {
-    if (!isMissingNativeBindingError(err) || nativeRepairAttempted) throw err;
-    nativeRepairAttempted = true;
+    if (!isMissingNativeBindingError(err)) throw err;
     const packageDir = nodeDataChannelPackageDir();
-    console.warn(
-      "node-datachannel native binding is missing; attempting to download the prebuilt N-API binary...",
-    );
+    if (!nativeRepairPromise) {
+      console.warn(
+        "node-datachannel native binding is missing; attempting to download the prebuilt N-API binary...",
+      );
+      nativeRepairPromise = runPrebuildInstall(packageDir);
+    }
     try {
-      await runPrebuildInstall(packageDir);
+      await nativeRepairPromise;
       return requireNativeNodeDataChannel();
     } catch (repairErr) {
       throw new Error(
@@ -251,6 +275,8 @@ export async function createWebRtcPublisher(options: WebRtcPublisherOptions): Pr
 export class WebRtcPublisher {
   private nextPeerId = 1;
   private readonly peers = new Map<string, WebRtcPeer>();
+  private readonly cancelledSessionIds = new Set<string>();
+  private readonly cancelledSessionIdOrder: string[] = [];
   private pendingSessionId: string | null = null;
 
   constructor(
@@ -261,12 +287,19 @@ export class WebRtcPublisher {
   get activePeerCount(): number {
     let count = 0;
     for (const peer of this.peers.values()) {
-      if (!peer.closed) count++;
+      if (peer.connected) count++;
     }
     return count;
   }
 
   async handleOffer(offer: WebRtcOffer): Promise<WebRtcAnswer> {
+    if (this.cancelledSessionIds.has(offer.sessionId)) {
+      throw new WebRtcSignalingError(
+        "WebRTC session was cancelled",
+        409,
+        "webrtc_session_cancelled",
+      );
+    }
     if (this.pendingSessionId) {
       throw new WebRtcSignalingError(
         "WebRTC signaling already in progress",
@@ -278,8 +311,13 @@ export class WebRtcPublisher {
 
     let peer: WebRtcPeer | null = null;
     try {
-      const previous = this.peers.get(offer.sessionId);
-      if (previous) previous.close();
+      if (this.peers.has(offer.sessionId)) {
+        throw new WebRtcSignalingError(
+          "WebRTC session ID is already active",
+          409,
+          "webrtc_session_active",
+        );
+      }
 
       peer = new WebRtcPeer({
         id: this.nextPeerId++,
@@ -305,6 +343,7 @@ export class WebRtcPublisher {
   }
 
   closeSession(sessionId: string): void {
+    this.rememberCancelledSession(sessionId);
     this.peers.get(sessionId)?.close();
   }
 
@@ -316,11 +355,15 @@ export class WebRtcPublisher {
     }
   }
 
+  resetVideoSource(): void {
+    for (const peer of this.peers.values()) peer.resetVideoSource();
+  }
+
   snapshot() {
     return {
       peers: this.peers.size,
       activePeers: this.activePeerCount,
-      pendingSessionId: this.pendingSessionId,
+      signalingPending: this.pendingSessionId !== null,
       detail: Array.from(this.peers.values(), (peer) => peer.snapshot()),
     };
   }
@@ -328,7 +371,18 @@ export class WebRtcPublisher {
   close(): void {
     for (const peer of this.peers.values()) peer.close();
     this.peers.clear();
+    this.cancelledSessionIds.clear();
+    this.cancelledSessionIdOrder.length = 0;
     this.pendingSessionId = null;
+  }
+
+  private rememberCancelledSession(sessionId: string): void {
+    if (this.cancelledSessionIds.has(sessionId)) return;
+    this.cancelledSessionIds.add(sessionId);
+    this.cancelledSessionIdOrder.push(sessionId);
+    if (this.cancelledSessionIdOrder.length <= MAX_CANCELLED_SESSION_IDS) return;
+    const oldest = this.cancelledSessionIdOrder.shift();
+    if (oldest) this.cancelledSessionIds.delete(oldest);
   }
 }
 
@@ -337,6 +391,8 @@ class WebRtcPeer {
   readonly sessionId: string;
   readonly pc: PeerConnection;
   closed = false;
+  private isConnected = false;
+  private wasConnected = false;
   private track: Track | null = null;
   private rtpConfig: RtpPacketizationConfig | null = null;
   private packetizer: H264RtpPacketizer | null = null;
@@ -346,13 +402,19 @@ class WebRtcPeer {
   private awaitingKeyFrame = true;
   private sentFrames = 0;
   private droppedFrames = 0;
-  private lastFrameAt: string | null = null;
+  private lastFrameMs = 0;
   private lastState = "new";
   private lastIceState = "new";
   private lastError: string | null = null;
-  private readonly createdMs = Date.now();
-  private lastRtpTimestamp = 0;
+  private readonly createdMs = performance.now();
+  private lastRtpTicks = 0;
   private selectedMid: string | null = null;
+  private connectionTimer: ReturnType<typeof setTimeout> | null = null;
+  private disconnectedTimer: ReturnType<typeof setTimeout> | null = null;
+
+  get connected(): boolean {
+    return !this.closed && this.isConnected;
+  }
 
   constructor(
     private readonly params: {
@@ -380,10 +442,17 @@ class WebRtcPeer {
       this.lastState = state;
       if (state === "failed" || state === "closed") {
         this.close();
+      } else {
+        this.reconcileConnectivity();
       }
     });
     this.pc.onIceStateChange((state) => {
       this.lastIceState = state;
+      if (state === "failed" || state === "closed") {
+        this.close();
+      } else {
+        this.reconcileConnectivity();
+      }
     });
   }
 
@@ -407,11 +476,16 @@ class WebRtcPeer {
     this.nackResponder = nackResponder;
     // setRemoteDescription reciprocates the offer's recvonly video m-line and
     // emits the SendOnly track we publish on via onTrack.
-    this.pc.setRemoteDescription(offer.sdp, "offer");
+    try {
+      this.pc.setRemoteDescription(offer.sdp, "offer");
+    } catch {
+      throw new WebRtcSignalingError("Invalid WebRTC offer SDP", 400, "invalid_offer");
+    }
     const localDescription = await this.createLocalAnswer();
     await this.waitForIceGathering();
     const finalDescription = this.pc.localDescription() ?? localDescription;
     if (!finalDescription?.sdp) throw new Error("WebRTC answer was not created");
+    this.armConnectionDeadline();
     // libdatachannel omits a=ssrc for the reciprocated track; browsers then
     // silently discard RTP packets because they cannot route the SSRC.
     return {
@@ -474,16 +548,18 @@ class WebRtcPeer {
       this.awaitingKeyFrame = false;
     }
 
-    const elapsedMs = Date.now() - this.createdMs;
-    this.lastRtpTimestamp = Math.max(this.lastRtpTimestamp + 1, Math.round(elapsedMs * 90));
-    this.rtpConfig.timestamp = this.lastRtpTimestamp;
+    const elapsedMs = performance.now() - this.createdMs;
+    this.lastRtpTicks = Math.max(this.lastRtpTicks + 1, Math.round(elapsedMs * 90));
+    this.rtpConfig.timestamp = this.lastRtpTicks >>> 0;
 
     try {
       if (track.sendMessageBinary(payload)) {
         this.sentFrames++;
-        this.lastFrameAt = new Date().toISOString();
+        this.lastFrameMs = Date.now();
       } else {
         this.droppedFrames++;
+        this.awaitingKeyFrame = true;
+        this.params.onKeyframeRequest("WebRTC peer backpressure");
       }
     } catch (err) {
       this.lastError = errorMessage(err);
@@ -491,9 +567,18 @@ class WebRtcPeer {
     }
   }
 
+  resetVideoSource(): void {
+    this.awaitingKeyFrame = true;
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.connectionTimer) clearTimeout(this.connectionTimer);
+    if (this.disconnectedTimer) clearTimeout(this.disconnectedTimer);
+    this.isConnected = false;
+    this.connectionTimer = null;
+    this.disconnectedTimer = null;
     try {
       this.track?.close();
     } catch {}
@@ -508,13 +593,56 @@ class WebRtcPeer {
       id: this.id,
       state: this.lastState,
       iceState: this.lastIceState,
+      connected: this.connected,
       trackOpen: this.trackOpen,
       sentFrames: this.sentFrames,
       droppedFrames: this.droppedFrames,
       awaitingKeyFrame: this.awaitingKeyFrame,
-      lastFrameAt: this.lastFrameAt,
+      lastFrameAt: this.lastFrameMs > 0 ? new Date(this.lastFrameMs).toISOString() : null,
       lastError: this.lastError,
     };
+  }
+
+  private reconcileConnectivity(): void {
+    const connected =
+      this.lastState === "connected" &&
+      (this.lastIceState === "connected" || this.lastIceState === "completed");
+    this.isConnected = connected;
+    if (connected) {
+      this.wasConnected = true;
+      if (this.connectionTimer) clearTimeout(this.connectionTimer);
+      this.connectionTimer = null;
+      this.clearDisconnectedDeadline();
+    } else if (this.wasConnected) {
+      this.armDisconnectedDeadline();
+    }
+  }
+
+  private armConnectionDeadline(): void {
+    if (this.closed || this.isConnected || this.connectionTimer) return;
+    this.connectionTimer = setTimeout(() => {
+      this.connectionTimer = null;
+      if (this.closed || this.isConnected) return;
+      this.lastError = "WebRTC peer did not connect before deadline";
+      this.close();
+    }, CONNECTION_TIMEOUT_MS);
+    this.connectionTimer.unref?.();
+  }
+
+  private armDisconnectedDeadline(): void {
+    if (this.closed || this.disconnectedTimer) return;
+    this.disconnectedTimer = setTimeout(() => {
+      this.disconnectedTimer = null;
+      if (this.closed || this.isConnected) return;
+      this.lastError = "WebRTC peer remained disconnected";
+      this.close();
+    }, DISCONNECTED_GRACE_MS);
+    this.disconnectedTimer.unref?.();
+  }
+
+  private clearDisconnectedDeadline(): void {
+    if (this.disconnectedTimer) clearTimeout(this.disconnectedTimer);
+    this.disconnectedTimer = null;
   }
 
   private createLocalAnswer(): Promise<{ type: string; sdp: string }> {

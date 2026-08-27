@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  WebRtcSignalingBusyError,
   WebRtcSignalingTimeoutError,
   closeWebRtcSession,
   postWebRtcOffer,
@@ -39,6 +40,19 @@ describe("WebRTC browser signaling", () => {
           }),
       }),
     ).rejects.toBeInstanceOf(WebRtcSignalingTimeoutError);
+  });
+
+  test("reports exhausted signaling contention as recoverable busy state", async () => {
+    await expect(
+      postWebRtcOffer({
+        url: "https://example.test/webrtc/offer",
+        body: "{}",
+        requestTimeoutMs: 100,
+        busyRetryIntervalMs: 0,
+        busyRetryCount: 1,
+        fetchImpl: async () => new Response(null, { status: 409 }),
+      }),
+    ).rejects.toBeInstanceOf(WebRtcSignalingBusyError);
   });
 
   test("uses sendBeacon for unload-time session close when available", async () => {
