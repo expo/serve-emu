@@ -44,6 +44,7 @@ import {
   parseWebRtcOffer,
 } from "./webrtc-signaling.ts";
 import { createWebRtcPublisher, type WebRtcPublisher } from "./webrtc-publisher.ts";
+import { HttpBodyError, readBodyLimited, readJsonLimited } from "./request-body.ts";
 
 export { fromBunSocket, fromWsSocket } from "./stream-socket.ts";
 export type { StreamSocket, WsWebSocketLike } from "./stream-socket.ts";
@@ -89,7 +90,6 @@ const FRAME_META_VERSION = 1;
 const FRAME_META_HEADER_BYTES = 16;
 const FRAME_FLAG_KEY = 1 << 0;
 const VIDEO_RESET_COOLDOWN_MS = 1500;
-const STALE_VIDEO_RESET_MS = 2500;
 const MAX_JSON_BODY_BYTES = 8 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_WEBRTC_CLOSE_BODY_BYTES = 4 * 1024;
@@ -298,21 +298,22 @@ export async function createApp(opts: AppOptions) {
     (value as Record<string, unknown>).type === "reset-video";
 
   const readJsonBody = async (req: Request, maxBytes = MAX_JSON_BODY_BYTES): Promise<unknown> => {
-    const contentLength = Number(req.headers.get("content-length") ?? "0");
-    if (contentLength > maxBytes) throw new Error("request body too large");
-    return req.json();
+    return readJsonLimited(req, maxBytes);
   };
 
   const readBodyText = async (req: Request, maxBytes: number): Promise<string> => {
-    const contentLength = Number(req.headers.get("content-length") ?? "0");
-    if (contentLength > maxBytes) {
-      throw new WebRtcSignalingError("WebRTC signaling body is too large", 413, "request_too_large");
+    try {
+      const body = await readBodyLimited(req, maxBytes);
+      return new TextDecoder("utf-8", { fatal: true }).decode(body);
+    } catch (err) {
+      if (
+        err instanceof HttpBodyError &&
+        (err.code === "payload-too-large" || err.code === "too-many-body-chunks")
+      ) {
+        throw new WebRtcSignalingError("WebRTC signaling body is too large", 413, "request_too_large");
+      }
+      throw err;
     }
-    const body = Buffer.from(await req.arrayBuffer());
-    if (body.byteLength > maxBytes) {
-      throw new WebRtcSignalingError("WebRTC signaling body is too large", 413, "request_too_large");
-    }
-    return body.toString("utf8");
   };
 
   const parseJsonBody = (body: string, code: string): unknown => {
@@ -358,7 +359,7 @@ export async function createApp(opts: AppOptions) {
     return new Set(r.stdout.trim().split(/\s+/).filter(Boolean));
   };
 
-  const logcatStream = (url: URL) => {
+  const logcatStream = (req: Request, url: URL) => {
     const packageName = (url.searchParams.get("package") ?? "").trim().slice(0, MAX_LOGCAT_QUERY_BYTES);
     const search = (url.searchParams.get("search") ?? "").trim().slice(0, MAX_LOGCAT_QUERY_BYTES).toLowerCase();
     const proc = spawn("adb", ["-s", opts.serial, "logcat", "-v", "threadtime"]);
@@ -433,12 +434,10 @@ export async function createApp(opts: AppOptions) {
 
     return new Response(stream, {
       headers: {
+        ...corsHeadersForRequest(req, opts, "GET"),
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        // Allow a cross-origin client (e.g. the Expo Hub dashboard served from a
-        // different dev-server port) to consume the logcat feed via EventSource.
-        "Access-Control-Allow-Origin": "*",
       },
     });
   };
@@ -591,13 +590,6 @@ export async function createApp(opts: AppOptions) {
     requestVideoReset("client backpressure");
   };
 
-  const hasWebSocketVideoClients = () => {
-    for (const client of clients) {
-      if (client.video) return true;
-    }
-    return false;
-  };
-
   const sendFrame = (client: Client, data: Buffer, isKeyFrame: boolean) => {
     if (client.awaitingKeyFrame) {
       if (!isKeyFrame) {
@@ -655,7 +647,7 @@ export async function createApp(opts: AppOptions) {
               c.awaitingKeyFrame = true;
               sendJson(c.socket, { type: "video-session", size: { width: f.width, height: f.height } });
             }
-            requestVideoReset(`video session resized to ${f.width}×${f.height}`);
+            webRtcPublisher?.resetVideoSource();
           }
           continue;
         }
@@ -691,11 +683,6 @@ export async function createApp(opts: AppOptions) {
   watchdog = setInterval(() => {
     sourceFps = frameCount - lastFpsFrameCount;
     lastFpsFrameCount = frameCount;
-    if (status !== "streaming" || (!hasWebSocketVideoClients() && !webRtcPublisher?.activePeerCount)) return;
-    const lastFrameSeenMs = lastFrameMs || startedMs;
-    if (Date.now() - lastFrameSeenMs > STALE_VIDEO_RESET_MS) {
-      requestVideoReset("source stream stalled");
-    }
   }, 1000);
 
   session.proc.once("exit", (code, signal) => {
@@ -767,7 +754,6 @@ export async function createApp(opts: AppOptions) {
       if (!isAllowedBrowserOrigin(req, opts)) return webRtcForbiddenOrigin(req);
       if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: webRtcCorsHeaders(req) });
       if (req.method !== "POST") return new Response("method not allowed", { status: 405, headers: webRtcCorsHeaders(req) });
-      let sessionId: string | undefined;
       try {
         if (streamSettings.transport !== "webrtc" || !webRtcPublisher) {
           throw new WebRtcSignalingError(
@@ -786,7 +772,6 @@ export async function createApp(opts: AppOptions) {
         const offer = parseWebRtcOffer(
           parseJsonBody(await readBodyText(req, MAX_WEBRTC_SIGNALING_BODY_BYTES), "invalid_offer"),
         );
-        sessionId = offer.sessionId;
         const answer = await webRtcPublisher.handleOffer(offer);
         if (req.signal.aborted) {
           webRtcPublisher.closeSession(offer.sessionId);
@@ -794,7 +779,6 @@ export async function createApp(opts: AppOptions) {
         }
         return Response.json(answer, { headers: webRtcJsonHeaders(req) });
       } catch (err) {
-        if (sessionId) webRtcPublisher?.closeSession(sessionId);
         const status = err instanceof WebRtcSignalingError ? err.status : 500;
         const code = err instanceof WebRtcSignalingError ? err.code : "webrtc_offer_failed";
         return Response.json(
@@ -826,7 +810,10 @@ export async function createApp(opts: AppOptions) {
 
     if (url.pathname === "/api/logcat") {
       if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
-      return logcatStream(url);
+      if (!isAllowedBrowserOrigin(req, opts)) {
+        return Response.json({ error: "forbidden_origin" }, { status: 403 });
+      }
+      return logcatStream(req, url);
     }
 
     if (url.pathname === "/api/screenshot") {

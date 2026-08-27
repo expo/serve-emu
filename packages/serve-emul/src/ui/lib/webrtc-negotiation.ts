@@ -7,7 +7,7 @@ type SendBeaconLike = (url: string | URL, data?: BodyInit | null) => boolean;
 
 export class WebRtcSignalingBusyError extends Error {
   constructor() {
-    super("WebRTC signaling stayed busy for too long. Reload to try again.");
+    super("WebRTC signaling stayed busy for too long.");
     this.name = "WebRtcSignalingBusyError";
   }
 }
