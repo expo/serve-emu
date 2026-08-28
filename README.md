@@ -7,7 +7,7 @@ Host your Android emulator (or real device) for use with agent tools like Codex,
 https://github.com/user-attachments/assets/7dd6d57c-4270-4b13-a733-992b7085d944
 
 ```sh
-bunx serve-emu
+bunx @expo/serve-emu
 # → Preview at http://localhost:3300
 ```
 
@@ -31,7 +31,7 @@ v1. Working:
 Planned:
 
 - Multi-device routing
-- Embeddable Connect-style middleware (`serve-emu/middleware`)
+- Embeddable Connect-style middleware (`@expo/serve-emu/middleware`)
 - Compiled single binary
 
 ## Requirements
@@ -45,7 +45,7 @@ Planned:
 
 ```sh
 bun install
-bun run --filter serve-emu setup    # downloads scrcpy-server-v3.1 (90KB) into vendor/
+bun run --filter '@expo/serve-emu' setup    # downloads the pinned scrcpy server into vendor/
 bun run packages/serve-emu/src/cli.ts
 # → http://localhost:3300
 ```
