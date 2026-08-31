@@ -1,3 +1,5 @@
+<!-- Generated from ../../README.md by scripts/sync-readme.ts. Do not edit directly. -->
+
 # serve-emu
 
 Host your Android emulator or attached Android device for agent workflows like Codex, Cursor, Claude Desktop, and browser-based QA. `serve-emu` streams the screen locally, over your LAN, or through your tunnel of choice, then accepts low-latency input and device-control commands over HTTP and WebSocket.
@@ -20,7 +22,7 @@ Use `@latest` for one-off runs so Bun/npm fetches the newest published version i
 
 ## Status
 
-Current package version: see [`packages/serve-emu/package.json`](packages/serve-emu/package.json) and [`packages/serve-emu/CHANGELOG.md`](packages/serve-emu/CHANGELOG.md).
+Current package version: see [`package.json`](package.json) and [`CHANGELOG.md`](CHANGELOG.md).
 
 Working:
 
@@ -82,7 +84,7 @@ bun run packages/serve-emu/src/cli.ts
 # -> http://localhost:3300
 ```
 
-`setup` downloads the pinned `scrcpy-server-v4.0` into `packages/serve-emu/vendor/` and builds the browser UI. The CLI also runs the scrcpy setup lazily on first start, so you can skip the setup step for a quick local run.
+`setup` downloads the pinned `scrcpy-server-v4.0` into `vendor/` and builds the browser UI. The CLI also runs the scrcpy setup lazily on first start, so you can skip the setup step for a quick local run.
 
 ## CLI
 
@@ -441,7 +443,7 @@ travels directly over scrcpy's binary control channel without duplicating video
 over WebSocket. `/api` exposes the active ICE configuration to the authenticated
 UI; `/health` redacts TURN credentials.
 
-See the [protocol reference](packages/serve-emu/docs/protocol.md) for the complete scrcpy v3/v4 framing, control packet, and `SEMU` v1/v2 wire formats.
+See the [protocol reference](docs/protocol.md) for the complete scrcpy v3/v4 framing, control packet, and `SEMU` v1/v2 wire formats.
 
 ## How It Works
 
@@ -518,7 +520,7 @@ npm publish --workspace packages/serve-emu
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup, validation steps, scrcpy protocol notes, and pull request guidelines.
+See [`CONTRIBUTING.md`](https://github.com/expo/serve-emu/blob/main/CONTRIBUTING.md) for development setup, validation steps, scrcpy protocol notes, and pull request guidelines.
 
 ## License
 

@@ -22,19 +22,19 @@ jobs:
       matrix:
         include:
           - name: Complete package check
-            command: bun run --filter serve-emul check
+            command: bun run --filter serve-emu check
           - name: Unit tests
-            command: bun run --filter serve-emul test
+            command: bun run --filter serve-emu test
           - name: Critical coverage
-            command: bun run --filter serve-emul coverage
+            command: bun run --filter serve-emu coverage
           - name: Server typecheck
-            command: bun run --filter serve-emul typecheck
+            command: bun run --filter serve-emu typecheck
           - name: UI typecheck
-            command: bun run --filter serve-emul typecheck:ui
+            command: bun run --filter serve-emu typecheck:ui
           - name: Test and script typecheck
-            command: bun run --filter serve-emul typecheck:tests
+            command: bun run --filter serve-emu typecheck:tests
           - name: Production build
-            command: bun run --filter serve-emul build
+            command: bun run --filter serve-emu build
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5

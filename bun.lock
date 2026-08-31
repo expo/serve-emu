@@ -9,11 +9,11 @@
         "typescript": "^5.6.0",
       },
     },
-    "packages/serve-emul": {
-      "name": "serve-emul",
+    "packages/serve-emu": {
+      "name": "serve-emu",
       "version": "0.0.5",
       "bin": {
-        "serve-emul": "src/cli.ts",
+        "serve-emu": "src/cli.ts",
       },
       "dependencies": {
         "@fastify/busboy": "^3.2.0",
@@ -651,7 +651,7 @@
 
     "semver-truncate": ["semver-truncate@3.0.0", "", { "dependencies": { "semver": "^7.3.5" } }, "sha512-LJWA9kSvMolR51oDE6PN3kALBNaUdkxzAGcexw8gjMA8xr5zUqK0JiR3CgARSqanYF3Z1YHvsErb1KDgh+v7Rg=="],
 
-    "serve-emul": ["serve-emul@workspace:packages/serve-emul"],
+    "serve-emu": ["serve-emu@workspace:packages/serve-emu"],
 
     "shebang-command": ["shebang-command@2.0.0", "", { "dependencies": { "shebang-regex": "^3.0.0" } }, "sha512-kHxr2zZpYtdmrN1qDjrrX/Z1rR1kG8Dx+gkpK1G4eXmvXswmcE1hTWBWYUzlraYw1/yZp6YuDY77YtvbN0dmDA=="],
 
