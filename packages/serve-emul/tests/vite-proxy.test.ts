@@ -16,6 +16,7 @@ describe("createBackendProxy", () => {
     expect(createBackendProxy()).toEqual({
       "/api": { target: DEFAULT_BACKEND_ORIGIN, changeOrigin: false },
       "/health": { target: DEFAULT_BACKEND_ORIGIN, changeOrigin: false },
+      "/webrtc": { target: DEFAULT_BACKEND_ORIGIN, changeOrigin: false },
       "/ws": {
         target: "ws://localhost:3300",
         changeOrigin: false,
@@ -29,6 +30,10 @@ describe("createBackendProxy", () => {
     expect(createBackendProxy("http://127.0.0.1:4300/")).toEqual({
       "/api": { target: "http://127.0.0.1:4300", changeOrigin: false },
       "/health": { target: "http://127.0.0.1:4300", changeOrigin: false },
+      "/webrtc": {
+        target: "http://127.0.0.1:4300",
+        changeOrigin: false,
+      },
       "/ws": {
         target: "ws://127.0.0.1:4300",
         changeOrigin: false,

@@ -93,6 +93,7 @@ import { parseSessionPageQuery } from "./session-api.ts";
 import {
   SessionRecoveryWatchdog,
   SYSTEM_RECOVERY_WATCHDOG_CLOCK,
+  type RecoveryClientState,
   type RecoveryWatchdogClock,
 } from "./session-recovery-watchdog.ts";
 import {
@@ -107,6 +108,22 @@ import {
   type UploadContext,
   type UploadManagerOptions,
 } from "./upload-manager.ts";
+import {
+  DEFAULT_STREAM_SETTINGS,
+  redactedStreamSettings,
+  type StreamSettings,
+} from "./stream-settings.ts";
+import {
+  MAX_WEBRTC_SIGNALING_BODY_BYTES,
+  WebRtcSignalingError,
+  parseWebRtcCloseRequest,
+  parseWebRtcOffer,
+} from "./webrtc-signaling.ts";
+import {
+  createWebRtcPublisher,
+  type WebRtcPublisher,
+  type WebRtcPublisherOptions,
+} from "./webrtc-publisher.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -133,6 +150,8 @@ export type ServerOpts = {
   maxActiveUploads?: number;
   maxQueuedUploads?: number;
   uploadQueueTimeoutMs?: number;
+  /** Video transport exposed by the browser UI. Defaults to WebSocket/WebCodecs. */
+  streamSettings?: StreamSettings;
 };
 
 export const DEFAULT_HOST = "127.0.0.1";
@@ -190,6 +209,7 @@ type DeviceGridResponse = {
 type WsData = {
   id: number;
   frameMeta: boolean;
+  video: boolean;
   context: DeviceContext;
   handle?: Client;
 };
@@ -199,6 +219,7 @@ type Client = {
   ws: ServerWebSocket<WsData>;
   context: DeviceContext;
   frameMeta: boolean;
+  video: boolean;
   sentFrames: number;
   droppedFrames: number;
   backpressureEvents: number;
@@ -208,6 +229,17 @@ type Client = {
 };
 
 type DeviceContext = ActiveDeviceSession<Client>;
+
+type WebRtcPublisherLike = Pick<
+  WebRtcPublisher,
+  | "activePeerCount"
+  | "handleOffer"
+  | "closeSession"
+  | "sendFrame"
+  | "resetVideoSource"
+  | "snapshot"
+  | "close"
+>;
 
 const MAX_WS_MESSAGE_BYTES = 16 * 1024;
 const DROP_FRAME_BUFFERED_BYTES = 512 * 1024;
@@ -219,6 +251,7 @@ const AWAITING_KEYFRAME_RESET_MS = 2500;
 const MAX_JSON_BODY_BYTES = 8 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_LOGCAT_QUERY_BYTES = 200;
+const MAX_WEBRTC_CLOSE_BODY_BYTES = 4 * 1024;
 
 export type ServerDependencies = {
   openScrcpy?: (
@@ -250,6 +283,9 @@ export type ServerDependencies = {
   stageMultipartUpload?: typeof stageMultipartUpload;
   installApk?: typeof installApk;
   importMediaFile?: typeof importMediaFile;
+  createWebRtcPublisher?: (
+    options: WebRtcPublisherOptions,
+  ) => Promise<WebRtcPublisherLike>;
 };
 
 function serverLimit(
@@ -307,6 +343,8 @@ export async function startServer(
     dependencies.stageMultipartUpload ?? stageMultipartUpload;
   const installStagedApk = dependencies.installApk ?? installApk;
   const importStagedMedia = dependencies.importMediaFile ?? importMediaFile;
+  const openWebRtcPublisher =
+    dependencies.createWebRtcPublisher ?? createWebRtcPublisher;
   const maxApkUploadBytes = serverLimit(
     opts.maxApkUploadBytes,
     DEFAULT_MAX_APK_UPLOAD_BYTES,
@@ -364,6 +402,7 @@ export async function startServer(
 
   const host = opts.host ?? DEFAULT_HOST;
   const authToken = opts.token && opts.token.length > 0 ? opts.token : null;
+  const streamSettings = opts.streamSettings ?? DEFAULT_STREAM_SETTINGS;
 
   /** Token presented by the request, from bearer header, cookie, or query. */
   const presentedToken = (req: Request, url: URL): string | null => {
@@ -404,6 +443,14 @@ export async function startServer(
     generation: number,
     scrcpy: ScrcpySession,
   ): DeviceContext => {
+    if (
+      streamSettings.transport === "webrtc" &&
+      scrcpy.meta.codecId !== streamSettings.codec
+    ) {
+      throw new Error(
+        `WebRTC requires ${streamSettings.codec.toUpperCase()} video, but scrcpy negotiated ${scrcpy.meta.codecId}`,
+      );
+    }
     const context = new ActiveDeviceSession<Client>({
       serial,
       generation,
@@ -437,7 +484,16 @@ export async function startServer(
   const sessions = new DeviceSessionManager(initialContext);
   const recoveries = new WeakMap<
     DeviceContext,
-    SessionRecoveryWatchdog<Client>
+    SessionRecoveryWatchdog<RecoveryClientState>
+  >();
+  const publishers = new WeakMap<DeviceContext, WebRtcPublisherLike>();
+  const publisherTasks = new WeakMap<
+    DeviceContext,
+    Promise<WebRtcPublisherLike>
+  >();
+  const webRtcRecoveryStates = new WeakMap<
+    DeviceContext,
+    RecoveryClientState
   >();
   const responseMetrics = new JsonResponseTracker(
     ["health", "sessionPage", "sessionExport"] as const,
@@ -462,11 +518,16 @@ export async function startServer(
     ok: context.status === "streaming",
     status: context.status,
     generation: context.generation,
+    sessionGeneration: context.generation,
     serial: context.serial,
     device: context.scrcpy.meta.deviceName,
     codec: context.scrcpy.meta.codecId,
     size: { width: context.screen.width, height: context.screen.height },
     clients: context.clients.size,
+    videoClients: Array.from(context.clients).filter((client) => client.video)
+      .length,
+    stream: redactedStreamSettings(streamSettings),
+    webrtc: publishers.get(context)?.snapshot() ?? null,
     frames: context.frameCount,
     sourceFps: recoverySnapshot.sourceFps,
     sourceFrameAgeMs: recoverySnapshot.sourceFrameAgeMs,
@@ -495,6 +556,7 @@ export async function startServer(
     clientsDetail: Array.from(context.clients, (client) => ({
       id: client.id,
       frameMeta: client.frameMeta,
+      video: client.video,
       sentFrames: client.sentFrames,
       droppedFrames: client.droppedFrames,
       backpressureEvents: client.backpressureEvents,
@@ -674,6 +736,9 @@ export async function startServer(
     let status = fallbackStatus;
     let code: string | undefined;
     if (err instanceof HttpBodyError) {
+      status = err.status;
+      code = err.code;
+    } else if (err instanceof WebRtcSignalingError) {
       status = err.status;
       code = err.code;
     } else if (err instanceof MultipartUploadError) {
@@ -1075,10 +1140,71 @@ export async function startServer(
     }
   };
 
-  const createRecovery = (context: DeviceContext) =>
-    new SessionRecoveryWatchdog<Client>({
+  const publisherFor = (
+    context: DeviceContext,
+  ): Promise<WebRtcPublisherLike> => {
+    if (streamSettings.transport !== "webrtc") {
+      return Promise.reject(
+        new WebRtcSignalingError(
+          "WebRTC streaming is not enabled",
+          404,
+          "webrtc_disabled",
+        ),
+      );
+    }
+    const publisher = publishers.get(context);
+    if (publisher) return Promise.resolve(publisher);
+    const pending = publisherTasks.get(context);
+    if (pending) return pending;
+
+    const task = openWebRtcPublisher({
+      settings: streamSettings,
+      onKeyframeRequest: (reason) => {
+        const recovery = recoveries.get(context);
+        const webRtcState = webRtcRecoveryStates.get(context);
+        if (recovery && webRtcState) {
+          recovery.markAwaiting(webRtcState);
+          recovery.requestVideoReset(reason);
+          return;
+        }
+        void requestVideoReset(context, reason).catch(() => {});
+      },
+    })
+      .then((created) => {
+        try {
+          sessions.assertCurrent(context);
+        } catch (error) {
+          created.close();
+          throw error;
+        }
+        publishers.set(context, created);
+        context.registerCleanup(() => created.close());
+        return created;
+      })
+      .finally(() => {
+        publisherTasks.delete(context);
+      });
+    publisherTasks.set(context, task);
+    return task;
+  };
+
+  const createRecovery = (context: DeviceContext) => {
+    const webRtcState: RecoveryClientState = {
+      awaitingKeyFrame: false,
+      awaitingKeyFrameSinceMs: null,
+      lastKeyFrameRequestMs: null,
+    };
+    webRtcRecoveryStates.set(context, webRtcState);
+    return new SessionRecoveryWatchdog<RecoveryClientState>({
       clock: recoveryClock,
-      clients: () => context.clients,
+      clients: function* () {
+        for (const client of context.clients) {
+          if (client.video) yield client;
+        }
+        if ((publishers.get(context)?.activePeerCount ?? 0) > 0) {
+          yield webRtcState;
+        }
+      },
       startedMs: recoveryClock.now(),
       intervalMs: 1_000,
       sessionResetCooldownMs: VIDEO_RESET_COOLDOWN_MS,
@@ -1105,6 +1231,7 @@ export async function startServer(
         }
       },
     });
+  };
 
   const dropUntilKeyFrame = (client: Client) => {
     client.droppedFrames++;
@@ -1175,7 +1302,11 @@ export async function startServer(
               context.screen.width = f.width;
               context.screen.height = f.height;
               context.cachedConfig = null;
+              publishers.get(context)?.resetVideoSource();
+              const webRtcState = webRtcRecoveryStates.get(context);
+              if (webRtcState) recoveries.get(context)?.markAwaiting(webRtcState);
               for (const c of context.clients) {
+                if (!c.video) continue;
                 recoveries.get(context)?.markAwaiting(c);
                 sendJson(c.ws, {
                   type: "video-session",
@@ -1197,9 +1328,23 @@ export async function startServer(
           recoveries.get(context)?.recordFrame();
           context.frameStats.record(f.data.length, f.isKey);
           const config = f.isKey ? context.cachedConfig : null;
+          const webRtcDelivery = publishers
+            .get(context)
+            ?.sendFrame(f, config);
+          if (
+            f.isKey &&
+            webRtcDelivery?.accepted &&
+            !webRtcDelivery.awaitingKeyFrame
+          ) {
+            const webRtcState = webRtcRecoveryStates.get(context);
+            if (webRtcState) {
+              recoveries.get(context)?.keyFrameAccepted(webRtcState);
+            }
+          }
           let rawOut: Buffer | null = null;
           let framedOut: Buffer | null = null;
           for (const c of context.clients) {
+            if (!c.video) continue;
             if (c.awaitingKeyFrame && !f.isKey) {
               c.droppedFrames++;
               context.totalDroppedFrames++;
@@ -1399,18 +1544,81 @@ export async function startServer(
       }
 
       if (url.pathname === "/api") {
-        return Response.json({
-          generation: requestContext.generation,
-          serial: requestContext.serial,
-          device: requestContext.scrcpy.meta.deviceName,
-          codec: requestContext.scrcpy.meta.codecId,
-          size: {
-            width: requestContext.screen.width,
-            height: requestContext.screen.height,
+        return Response.json(
+          {
+            generation: requestContext.generation,
+            serial: requestContext.serial,
+            device: requestContext.scrcpy.meta.deviceName,
+            codec: requestContext.scrcpy.meta.codecId,
+            size: {
+              width: requestContext.screen.width,
+              height: requestContext.screen.height,
+            },
+            status: requestContext.status,
+            clients: requestContext.clients.size,
+            stream: streamSettings,
           },
-          status: requestContext.status,
-          clients: requestContext.clients.size,
-        });
+          { headers: { "Cache-Control": "no-store" } },
+        );
+      }
+
+      if (url.pathname === "/webrtc/offer") {
+        if (req.method !== "POST") {
+          return new Response("method not allowed", { status: 405 });
+        }
+        try {
+          const offer = parseWebRtcOffer(
+            await readJsonLimited(
+              req,
+              MAX_WEBRTC_SIGNALING_BODY_BYTES,
+              requestContext.signal,
+            ),
+          );
+          sessions.assertCurrent(requestContext);
+          const publisher = await publisherFor(requestContext);
+          sessions.assertCurrent(requestContext);
+          const recovery = recoveries.get(requestContext);
+          const webRtcState = webRtcRecoveryStates.get(requestContext);
+          if (webRtcState) recovery?.markAwaiting(webRtcState);
+          const answer = await publisher.handleOffer(offer);
+          if (req.signal.aborted) {
+            publisher.closeSession(offer.sessionId);
+            return Response.json(
+              {
+                ok: false,
+                code: "request_aborted",
+                error: "WebRTC offer request was aborted",
+              },
+              { status: 499 },
+            );
+          }
+          sessions.assertCurrent(requestContext);
+          return Response.json(answer);
+        } catch (error) {
+          return errorResponse(error);
+        }
+      }
+
+      if (url.pathname === "/webrtc/close") {
+        if (req.method !== "POST") {
+          return new Response("method not allowed", { status: 405 });
+        }
+        try {
+          const payload = parseWebRtcCloseRequest(
+            await readJsonLimited(
+              req,
+              MAX_WEBRTC_CLOSE_BODY_BYTES,
+              requestContext.signal,
+            ),
+          );
+          sessions.assertCurrent(requestContext);
+          const publisher = await publisherFor(requestContext);
+          sessions.assertCurrent(requestContext);
+          publisher.closeSession(payload.sessionId);
+          return Response.json({ ok: true });
+        } catch (error) {
+          return errorResponse(error);
+        }
       }
 
       if (url.pathname === "/api/devices") {
@@ -2120,8 +2328,14 @@ export async function startServer(
           });
         }
         const frameMeta = url.searchParams.get("frame-meta") === "1";
+        const video = url.searchParams.get("video") !== "0";
         const ok = srv.upgrade(req, {
-          data: { id: nextId++, frameMeta, context: requestContext },
+          data: {
+            id: nextId++,
+            frameMeta,
+            video,
+            context: requestContext,
+          },
         });
         if (ok) return undefined as unknown as Response;
         return new Response("upgrade failed", { status: 400 });
@@ -2152,6 +2366,7 @@ export async function startServer(
           ws,
           context,
           frameMeta: ws.data.frameMeta,
+          video: ws.data.video,
           sentFrames: 0,
           droppedFrames: 0,
           backpressureEvents: 0,
@@ -2161,9 +2376,11 @@ export async function startServer(
         };
         context.clients.add(handle);
         ws.data.handle = handle;
-        const recovery = recoveries.get(context);
-        recovery?.markAwaiting(handle);
-        recovery?.requestVideoReset("client opened");
+        if (handle.video) {
+          const recovery = recoveries.get(context);
+          recovery?.markAwaiting(handle);
+          recovery?.requestVideoReset("client opened");
+        }
       },
       message(ws, raw) {
         const context = ws.data.context;

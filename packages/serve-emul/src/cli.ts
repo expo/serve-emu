@@ -14,6 +14,13 @@ import {
   startServer,
 } from "./server.ts";
 import { getUpdateNotice } from "./update-check.ts";
+import {
+  DEFAULT_WEBRTC_ICE_SERVERS,
+  parseIceUrlList,
+  type StreamSettings,
+  type WebRtcIceServer,
+  type WebRtcIceTransportPolicy,
+} from "./stream-settings.ts";
 import packageJson from "../package.json";
 
 const argv = Bun.argv.slice(2);
@@ -30,6 +37,12 @@ const { values } = parseArgs({
     "max-size": { type: "string", default: String(SCRCPY_DEFAULTS.maxSize) },
     "key-frame-interval": { type: "string", default: String(SCRCPY_DEFAULTS.keyFrameInterval) },
     "repeat-frame-ms": { type: "string", default: String(SCRCPY_DEFAULTS.repeatFrameMs) },
+    transport: { type: "string", default: "websocket" },
+    "stun-url": { type: "string" },
+    "turn-url": { type: "string" },
+    "turn-username": { type: "string" },
+    "turn-credential": { type: "string" },
+    "webrtc-ice-policy": { type: "string", default: "all" },
     "max-apk-upload-bytes": { type: "string", default: String(DEFAULT_MAX_APK_UPLOAD_BYTES) },
     "max-media-upload-bytes": { type: "string", default: String(DEFAULT_MAX_MEDIA_UPLOAD_BYTES) },
     "max-active-uploads": { type: "string", default: String(DEFAULT_MAX_ACTIVE_UPLOADS) },
@@ -55,6 +68,83 @@ function numberOption(name: string, fallback: number): number {
   return n;
 }
 
+function stringOption(name: string): string | undefined {
+  const value = values[name as keyof typeof values];
+  return typeof value === "string" ? value : undefined;
+}
+
+function optionProvided(name: string): boolean {
+  return argv.some(
+    (arg) => arg === `--${name}` || arg.startsWith(`--${name}=`),
+  );
+}
+
+function streamSettingsFromOptions(): StreamSettings {
+  const transport = stringOption("transport") ?? "websocket";
+  if (transport !== "websocket" && transport !== "webrtc") {
+    throw new Error("--transport must be one of: websocket, webrtc.");
+  }
+
+  const webRtcOptionNames = [
+    "stun-url",
+    "turn-url",
+    "turn-username",
+    "turn-credential",
+    "webrtc-ice-policy",
+  ];
+  if (transport !== "webrtc" && webRtcOptionNames.some(optionProvided)) {
+    throw new Error("WebRTC options require --transport webrtc.");
+  }
+  if (transport === "websocket") return { transport };
+
+  const iceTransportPolicy = stringOption("webrtc-ice-policy") ?? "all";
+  if (iceTransportPolicy !== "all" && iceTransportPolicy !== "relay") {
+    throw new Error("--webrtc-ice-policy must be one of: all, relay.");
+  }
+
+  const stunUrl = stringOption("stun-url");
+  const turnUrl = stringOption("turn-url");
+  const turnUsername = stringOption("turn-username");
+  const turnCredential = stringOption("turn-credential");
+  if (
+    (turnUsername !== undefined || turnCredential !== undefined) &&
+    turnUrl === undefined
+  ) {
+    throw new Error(
+      "--turn-username and --turn-credential require --turn-url.",
+    );
+  }
+  if (turnUrl !== undefined && (!turnUsername || !turnCredential)) {
+    throw new Error(
+      "--turn-url requires both --turn-username and --turn-credential.",
+    );
+  }
+  if (iceTransportPolicy === "relay" && turnUrl === undefined) {
+    throw new Error("--webrtc-ice-policy relay requires --turn-url.");
+  }
+
+  const iceServers: WebRtcIceServer[] = stunUrl
+    ? [{ urls: parseIceUrlList(stunUrl, "stun") }]
+    : DEFAULT_WEBRTC_ICE_SERVERS.map((server) => ({
+        ...server,
+        urls: [...server.urls],
+      }));
+  if (turnUrl) {
+    iceServers.push({
+      urls: parseIceUrlList(turnUrl, "turn"),
+      username: turnUsername,
+      credential: turnCredential,
+    });
+  }
+
+  return {
+    transport,
+    codec: "h264",
+    iceServers,
+    iceTransportPolicy: iceTransportPolicy as WebRtcIceTransportPolicy,
+  };
+}
+
 function isLoopbackHost(host: string): boolean {
   const h = host.toLowerCase();
   return h === "localhost" || h === "::1" || h === "[::1]" || h.startsWith("127.");
@@ -78,10 +168,11 @@ async function checkForUpdate() {
 }
 
 if (values.help) {
-  console.log(`serve-emul — host an Android device over scrcpy + WebSocket
+  console.log(`serve-emul — host an Android device over scrcpy + WebSocket/WebRTC
 
 Usage:
   serve-emul [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms]
+  serve-emul --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
   serve-emul --avd <name> [--restart-avd]
   serve-emul --avd-list
   serve-emul --running-avds
@@ -115,6 +206,18 @@ Options:
                          screen change, so static screens keep producing frames
                          (16 ≈ steady 60fps at the cost of extra CPU/bandwidth;
                          0 keeps the encoder default of one repeat per 100ms)
+      --transport <websocket|webrtc>
+                         Browser video transport (default: websocket)
+      --stun-url <url[,url...]>
+                         STUN URL(s); omitted = default public STUN servers
+      --turn-url <url[,url...]>
+                         TURN URL(s) for WebRTC ICE
+      --turn-username <value>
+                         TURN username for --turn-url
+      --turn-credential <value>
+                         TURN credential for --turn-url
+      --webrtc-ice-policy <all|relay>
+                         Browser/native ICE policy (default: all)
       --max-apk-upload-bytes <n>    Maximum streamed APK bytes (default: ${DEFAULT_MAX_APK_UPLOAD_BYTES})
       --max-media-upload-bytes <n>  Maximum streamed media bytes (default: ${DEFAULT_MAX_MEDIA_UPLOAD_BYTES})
       --max-active-uploads <n>      Concurrent uploads (default: ${DEFAULT_MAX_ACTIVE_UPLOADS})
@@ -174,6 +277,7 @@ async function main() {
   const maxSize = numberOption("max-size", SCRCPY_DEFAULTS.maxSize);
   const keyFrameInterval = numberOption("key-frame-interval", SCRCPY_DEFAULTS.keyFrameInterval);
   const repeatFrameMs = numberOption("repeat-frame-ms", SCRCPY_DEFAULTS.repeatFrameMs);
+  const streamSettings = streamSettingsFromOptions();
   const maxApkUploadBytes = numberOption("max-apk-upload-bytes", DEFAULT_MAX_APK_UPLOAD_BYTES);
   const maxMediaUploadBytes = numberOption("max-media-upload-bytes", DEFAULT_MAX_MEDIA_UPLOAD_BYTES);
   const maxActiveUploads = numberOption("max-active-uploads", DEFAULT_MAX_ACTIVE_UPLOADS);
@@ -239,6 +343,7 @@ async function main() {
     maxSize,
     keyFrameInterval,
     repeatFrameMs,
+    streamSettings,
     maxApkUploadBytes,
     maxMediaUploadBytes,
     maxActiveUploads,

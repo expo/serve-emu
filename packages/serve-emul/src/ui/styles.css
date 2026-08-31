@@ -852,7 +852,8 @@ input[type="checkbox"] {
     max-height: none;
     justify-self: center;
   }
-  canvas {
+  canvas,
+  .stream-video {
     max-width: 100%;
     max-height: 60vh;
   }

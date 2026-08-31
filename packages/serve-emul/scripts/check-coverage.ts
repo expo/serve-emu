@@ -8,7 +8,11 @@ const CRITICAL_SOURCE_FILES = [
   "src/input.ts",
   "src/route-playback.ts",
   "src/session-recorder.ts",
+  "src/stream-settings.ts",
+  "src/webrtc-publisher.ts",
+  "src/webrtc-signaling.ts",
   "src/ui/lib/poller.ts",
+  "src/ui/lib/webrtc-negotiation.ts",
   "src/ui/lib/stream-state.ts",
 ] as const;
 

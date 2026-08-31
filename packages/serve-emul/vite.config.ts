@@ -6,7 +6,10 @@ import react from "@vitejs/plugin-react";
 export const DEFAULT_BACKEND_ORIGIN = "http://localhost:3300";
 export const DEFAULT_UI_PORT = 5173;
 
-type BackendProxy = Record<"/api" | "/health" | "/ws", ProxyOptions>;
+type BackendProxy = Record<
+  "/api" | "/health" | "/webrtc" | "/ws",
+  ProxyOptions
+>;
 
 function parseBackendOrigin(value: string | undefined): URL {
   const configuredOrigin =
@@ -45,6 +48,7 @@ export function createBackendProxy(backendOrigin?: string): BackendProxy {
   return {
     "/api": { target: httpTarget, changeOrigin: false },
     "/health": { target: httpTarget, changeOrigin: false },
+    "/webrtc": { target: httpTarget, changeOrigin: false },
     "/ws": {
       target: wsTarget.origin,
       changeOrigin: false,

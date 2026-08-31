@@ -3,7 +3,7 @@ import {
   WebRtcSignalingError,
   parseWebRtcCloseRequest,
   parseWebRtcOffer,
-} from "../webrtc-signaling.ts";
+} from "../src/webrtc-signaling.ts";
 
 const SESSION_ID = "00000000-0000-4000-8000-000000000000";
 
@@ -40,7 +40,7 @@ describe("WebRTC signaling validation", () => {
         sessionId: SESSION_ID,
         iceServers: [{ urls: ["turn:turn.example:3478"] }],
       }),
-    ).toThrow("ICE servers must be configured by the serve-emu host");
+    ).toThrow("ICE servers must be configured by the serve-emul host");
   });
 
   test("requires valid UUID session IDs", () => {

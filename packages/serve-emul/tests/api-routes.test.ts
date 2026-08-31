@@ -142,12 +142,14 @@ function fakeDependencies(
 ): ApiDependencies {
   const dependencies: ApiDependencies = {
     getInfo: () => ({
+      generation: 0,
       serial: "emulator-5554",
       device: "Fake device",
       codec: "h264",
       size: { width: 1080, height: 1920 },
       status: "streaming",
       clients: 0,
+      stream: { transport: "websocket" },
     }),
     listDevices: async () => ({
       ok: true,

@@ -3,7 +3,7 @@ import { createConnection, type Socket } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { SCRCPY_VERSION, ensureScrcpyServer } from "../scripts/fetch-scrcpy.ts";
+import { SCRCPY_VERSION, ensureScrcpyServer } from "./scrcpy-server.ts";
 import { execText } from "./exec.ts";
 
 // Canonical scrcpy wire layouts and upgrade checklist: ../docs/protocol.md
@@ -130,7 +130,7 @@ export const SCRCPY_DEFAULTS = {
   repeatFrameMs: 0,
 } as const;
 
-type VideoFrame = {
+export type VideoFrame = {
   type: "frame";
   data: Buffer;
   pts: bigint;
@@ -1098,7 +1098,7 @@ export async function startScrcpy(
       });
     });
     // Drain routine device-server output without forwarding it to the CLI.
-    proc.stdout?.resume();
+    if (typeof proc.stdout?.resume === "function") proc.stdout.resume();
     proc.stderr?.on("data", (b: Buffer) => {
       stderrTail = `${stderrTail}${b.toString("utf8")}`.slice(-8_192);
     });

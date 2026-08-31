@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type nodeDataChannel from "node-datachannel";
-import { injectVideoSsrc, selectH264Media, WebRtcPublisher } from "../webrtc-publisher.ts";
-import { WebRtcSignalingError } from "../webrtc-signaling.ts";
+import { injectVideoSsrc, selectH264Media, WebRtcPublisher } from "../src/webrtc-publisher.ts";
+import { WebRtcSignalingError } from "../src/webrtc-signaling.ts";
 
 const OFFER_SDP = [
   "v=0",
@@ -235,7 +235,7 @@ describe("WebRTC publisher SDP helpers", () => {
         "a=mid:audio0",
         "m=video 9 UDP/TLS/RTP/SAVPF 109",
         "a=mid:video0",
-        "a=ssrc:1234 cname:serve-emu",
+        "a=ssrc:1234 cname:serve-emul",
         "a=sendonly",
       ].join("\r\n"),
     );
@@ -254,7 +254,7 @@ describe("WebRTC publisher SDP helpers", () => {
         "v=0",
         "m=video 9 UDP/TLS/RTP/SAVPF 109",
         "a=mid:video0",
-        "a=ssrc:1234 cname:serve-emu",
+        "a=ssrc:1234 cname:serve-emul",
         "a=ssrc:9999 cname:old",
       ].join("\n"),
     );
@@ -265,7 +265,7 @@ describe("WebRTC publisher SDP helpers", () => {
       "v=0",
       "m=video 9 UDP/TLS/RTP/SAVPF 109",
       "a=mid:video0",
-      "a=ssrc:1234 cname:serve-emu",
+      "a=ssrc:1234 cname:serve-emul",
     ].join("\r\n");
 
     expect(injectVideoSsrc(answer, "video0", 1234)).toBe(answer);
@@ -414,20 +414,80 @@ describe("WebRTC publisher signaling", () => {
       isKey,
     });
 
-    publisher.sendFrame(frame(false), null);
-    publisher.sendFrame(frame(true), null);
-    publisher.sendFrame(frame(false), null);
-    publisher.sendFrame(frame(true), null);
+    const deliveries = [
+      publisher.sendFrame(frame(false), null),
+      publisher.sendFrame(frame(true), null),
+      publisher.sendFrame(frame(false), null),
+      publisher.sendFrame(frame(true), null),
+    ];
     publisher.resetVideoSource();
-    publisher.sendFrame(frame(false), null);
-    publisher.sendFrame(frame(true), null);
+    deliveries.push(
+      publisher.sendFrame(frame(false), null),
+      publisher.sendFrame(frame(true), null),
+    );
 
+    expect(deliveries).toEqual([
+      { accepted: false, awaitingKeyFrame: true },
+      { accepted: false, awaitingKeyFrame: true },
+      { accepted: false, awaitingKeyFrame: true },
+      { accepted: true, awaitingKeyFrame: false },
+      { accepted: false, awaitingKeyFrame: true },
+      { accepted: true, awaitingKeyFrame: false },
+    ]);
     expect(publisher.snapshot().detail[0]).toMatchObject({
       sentFrames: 2,
       droppedFrames: 4,
       awaitingKeyFrame: false,
     });
     expect(resetReasons.filter((reason) => reason === "WebRTC peer backpressure")).toHaveLength(1);
+    publisher.close();
+  });
+
+  test("keeps aggregate recovery pending when only some peers accept a keyframe", async () => {
+    const connections: FakePeerConnection[] = [];
+    const ndc = {
+      ...fakeNodeDataChannel(),
+      PeerConnection: class extends FakePeerConnection {
+        constructor(label: string) {
+          super(label);
+          connections.push(this);
+        }
+      },
+    } as unknown as typeof nodeDataChannel;
+    const publisher = new WebRtcPublisher(ndc, {
+      settings: {
+        transport: "webrtc",
+        codec: "h264",
+        iceServers: [],
+        iceTransportPolicy: "all",
+      },
+      onKeyframeRequest() {},
+    });
+    await publisher.handleOffer({
+      type: "offer",
+      sdp: OFFER_SDP,
+      sessionId: "00000000-0000-4000-8000-000000000001",
+    });
+    await publisher.handleOffer({
+      type: "offer",
+      sdp: OFFER_SDP,
+      sessionId: "00000000-0000-4000-8000-000000000002",
+    });
+    connections[0]!.track.sendResults.push(true);
+    connections[1]!.track.sendResults.push(false);
+
+    expect(
+      publisher.sendFrame(
+        {
+          type: "frame",
+          data: Buffer.from([1]),
+          pts: 0n,
+          isConfig: false,
+          isKey: true,
+        },
+        null,
+      ),
+    ).toEqual({ accepted: true, awaitingKeyFrame: true });
     publisher.close();
   });
 

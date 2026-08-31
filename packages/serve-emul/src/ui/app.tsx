@@ -15,7 +15,12 @@ import { DevicePanel } from "./components/device-panel";
 import { DeviceStream } from "./components/device-stream";
 import { ControlBar, type HardwareKey } from "./components/control-bar";
 import { SideTools } from "./components/side-tools";
-import { useStream, type DeviceSize, type Sender } from "./lib/use-stream";
+import {
+  useStream,
+  type DeviceSize,
+  type Sender,
+  type StreamTransport,
+} from "./lib/use-stream";
 
 // Android KeyEvent meta state bits (AMETA_*).
 const AMETA_SHIFT_ON = 0x1;
@@ -52,8 +57,10 @@ const SHORTCUT_KEYCODES: Record<string, number> = {
 
 type StreamControls = {
   canvasRef: RefObject<HTMLCanvasElement>;
+  videoRef: RefObject<HTMLVideoElement>;
   send: Sender;
   deviceSize: DeviceSize | null;
+  transport: StreamTransport | null;
 };
 
 const StreamControlsContext = createContext<StreamControls | null>(null);
@@ -69,19 +76,22 @@ function useStreamControls(): StreamControls {
 
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const { state, send } = useStream(canvasRef);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const { state, send, transport } = useStream(canvasRef, videoRef);
   const deviceWidth = state.deviceSize?.width;
   const deviceHeight = state.deviceSize?.height;
   const controls = useMemo<StreamControls>(
     () => ({
       canvasRef,
+      videoRef,
       send,
+      transport,
       deviceSize:
         deviceWidth === undefined || deviceHeight === undefined
           ? null
           : { width: deviceWidth, height: deviceHeight },
     }),
-    [send, deviceWidth, deviceHeight],
+    [send, transport, deviceWidth, deviceHeight],
   );
 
   return (
@@ -95,7 +105,8 @@ export function App() {
 }
 
 const AppShell = memo(function AppShell() {
-  const { canvasRef, send, deviceSize } = useStreamControls();
+  const { canvasRef, videoRef, send, deviceSize, transport } =
+    useStreamControls();
   const keyboardProxyRef = useRef<HTMLInputElement>(null);
   const renderCountRef = useRef(0);
   renderCountRef.current += 1;
@@ -207,6 +218,8 @@ const AppShell = memo(function AppShell() {
         <div className="device">
           <DeviceStream
             canvasRef={canvasRef}
+            videoRef={videoRef}
+            transport={transport}
             send={send}
             accessibilityEnabled={accessibilityEnabled}
             accessibilityNodes={accessibilityNodes}

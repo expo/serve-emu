@@ -1,6 +1,9 @@
 {
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": [
+    "src/middleware.ts",
+    "src/stream-settings.ts",
+    "src/stream-socket.ts",
     "src/ui/lib/stream-worker.ts",
     "tests/**/*.test.ts"
   ],

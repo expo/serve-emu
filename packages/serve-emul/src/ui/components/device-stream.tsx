@@ -8,11 +8,13 @@ import {
   type LatestAnimationFrameScheduler,
   type NormalizedPoint,
 } from "../lib/accessibility-hover";
-import type { Sender } from "../lib/use-stream";
+import type { Sender, StreamTransport } from "../lib/use-stream";
 import type { AccessibilityNode } from "./accessibility-panel";
 
 type Props = {
   canvasRef: RefObject<HTMLCanvasElement>;
+  videoRef: RefObject<HTMLVideoElement>;
+  transport: StreamTransport | null;
   send: Sender;
   accessibilityNodes?: AccessibilityNode[];
   accessibilityEnabled?: boolean;
@@ -30,6 +32,8 @@ const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
 
 export function DeviceStream({
   canvasRef,
+  videoRef,
+  transport,
   send,
   accessibilityNodes = [],
   accessibilityEnabled = false,
@@ -100,23 +104,29 @@ export function DeviceStream({
   }, [accessibilityEnabled]);
 
   const pointFromClient = (clientX: number, clientY: number): Point | null => {
-    const canvas = canvasRef.current;
-    if (!canvas) return null;
-    const r = canvas.getBoundingClientRect();
+    const surface =
+      transport === "webrtc" ? videoRef.current : canvasRef.current;
+    if (!surface) return null;
+    const r = surface.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
     return {
       x: clamp01((clientX - r.left) / r.width),
       y: clamp01((clientY - r.top) / r.height),
     };
   };
 
-  const norm = (e: PointerEvent<HTMLCanvasElement>): Point | null =>
+  const norm = (
+    e: PointerEvent<HTMLCanvasElement | HTMLVideoElement>,
+  ): Point | null =>
     pointFromClient(e.clientX, e.clientY);
 
   const sendTouch = (action: "down" | "move" | "up", p: Point, pointerId: number) => {
     send({ type: "touch", action, x: p.x, y: p.y, pointerId, ack: false });
   };
 
-  const onPointerDown = (e: PointerEvent<HTMLCanvasElement>) => {
+  const onPointerDown = (
+    e: PointerEvent<HTMLCanvasElement | HTMLVideoElement>,
+  ) => {
     if (e.pointerType === "mouse" && e.button !== 0) return;
     if (activeRef.current) return;
     e.preventDefault();
@@ -125,12 +135,14 @@ export function DeviceStream({
     if (!p) return;
     pointerMoveSchedulerRef.current?.cancel();
     reportAccessibilityHover(null);
-    canvasRef.current?.setPointerCapture(e.pointerId);
+    e.currentTarget.setPointerCapture(e.pointerId);
     activeRef.current = { id: e.pointerId, ...p };
     sendTouch("down", p, e.pointerId);
   };
 
-  const onPointerMove = (e: PointerEvent<HTMLCanvasElement>) => {
+  const onPointerMove = (
+    e: PointerEvent<HTMLCanvasElement | HTMLVideoElement>,
+  ) => {
     const active = activeRef.current;
     if (active && e.pointerId !== active.id) return;
     const native = e.nativeEvent;
@@ -142,7 +154,9 @@ export function DeviceStream({
     if (point) pointerMoveSchedulerRef.current?.schedule({ point, pointerId: e.pointerId });
   };
 
-  const stopPointer = (e: PointerEvent<HTMLCanvasElement>) => {
+  const stopPointer = (
+    e: PointerEvent<HTMLCanvasElement | HTMLVideoElement>,
+  ) => {
     const active = activeRef.current;
     if (!active || e.pointerId !== active.id) return;
     e.preventDefault();
@@ -150,7 +164,7 @@ export function DeviceStream({
     const up = norm(e);
     if (up) sendTouch("up", up, active.id);
     try {
-      canvasRef.current?.releasePointerCapture(active.id);
+      e.currentTarget.releasePointerCapture(active.id);
     } catch {}
     activeRef.current = null;
   };
@@ -164,6 +178,24 @@ export function DeviceStream({
     <div className="stream-surface">
       <canvas
         ref={canvasRef}
+        className={transport === "webrtc" ? "stream-hidden" : undefined}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerLeave={onPointerLeave}
+        onPointerUp={stopPointer}
+        onPointerCancel={stopPointer}
+        onContextMenu={(e) => e.preventDefault()}
+      />
+      <video
+        ref={videoRef}
+        className={
+          transport === "webrtc"
+            ? "stream-video"
+            : "stream-video stream-hidden"
+        }
+        muted
+        playsInline
+        autoPlay
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerLeave={onPointerLeave}

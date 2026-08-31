@@ -15,11 +15,17 @@ import {
   clearAppData,
   forceStopApp,
   grantPermission,
-  importMediaFile,
-  installApk,
   launchApp,
 } from "./app-management.ts";
 import { getForegroundApp } from "./app-info.ts";
+import { loadDeviceGrid } from "./device-grid.ts";
+import {
+  listAvds,
+  listRunningAvds,
+  resolveRunningAvds,
+  startEmulator,
+  stopEmulator,
+} from "./emulator.ts";
 import { getNightMode, isNightMode, setNightMode } from "./ui-mode.ts";
 import { startScrcpy, type ScrcpySession } from "./scrcpy.ts";
 import { dispatch, parseGesture, resetVideoPacket, type Gesture, type Screen } from "./input.ts";
@@ -45,6 +51,7 @@ import {
 } from "./webrtc-signaling.ts";
 import { createWebRtcPublisher, type WebRtcPublisher } from "./webrtc-publisher.ts";
 import { HttpBodyError, readBodyLimited, readJsonLimited } from "./request-body.ts";
+import { createMiddlewareUploader } from "./middleware-upload.ts";
 
 export { fromBunSocket, fromWsSocket } from "./stream-socket.ts";
 export type { StreamSocket, WsWebSocketLike } from "./stream-socket.ts";
@@ -66,6 +73,11 @@ export type AppOptions = {
   bitRate?: number;
   maxSize?: number;
   keyFrameInterval?: number;
+  maxApkUploadBytes?: number;
+  maxMediaUploadBytes?: number;
+  maxActiveUploads?: number;
+  maxQueuedUploads?: number;
+  uploadQueueTimeoutMs?: number;
   streamSettings?: StreamSettings;
 } & BrowserOriginPolicy;
 
@@ -145,19 +157,33 @@ function serveStaticFile(pathname: string): Response | null {
 }
 
 /**
- * Build a transport-agnostic serve-emu app for one device: starts scrcpy, owns
+ * Build a transport-agnostic serve-emul app for one device: starts scrcpy, owns
  * the client set + video fan-out, and exposes a fetch-style `handleRequest` plus
  * an `attachWebSocket` for the H.264/gesture channel. `server.ts` (Bun) and the
  * Expo DevTools plugin both mount these onto their own transport.
  */
 export async function createApp(opts: AppOptions) {
-  const session: ScrcpySession = await startScrcpy({
+  const uploader = createMiddlewareUploader({
     serial: opts.serial,
-    maxFps: opts.maxFps,
-    bitRate: opts.bitRate,
-    maxSize: opts.maxSize,
-    keyFrameInterval: opts.keyFrameInterval,
+    maxApkUploadBytes: opts.maxApkUploadBytes,
+    maxMediaUploadBytes: opts.maxMediaUploadBytes,
+    maxActiveUploads: opts.maxActiveUploads,
+    maxQueuedUploads: opts.maxQueuedUploads,
+    uploadQueueTimeoutMs: opts.uploadQueueTimeoutMs,
   });
+  let session: ScrcpySession;
+  try {
+    session = await startScrcpy({
+      serial: opts.serial,
+      maxFps: opts.maxFps,
+      bitRate: opts.bitRate,
+      maxSize: opts.maxSize,
+      keyFrameInterval: opts.keyFrameInterval,
+    });
+  } catch (error) {
+    await uploader.close(error);
+    throw error;
+  }
 
   const clients = new Set<Client>();
   const screen: Screen = { width: session.meta.width, height: session.meta.height };
@@ -213,6 +239,7 @@ export async function createApp(opts: AppOptions) {
     location: lastLocation,
     route: routePlayback.snapshot(),
     session: sessionRecorder.snapshot(),
+    uploads: uploader.snapshot(),
     stream: redactedStreamSettings(streamSettings),
     webrtc: webRtcPublisher?.snapshot() ?? null,
     clientsDetail: Array.from(clients, (client) => ({
@@ -251,6 +278,7 @@ export async function createApp(opts: AppOptions) {
     pendingVideoResetReason = null;
     routePlayback.close();
     webRtcPublisher?.close();
+    void uploader.close(new Error(reason));
     session.close();
     closeClients(nextStatus === "error" ? 1011 : 1000, reason);
   };
@@ -490,7 +518,7 @@ export async function createApp(opts: AppOptions) {
       if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
         throw new Error("payload must be an object");
       }
-      const result = action(payload as Record<string, unknown>);
+      const result = await action(payload as Record<string, unknown>);
       return Response.json(result);
     } catch (err) {
       return Response.json(
@@ -500,33 +528,9 @@ export async function createApp(opts: AppOptions) {
     }
   };
 
-  const installEndpoint = async (req: Request) => {
-    try {
-      const form = await req.formData();
-      const file = form.get("apk");
-      if (!(file instanceof File)) throw new Error("multipart field apk must be a file");
-      return Response.json(await installApk(opts.serial, file));
-    } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
-    }
-  };
+  const installEndpoint = (req: Request) => uploader.install(req);
 
-  const fileImportEndpoint = async (req: Request) => {
-    try {
-      const form = await req.formData();
-      const file = form.get("file");
-      if (!(file instanceof File)) throw new Error("multipart field file must be a file");
-      return Response.json(await importMediaFile(opts.serial, file));
-    } catch (err) {
-      return Response.json(
-        { ok: false, error: err instanceof Error ? err.message : String(err) },
-        { status: 400 },
-      );
-    }
-  };
+  const fileImportEndpoint = (req: Request) => uploader.importFile(req);
 
   const performVideoReset = (reason: string) => {
     const now = Date.now();
@@ -713,6 +717,7 @@ export async function createApp(opts: AppOptions) {
     if (url.pathname === "/api") {
       return Response.json(
         {
+          generation: 0,
           serial: opts.serial,
           device: session.meta.deviceName,
           codec: session.meta.codecId,
@@ -733,7 +738,7 @@ export async function createApp(opts: AppOptions) {
         return Response.json({
           ok: true,
           currentSerial: opts.serial,
-          devices: listAllDevices().map((device) => ({
+          devices: (await listAllDevices()).map((device) => ({
             ...device,
             current: device.serial === opts.serial,
           })),
@@ -757,7 +762,7 @@ export async function createApp(opts: AppOptions) {
       try {
         if (streamSettings.transport !== "webrtc" || !webRtcPublisher) {
           throw new WebRtcSignalingError(
-            "WebRTC transport is not enabled. Start serve-emu with --transport webrtc.",
+            "WebRTC transport is not enabled. Start serve-emul with --transport webrtc.",
             400,
             "webrtc_not_enabled",
           );
@@ -821,7 +826,7 @@ export async function createApp(opts: AppOptions) {
         return new Response("method not allowed", { status: 405 });
       }
       try {
-        const png = screencapPng(opts.serial);
+        const png = await screencapPng(opts.serial);
         if (url.searchParams.get("format") === "base64") {
           return Response.json({
             ok: true,
@@ -841,7 +846,10 @@ export async function createApp(opts: AppOptions) {
     if (url.pathname === "/api/foreground") {
       if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
       try {
-        return Response.json({ ok: true, app: getForegroundApp(opts.serial) });
+        return Response.json({
+          ok: true,
+          app: await getForegroundApp(opts.serial),
+        });
       } catch (err) {
         return Response.json(
           { ok: false, error: err instanceof Error ? err.message : String(err) },
@@ -853,7 +861,7 @@ export async function createApp(opts: AppOptions) {
     if (url.pathname === "/api/accessibility") {
       if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
       try {
-        return Response.json(getAccessibilitySnapshot(opts.serial));
+        return Response.json(await getAccessibilitySnapshot(opts.serial));
       } catch (err) {
         return Response.json(
           { ok: false, error: err instanceof Error ? err.message : String(err) },
@@ -917,7 +925,10 @@ export async function createApp(opts: AppOptions) {
     if (url.pathname === "/api/orientation") {
       if (req.method === "GET") {
         try {
-          return Response.json({ ok: true, orientation: getUserRotation(opts.serial) });
+          return Response.json({
+            ok: true,
+            orientation: await getUserRotation(opts.serial),
+          });
         } catch (err) {
           return Response.json(
             { ok: false, error: err instanceof Error ? err.message : String(err) },
@@ -937,7 +948,10 @@ export async function createApp(opts: AppOptions) {
           }
           return Response.json({
             ok: true,
-            orientation: setUserRotation(opts.serial, orientation as OrientationMode),
+            orientation: await setUserRotation(
+              opts.serial,
+              orientation as OrientationMode,
+            ),
           });
         } catch (err) {
           return Response.json(
@@ -1170,6 +1184,7 @@ export async function createApp(opts: AppOptions) {
     pendingVideoResetTimer = null;
     pendingVideoResetReason = null;
     routePlayback.close();
+    void uploader.close(new Error("server stopping"));
     session.close();
   };
 
@@ -1187,6 +1202,17 @@ export type EmuApp = Awaited<ReturnType<typeof createApp>>;
 
 export type RouterDefaults = Partial<AppOptions>;
 
+export type RouterDependencies = {
+  listDevices?: typeof listDevices;
+  listAllDevices?: typeof listAllDevices;
+  listAvds?: typeof listAvds;
+  listRunningAvds?: typeof listRunningAvds;
+  resolveRunningAvds?: typeof resolveRunningAvds;
+  startEmulator?: typeof startEmulator;
+  stopEmulator?: typeof stopEmulator;
+  createApp?: (opts: AppOptions) => Promise<EmuApp>;
+};
+
 /**
  * Multi-device router. Owns a lazily-populated `Map<serial, EmuApp>` and routes
  * each request to the app for its `?device=<serial>` query (falling back to the
@@ -1195,30 +1221,58 @@ export type RouterDefaults = Partial<AppOptions>;
  * and the Expo DevTools plugin mount this onto their own transport, so the
  * device-routing logic lives here once rather than in each transport.
  */
-export function createRouter(defaults: RouterDefaults = {}) {
+export function createRouter(
+  defaults: RouterDefaults = {},
+  dependencies: RouterDependencies = {},
+) {
+  const readOnlineDevices = dependencies.listDevices ?? listDevices;
+  const readAllDevices = dependencies.listAllDevices ?? listAllDevices;
+  const readAvds = dependencies.listAvds ?? listAvds;
+  const readRunningAvds = dependencies.listRunningAvds ?? listRunningAvds;
+  const resolveAvds = dependencies.resolveRunningAvds ?? resolveRunningAvds;
+  const launchEmulator = dependencies.startEmulator ?? startEmulator;
+  const killEmulator = dependencies.stopEmulator ?? stopEmulator;
+  const createDeviceApp = dependencies.createApp ?? createApp;
   const apps = new Map<string, EmuApp>();
   const pending = new Map<string, Promise<EmuApp>>();
   const failureAt = new Map<string, number>();
+  const stoppingSerials = new Set<string>();
+  let selectedSerial = defaults.serial ?? null;
+  let selectionRevision = 0;
 
   // Resolve the serial a request targets: an explicit (connected) `?device=`,
   // else the configured default if still attached, else the first online
   // device. Throws only when *no* device is attached — multiple devices is
   // never an error (we just take the first), so the UI always opens cleanly.
-  const resolveSerial = (requested?: string | null): string => {
-    const online = listDevices();
+  const resolveSerial = async (
+    requested?: string | null,
+  ): Promise<string> => {
+    const discovered = await readOnlineDevices();
+    for (const serial of stoppingSerials) {
+      if (!discovered.some((device) => device.serial === serial)) {
+        stoppingSerials.delete(serial);
+      }
+    }
+    const online = discovered.filter(
+      (device) => !stoppingSerials.has(device.serial),
+    );
     if (requested) {
       if (!online.some((d) => d.serial === requested)) {
         throw new Error(`device ${requested} is not connected`);
       }
       return requested;
     }
-    if (defaults.serial && online.some((d) => d.serial === defaults.serial)) {
-      return defaults.serial;
+    if (
+      selectedSerial &&
+      online.some((device) => device.serial === selectedSerial)
+    ) {
+      return selectedSerial;
     }
     const first = online[0];
     if (!first) {
       throw new Error("No booted Android device found. Start an emulator or attach a device.");
     }
+    selectedSerial = first.serial;
     return first.serial;
   };
 
@@ -1237,11 +1291,11 @@ export function createRouter(defaults: RouterDefaults = {}) {
     if (inFlight) return inFlight;
     if (Date.now() - (failureAt.get(serial) ?? 0) < SPAWN_RETRY_COOLDOWN_MS) {
       return Promise.reject(
-        new Error(`serve-emu start for ${serial} is cooling down after a failure`),
+        new Error(`serve-emul start for ${serial} is cooling down after a failure`),
       );
     }
     const promise = (async () => {
-      const created = await createApp({ ...defaults, serial });
+      const created = await createDeviceApp({ ...defaults, serial });
       apps.set(serial, created);
       return created;
     })();
@@ -1258,25 +1312,67 @@ export function createRouter(defaults: RouterDefaults = {}) {
 
   // Resolve + start in one step.
   const ensure = async (requested?: string | null): Promise<{ serial: string; app: EmuApp }> => {
-    const serial = resolveSerial(requested);
+    const serial = await resolveSerial(requested);
     return { serial, app: await getApp(serial) };
   };
 
-  const devicesResponse = (): Response => {
+  const devicesResponse = async (): Promise<Response> => {
     let defaultSerial: string | null = null;
     try {
-      defaultSerial = resolveSerial(null);
+      defaultSerial = await resolveSerial(null);
     } catch {
       defaultSerial = null;
     }
     return Response.json({
       ok: true,
       defaultSerial,
-      devices: listAllDevices().map((device) => ({
+      devices: (await readAllDevices()).map((device) => ({
         ...device,
         streaming: apps.get(device.serial)?.isStreaming() ?? false,
       })),
     });
+  };
+
+  const readRouterPayload = async (req: Request): Promise<Record<string, unknown>> => {
+    const payload = await readJsonLimited(req, MAX_JSON_BODY_BYTES);
+    if (
+      typeof payload !== "object" ||
+      payload === null ||
+      Array.isArray(payload)
+    ) {
+      throw new Error("payload must be an object");
+    }
+    return payload as Record<string, unknown>;
+  };
+
+  const selectSerial = async (serial: string): Promise<EmuApp> => {
+    const revision = ++selectionRevision;
+    const resolved = await resolveSerial(serial);
+    const app = await getApp(resolved);
+    if (revision !== selectionRevision) {
+      throw new Error("device selection was superseded");
+    }
+    selectedSerial = resolved;
+    return app;
+  };
+
+  const stopApp = async (serial: string): Promise<void> => {
+    const inFlight = pending.get(serial);
+    let stoppedInFlight: EmuApp | null = null;
+    if (inFlight) {
+      stoppedInFlight = await inFlight.catch(() => null);
+      try {
+        stoppedInFlight?.stop();
+      } catch {}
+    }
+    const app = apps.get(serial);
+    if (app && app !== stoppedInFlight) {
+      try {
+        app.stop();
+      } catch {}
+    }
+    apps.delete(serial);
+    failureAt.delete(serial);
   };
 
   const handleRequest = async (req: Request): Promise<Response> => {
@@ -1286,9 +1382,133 @@ export function createRouter(defaults: RouterDefaults = {}) {
     if (url.pathname === "/api/devices") {
       if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
       try {
-        return devicesResponse();
+        return await devicesResponse();
       } catch (err) {
         return Response.json({ ok: false, error: errMsg(err) }, { status: 400 });
+      }
+    }
+
+    if (url.pathname === "/api/device-grid") {
+      if (req.method !== "GET") {
+        return new Response("method not allowed", { status: 405 });
+      }
+      let currentSerial = "";
+      try {
+        currentSerial = await resolveSerial(null);
+      } catch {}
+      const currentStatus = currentSerial
+        ? (apps.get(currentSerial)?.health().status ?? "streaming")
+        : "stopped";
+      try {
+        return Response.json(
+          await loadDeviceGrid(currentSerial, currentStatus, {
+            listAllDevices: () => readAllDevices(),
+            listAvds: () => readAvds(),
+            resolveRunningAvds: (devices) => resolveAvds(devices),
+          }),
+        );
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: errMsg(err) },
+          { status: 400 },
+        );
+      }
+    }
+
+    if (url.pathname === "/api/devices/select") {
+      if (req.method !== "POST") {
+        return new Response("method not allowed", { status: 405 });
+      }
+      try {
+        const payload = await readRouterPayload(req);
+        const serial =
+          typeof payload.serial === "string" ? payload.serial.trim() : "";
+        if (!serial) throw new Error("serial is required");
+        const app = await selectSerial(serial);
+        return Response.json({
+          ok: true,
+          serial,
+          device: app.session.meta.deviceName,
+        });
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: errMsg(err) },
+          { status: 400 },
+        );
+      }
+    }
+
+    if (url.pathname === "/api/avds/start") {
+      if (req.method !== "POST") {
+        return new Response("method not allowed", { status: 405 });
+      }
+      try {
+        const payload = await readRouterPayload(req);
+        const avd = typeof payload.avd === "string" ? payload.avd.trim() : "";
+        if (!avd) throw new Error("avd is required");
+        const launch = await launchEmulator({ avd });
+        stoppingSerials.delete(launch.serial);
+        const select = payload.select !== false;
+        if (!select) {
+          return Response.json({ ok: true, serial: launch.serial, avd });
+        }
+        try {
+          const app = await selectSerial(launch.serial);
+          return Response.json({
+            ok: true,
+            serial: launch.serial,
+            avd,
+            device: app.session.meta.deviceName,
+          });
+        } catch (err) {
+          launch.stop();
+          throw err;
+        }
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: errMsg(err) },
+          { status: 400 },
+        );
+      }
+    }
+
+    if (url.pathname === "/api/avds/stop") {
+      if (req.method !== "POST") {
+        return new Response("method not allowed", { status: 405 });
+      }
+      try {
+        const payload = await readRouterPayload(req);
+        let serial =
+          typeof payload.serial === "string" ? payload.serial.trim() : "";
+        const avd =
+          typeof payload.avd === "string" ? payload.avd.trim() : "";
+        if (!serial && avd) {
+          const running = await readRunningAvds();
+          serial =
+            running.find((candidate) => candidate.avd === avd)?.serial ?? "";
+        }
+        if (!serial) throw new Error("serial or running avd is required");
+        if (!/^emulator-\d+$/.test(serial)) {
+          throw new Error(`${serial} is not an emulator`);
+        }
+        stoppingSerials.add(serial);
+        await stopApp(serial);
+        try {
+          await killEmulator(serial);
+        } catch (err) {
+          stoppingSerials.delete(serial);
+          throw err;
+        }
+        if (selectedSerial === serial) {
+          selectionRevision++;
+          selectedSerial = null;
+        }
+        return Response.json({ ok: true, serial });
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: errMsg(err) },
+          { status: 400 },
+        );
       }
     }
 
@@ -1340,7 +1560,14 @@ export function createRouter(defaults: RouterDefaults = {}) {
     apps.clear();
   };
 
-  return { resolveSerial, getApp, ensure, handleRequest, attachWebSocket, stopAll };
+  return {
+    resolveSerial,
+    getApp,
+    ensure,
+    handleRequest,
+    attachWebSocket,
+    stopAll,
+  };
 }
 
 export type EmuRouter = ReturnType<typeof createRouter>;

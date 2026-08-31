@@ -45,6 +45,7 @@
     "remote-control",
     "h264",
     "webcodecs",
+    "webrtc",
     "bun"
   ],
   "engines": {
@@ -53,7 +54,6 @@
   "bin": {
     "serve-emul": "src/cli.ts"
   },
-  "exports": {},
   "scripts": {
     "setup": "bun run scripts/fetch-scrcpy.ts && bun run build:ui",
     "dev": "bun --watch run src/cli.ts",
@@ -101,8 +101,6 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
-    "@swc/cli": "^0.8.1",
-    "@swc/core": "^1.15.43",
     "knip": "6.26.0",
     "typescript": "^5.7.0",
     "vite": "^5.4.11"

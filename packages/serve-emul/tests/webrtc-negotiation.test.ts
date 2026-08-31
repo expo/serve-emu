@@ -4,7 +4,7 @@ import {
   WebRtcSignalingTimeoutError,
   closeWebRtcSession,
   postWebRtcOffer,
-} from "../ui/lib/webrtc-negotiation.ts";
+} from "../src/ui/lib/webrtc-negotiation.ts";
 
 describe("WebRTC browser signaling", () => {
   test("retries while the server reports serialized signaling contention", async () => {

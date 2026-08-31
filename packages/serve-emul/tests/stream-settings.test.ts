@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseIceUrlList, redactedStreamSettings } from "../stream-settings.ts";
+import { parseIceUrlList, redactedStreamSettings } from "../src/stream-settings.ts";
 
 describe("stream settings", () => {
   test("parses comma-separated STUN and TURN URLs", () => {

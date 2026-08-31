@@ -36,6 +36,12 @@ const REQUIRED_PACKAGE_FILES = [
   "LICENSE",
   "README.md",
   "dist/ui/index.html",
+  "dist/middleware.js",
+  "dist/middleware.d.ts",
+  "dist/stream-settings.js",
+  "dist/stream-settings.d.ts",
+  "dist/stream-socket.js",
+  "dist/stream-socket.d.ts",
   "package.json",
   "scripts/fetch-scrcpy.ts",
   "src/cli.ts",
@@ -154,6 +160,21 @@ async function expectImportFailure(specifier: string, consumerDirectory: string)
   invariant(result.exitCode !== 0, `Unsupported package import unexpectedly succeeded: ${specifier}`);
 }
 
+async function expectImportSuccess(
+  specifier: string,
+  exportName: string,
+  consumerDirectory: string,
+): Promise<void> {
+  await runSuccessfully(
+    [
+      bunExecutable,
+      "--eval",
+      `const mod = await import(${JSON.stringify(specifier)}); if (typeof mod[${JSON.stringify(exportName)}] === "undefined") throw new Error("missing export")`,
+    ],
+    consumerDirectory,
+  );
+}
+
 async function main(): Promise<void> {
   const temporaryRoot = await mkdtemp(join(tmpdir(), "serve-emul-package-smoke-"));
 
@@ -226,9 +247,21 @@ async function main(): Promise<void> {
     invariant(
       typeof installedManifest.exports === "object" &&
         installedManifest.exports !== null &&
-        !Array.isArray(installedManifest.exports) &&
-        Object.keys(installedManifest.exports).length === 0,
-      "Installed package does not contain the documented CLI-only export policy",
+        !Array.isArray(installedManifest.exports),
+      "Installed package does not contain an export map",
+    );
+    const exportPaths = Object.keys(
+      installedManifest.exports as Record<string, unknown>,
+    ).sort();
+    invariant(
+      JSON.stringify(exportPaths) ===
+        JSON.stringify([
+          ".",
+          "./middleware",
+          "./stream-settings",
+          "./stream-socket",
+        ]),
+      `Installed package exports are incorrect: ${exportPaths.join(", ")}`,
     );
 
     const cliResult = await runCommand(
@@ -247,7 +280,22 @@ async function main(): Promise<void> {
         .join("\n"),
     );
 
-    await expectImportFailure("serve-emul", consumerDirectory);
+    await expectImportSuccess("serve-emul", "createRouter", consumerDirectory);
+    await expectImportSuccess(
+      "serve-emul/middleware",
+      "createApp",
+      consumerDirectory,
+    );
+    await expectImportSuccess(
+      "serve-emul/stream-settings",
+      "DEFAULT_STREAM_SETTINGS",
+      consumerDirectory,
+    );
+    await expectImportSuccess(
+      "serve-emul/stream-socket",
+      "fromBunSocket",
+      consumerDirectory,
+    );
     await expectImportFailure("serve-emul/src/adb.ts", consumerDirectory);
 
     console.log(`Package smoke test passed: ${packReport.filename} (${packReport.files.length} files)`);

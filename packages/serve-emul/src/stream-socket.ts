@@ -3,7 +3,7 @@
  *
  * The streaming core in `middleware.ts` drives clients through this interface so
  * it works against both Bun's native `ServerWebSocket` (the standalone
- * `serve-emu` server) and the Node `ws` sockets that `@expo/cli` hands to a
+ * `serve-emul` server) and the Node `ws` sockets that `@expo/cli` hands to a
  * DevTools plugin's `webSocketHandlers` — without depending on either's types.
  *
  * Only what the core needs: send (binary frames + JSON acks), backpressure
@@ -66,7 +66,7 @@ export function fromBunSocket(ws: BunServerWebSocketLike): StreamSocket {
 
 /**
  * The slice of a `ws`-package socket the adapter relies on — typed structurally
- * so `serve-emu` needn't depend on `ws`. This is what `@expo/cli` passes to a
+ * so `serve-emul` needn't depend on `ws`. This is what `@expo/cli` passes to a
  * plugin's `webSocketHandlers`.
  */
 export interface WsWebSocketLike {

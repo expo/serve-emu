@@ -23,6 +23,13 @@ export type WebRtcPublisherOptions = {
   onKeyframeRequest: (reason: string) => void;
 };
 
+export type WebRtcFrameDelivery = {
+  /** At least one peer accepted this frame into its native media track. */
+  accepted: boolean;
+  /** At least one live peer still needs a keyframe after this delivery. */
+  awaitingKeyFrame: boolean;
+};
+
 type H264Media = { payloadType: number; mid: string };
 
 const requireModule = createRequire(import.meta.url);
@@ -162,7 +169,7 @@ export function injectVideoSsrc(sdp: string, mid: string, ssrc: number): string 
   }
   const ssrcPrefix = `a=ssrc:${ssrc} `;
   if (lines.slice(section.start, section.end).some((line) => line.startsWith(ssrcPrefix))) return sdp;
-  lines.splice(section.midIndex + 1, 0, `a=ssrc:${ssrc} cname:serve-emu`);
+  lines.splice(section.midIndex + 1, 0, `a=ssrc:${ssrc} cname:serve-emul`);
   return lines.join(eol);
 }
 
@@ -347,12 +354,21 @@ export class WebRtcPublisher {
     this.peers.get(sessionId)?.close();
   }
 
-  sendFrame(frame: VideoFrame, config: Buffer | null): void {
-    if (this.peers.size === 0) return;
-    const payload = frame.isKey && config ? Buffer.concat([config, frame.data]) : frame.data;
-    for (const peer of this.peers.values()) {
-      peer.sendFrame(payload, frame.isKey);
+  sendFrame(frame: VideoFrame, config: Buffer | null): WebRtcFrameDelivery {
+    if (this.peers.size === 0) {
+      return { accepted: false, awaitingKeyFrame: false };
     }
+    const payload = frame.isKey && config ? Buffer.concat([config, frame.data]) : frame.data;
+    let accepted = false;
+    for (const peer of this.peers.values()) {
+      if (peer.sendFrame(payload, frame.isKey)) accepted = true;
+    }
+    return {
+      accepted,
+      awaitingKeyFrame: Array.from(this.peers.values()).some(
+        (peer) => peer.needsKeyFrame,
+      ),
+    };
   }
 
   resetVideoSource(): void {
@@ -416,6 +432,10 @@ class WebRtcPeer {
     return !this.closed && this.isConnected;
   }
 
+  get needsKeyFrame(): boolean {
+    return !this.closed && this.awaitingKeyFrame;
+  }
+
   constructor(
     private readonly params: {
       id: number;
@@ -430,7 +450,7 @@ class WebRtcPeer {
     this.sessionId = params.sessionId;
     // The browser is always the offerer. Local auto-negotiation can otherwise
     // wedge the peer in have-local-offer before the browser offer is applied.
-    this.pc = new params.ndc.PeerConnection(`serve-emu-${params.id}`, {
+    this.pc = new params.ndc.PeerConnection(`serve-emul-${params.id}`, {
       iceServers: iceUrlsForNodeDataChannel(params.settings.iceServers),
       iceTransportPolicy: params.settings.iceTransportPolicy,
       forceMediaTransport: true,
@@ -462,7 +482,7 @@ class WebRtcPeer {
     const ssrc = randomSsrc();
     this.rtpConfig = new this.params.ndc.RtpPacketizationConfig(
       ssrc,
-      "serve-emu",
+      "serve-emul",
       payloadType,
       RTP_CLOCK_RATE,
     );
@@ -537,13 +557,21 @@ class WebRtcPeer {
     });
   }
 
-  sendFrame(payload: Buffer, isKeyFrame: boolean): void {
+  sendFrame(payload: Buffer, isKeyFrame: boolean): boolean {
     const track = this.track;
-    if (this.closed || !track || !this.rtpConfig || !this.trackOpen || !track.isOpen()) return;
+    if (
+      this.closed ||
+      !track ||
+      !this.rtpConfig ||
+      !this.trackOpen ||
+      !track.isOpen()
+    ) {
+      return false;
+    }
     if (this.awaitingKeyFrame) {
       if (!isKeyFrame) {
         this.droppedFrames++;
-        return;
+        return false;
       }
       this.awaitingKeyFrame = false;
     }
@@ -556,14 +584,17 @@ class WebRtcPeer {
       if (track.sendMessageBinary(payload)) {
         this.sentFrames++;
         this.lastFrameMs = Date.now();
+        return true;
       } else {
         this.droppedFrames++;
         this.awaitingKeyFrame = true;
         this.params.onKeyframeRequest("WebRTC peer backpressure");
+        return false;
       }
     } catch (err) {
       this.lastError = errorMessage(err);
       this.close();
+      return false;
     }
   }
 

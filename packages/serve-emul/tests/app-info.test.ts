@@ -58,6 +58,7 @@ describe("getForegroundApp", () => {
       label: "Example App",
       versionName: "1.2.3",
       versionCode: "42",
+      minSdk: 23,
       debuggable: true,
     });
     expect(calls).toHaveLength(3);
@@ -99,6 +100,7 @@ describe("getForegroundApp", () => {
       label: "Alternate App",
       versionName: "7.0-beta",
       versionCode: "7",
+      minSdk: null,
       debuggable: false,
     });
     expect(commands.slice(0, 2)).toEqual([
@@ -121,6 +123,7 @@ describe("getForegroundApp", () => {
       label: null,
       versionName: null,
       versionCode: null,
+      minSdk: null,
       debuggable: null,
     });
     expect(commands).toEqual([
@@ -150,6 +153,7 @@ describe("getForegroundApp", () => {
       label: null,
       versionName: null,
       versionCode: null,
+      minSdk: null,
       debuggable: null,
     });
   });

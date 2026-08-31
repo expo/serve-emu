@@ -3,7 +3,7 @@ import {
   corsHeadersForRequest,
   isAllowedBrowserOrigin,
   parseAllowedOrigins,
-} from "../origin-policy.ts";
+} from "../src/origin-policy.ts";
 
 describe("browser origin policy", () => {
   test("allows same-origin and loopback browser requests", () => {

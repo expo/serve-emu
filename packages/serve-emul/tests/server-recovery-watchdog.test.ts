@@ -185,6 +185,54 @@ type FakeWebSocket = {
   getBufferedAmount(): number;
 };
 
+type FakeWebRtcFrameDelivery = {
+  accepted: boolean;
+  awaitingKeyFrame: boolean;
+};
+
+class FakeWebRtcPublisher {
+  activePeerCount = 0;
+  delivery: FakeWebRtcFrameDelivery = {
+    accepted: false,
+    awaitingKeyFrame: true,
+  };
+  onKeyframeRequest: ((reason: string) => void) | null = null;
+  readonly frames: VideoPacket[] = [];
+
+  async handleOffer(): Promise<{ type: string; sdp: string }> {
+    this.activePeerCount = 1;
+    return { type: "answer", sdp: "v=0\r\n" };
+  }
+
+  closeSession(): void {
+    this.activePeerCount = 0;
+  }
+
+  sendFrame(frame: VideoPacket): FakeWebRtcFrameDelivery {
+    this.frames.push(frame);
+    return this.delivery;
+  }
+
+  resetVideoSource(): void {}
+
+  snapshot() {
+    return {
+      peers: this.activePeerCount,
+      activePeers: this.activePeerCount,
+      signalingPending: false,
+      detail: [],
+    };
+  }
+
+  close(): void {
+    this.activePeerCount = 0;
+  }
+
+  requestKeyframe(reason: string): void {
+    this.onKeyframeRequest?.(reason);
+  }
+}
+
 function fakeWebSocket(
   data: unknown,
   options: FakeWebSocketOptions = {},
@@ -250,6 +298,7 @@ type Harness = Awaited<ReturnType<typeof createHarness>>;
 async function createHarness(options: {
   serials?: string[];
   delayedSerials?: string[];
+  webRtcPublisher?: FakeWebRtcPublisher;
 } = {}) {
   const serials = options.serials ?? ["A"];
   const sessions = new Map(
@@ -278,8 +327,28 @@ async function createHarness(options: {
     serve: captured.serve,
     recoveryClock: clock,
   };
+  if (options.webRtcPublisher) {
+    dependencies.createWebRtcPublisher = async (publisherOptions) => {
+      options.webRtcPublisher!.onKeyframeRequest =
+        publisherOptions.onKeyframeRequest;
+      return options.webRtcPublisher!;
+    };
+  }
   const started = await startServer(
-    { serial: serials[0]!, port: 33_030 },
+    {
+      serial: serials[0]!,
+      port: 33_030,
+      ...(options.webRtcPublisher
+        ? {
+            streamSettings: {
+              transport: "webrtc" as const,
+              codec: "h264" as const,
+              iceServers: [],
+              iceTransportPolicy: "all" as const,
+            },
+          }
+        : {}),
+    },
     dependencies,
   );
   const handlers = captured.options();
@@ -368,6 +437,80 @@ async function pushFrame(
 }
 
 describe("server recovery watchdog", () => {
+  test("keeps WebRTC recovery pending when the publisher cannot accept a source keyframe", async () => {
+    const publisher = new FakeWebRtcPublisher();
+    const harness = await createHarness({ webRtcPublisher: publisher });
+    try {
+      const offer = await harness.post("/webrtc/offer", {
+        type: "offer",
+        sdp: "v=0\r\n",
+        sessionId: "00000000-0000-4000-8000-000000000001",
+        codec: "h264",
+      });
+      expect(offer.status).toBe(200);
+
+      await pushFrame(harness, "A", keyFrame(), 1);
+      expect(await harness.health()).toMatchObject({
+        keyFrameRecovery: { awaitingClients: 1 },
+      });
+
+      harness.clock.advance(2_500);
+      harness.clock.fireActive();
+      await waitFor(
+        () =>
+          harness.sessions.get("A")!.fakeControlSocket.writes.length === 1,
+      );
+      expect(harness.sessions.get("A")!.fakeControlSocket.writes).toHaveLength(
+        1,
+      );
+    } finally {
+      await harness.started.stop();
+    }
+  });
+
+  test("retries after a publisher keyframe request when the replacement keyframe is not accepted", async () => {
+    const publisher = new FakeWebRtcPublisher();
+    publisher.delivery = { accepted: true, awaitingKeyFrame: false };
+    const harness = await createHarness({ webRtcPublisher: publisher });
+    const session = harness.sessions.get("A")!;
+    try {
+      const offer = await harness.post("/webrtc/offer", {
+        type: "offer",
+        sdp: "v=0\r\n",
+        sessionId: "00000000-0000-4000-8000-000000000002",
+        codec: "h264",
+      });
+      expect(offer.status).toBe(200);
+
+      await pushFrame(harness, "A", keyFrame(), 1);
+      expect((await harness.health()).keyFrameRecovery.awaitingClients).toBe(
+        0,
+      );
+
+      publisher.requestKeyframe("WebRTC peer backpressure");
+      await waitFor(() => session.fakeControlSocket.writes.length === 1);
+      expect(await harness.health()).toMatchObject({
+        videoResetRequests: 1,
+        lastVideoResetReason: "WebRTC peer backpressure",
+        keyFrameRecovery: { awaitingClients: 1 },
+      });
+
+      publisher.delivery = { accepted: false, awaitingKeyFrame: true };
+      await pushFrame(harness, "A", keyFrame(), 2);
+      harness.clock.advance(2_500);
+      await pushFrame(harness, "A", deltaFrame(), 3);
+      harness.clock.fireActive();
+      await waitFor(() => session.fakeControlSocket.writes.length === 2);
+      expect(await harness.health()).toMatchObject({
+        videoResetRequests: 2,
+        lastVideoResetReason: "client awaiting keyframe",
+        keyFrameRecovery: { awaitingClients: 1 },
+      });
+    } finally {
+      await harness.started.stop();
+    }
+  });
+
   test("retries across three windows with continuous deltas and a staggered client", async () => {
     const harness = await createHarness();
     const session = harness.sessions.get("A")!;

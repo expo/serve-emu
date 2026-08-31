@@ -107,20 +107,24 @@ describe("complete API success contracts", () => {
   test("parses discovery and device mutation payloads", () => {
     expect(
       parseApiInfoResponse({
+        generation: 3,
         serial: "emulator-5554",
         device: "Pixel 8",
         codec: "h264",
         size: { width: 1080, height: 1920 },
         status: "streaming",
         clients: 2,
+        stream: { transport: "websocket" },
       }),
     ).toEqual({
+      generation: 3,
       serial: "emulator-5554",
       device: "Pixel 8",
       codec: "h264",
       size: { width: 1080, height: 1920 },
       status: "streaming",
       clients: 2,
+      stream: { transport: "websocket" },
     });
     expect(
       parseDeviceListResponse({
@@ -225,6 +229,7 @@ describe("complete API success contracts", () => {
           label: "Example",
           versionName: "1.2.3",
           versionCode: "42",
+          minSdk: 23,
           debuggable: false,
         },
       }).app,
@@ -239,6 +244,7 @@ describe("complete API success contracts", () => {
           label: null,
           versionName: null,
           versionCode: null,
+          minSdk: null,
           debuggable: null,
         },
       }).app.packageName,
@@ -421,12 +427,14 @@ describe("API parser rejection boundaries", () => {
     expect(() => parseApiInfoResponse([])).toThrow("must be an object");
     expect(() =>
       parseApiInfoResponse({
+        generation: 0,
         serial: "a",
         device: "d",
         codec: "h264",
         size: { width: 0, height: 1 },
         status: "streaming",
         clients: 0,
+        stream: { transport: "websocket" },
       }),
     ).toThrow("dimensions must be positive");
     expect(() => parseDeviceListResponse({ ok: true, devices: {} })).toThrow("must be an array");

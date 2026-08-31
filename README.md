@@ -16,7 +16,7 @@ bunx serve-emul@latest
 
 Use `@latest` for one-off runs so Bun/npm fetches the newest published version instead of reusing a cached or locally installed copy.
 
-`serve-emul` starts the vendored scrcpy server on the device, opens an adb forward tunnel, forwards H.264 frames over WebSockets, and decodes them in the browser with WebCodecs. Input events are written directly to scrcpy's control socket instead of shelling out to `adb shell input`, keeping taps, swipes, text, and key events responsive enough for agents.
+`serve-emul` starts the vendored scrcpy server on the device, opens an adb forward tunnel, and streams H.264 over WebSocket/WebCodecs or WebRTC. Browsers without WebCodecs can use the Media Source Extensions fallback. Input events are written directly to scrcpy's control socket instead of shelling out to `adb shell input`, keeping taps, swipes, text, and key events responsive enough for agents.
 
 ## Status
 
@@ -24,7 +24,7 @@ Current package version: see [`packages/serve-emul/package.json`](packages/serve
 
 Working:
 
-- Live H.264 video stream from device to WebCodecs canvas
+- Live H.264 video over WebSocket/WebCodecs or WebRTC, with an MSE fallback
 - Tap, swipe, text, keyevent, Back, Home, Recents, and Power input
 - Keyboard passthrough in the browser UI: editing/navigation keys, Ctrl/Cmd shortcuts (select all, copy, paste, cut, undo, redo), and IME composition for CJK text
 - Multi-client streaming, so multiple browser tabs can share one device
@@ -35,35 +35,33 @@ Working:
 - Emulator GPS location control and route playback from GPX, GeoJSON, KML, or waypoint JSON
 - Session recording and replay for REST, WebSocket, and location events
 - APK install, app launch, clear data, force stop, permission grant, and media/file import helpers
+- Query-scoped multi-device routing and embeddable middleware exports
 
 Planned:
 
-- Multi-device routing
-- Embeddable Connect-style middleware (`serve-emul/middleware`)
 - Compiled single binary
 
 ## Requirements
 
-- Bun 1.1+
+- Bun 1.3.13+
 - `adb` on PATH from Android platform-tools
 - A booted device/emulator from `adb devices`, or an AVD name passed with `--avd`
-- Chrome, Edge, or Safari 16.4+ for the bundled WebCodecs UI
+- A modern browser with H.264 WebRTC support or WebCodecs; MSE is used when WebCodecs is unavailable
 
 Node.js 18+ can invoke the published package through `npx`, but local development and server runtime use Bun.
 
 ## Package API
 
-As of 1.0.0, `serve-emul` is intentionally a CLI-only package. The only
-supported package surface is the installed `serve-emul` executable. There are
-no supported JavaScript or TypeScript import paths: both `import "serve-emul"`
-and deep imports such as `import "serve-emul/src/adb.ts"` are blocked by the
-package export map. Files shipped for the CLI are implementation details and
-carry no import-path stability guarantee.
+The CLI remains the simplest entry point, and the fork also publishes a small
+typed integration surface:
 
-The documented HTTP and WebSocket endpoints remain supported runtime APIs once
-the CLI is running; they are not package imports. The planned
-`serve-emul/middleware` entry point is not available yet and must not be
-imported until it is explicitly exported and documented in a future release.
+- `serve-emul` and `serve-emul/middleware`: `createApp`, `createRouter`, and socket adapters for embedding the device router in another Bun/Node server
+- `serve-emul/stream-socket`: Bun and `ws` socket adapters
+- `serve-emul/stream-settings`: WebSocket/WebRTC settings, ICE types, defaults, and validation helpers
+
+Unlisted deep imports such as `serve-emul/src/adb.ts` are blocked by the export
+map. The HTTP, WebSocket, and WebRTC signaling endpoints documented below are
+also supported runtime APIs.
 
 ## Quick Start
 
@@ -90,6 +88,7 @@ bun run packages/serve-emul/src/cli.ts
 
 ```text
 serve-emul [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms] [--max-apk-upload-bytes N] [--max-media-upload-bytes N]
+serve-emul --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
 serve-emul --avd <name> [--gpu <mode>] [--restart-avd]
 serve-emul --avd-list
 serve-emul --running-avds
@@ -107,6 +106,12 @@ serve-emul --running-avds
 | `--max-size` | `1280` | Downscale the longest edge to N pixels; `0` keeps native size. The emulator's software H.264 encoder sustains 60fps only below ~1 megapixel, hence the 1280 default |
 | `--key-frame-interval` | `10` | Ask the encoder for regular keyframes; `0` disables this codec option. Late joiners get keyframes on demand, so a long interval avoids periodic keyframe bursts |
 | `--repeat-frame-ms` | `0` | Re-encode the previous frame after N ms without screen changes (`16` ≈ steady 60fps on static screens, at extra CPU/bandwidth cost); `0` keeps the encoder default of one repeat per 100ms |
+| `--transport` | `websocket` | Browser video transport: `websocket` or `webrtc` |
+| `--stun-url` | public STUN defaults | Comma-separated STUN URL(s) for WebRTC ICE |
+| `--turn-url` | none | Comma-separated TURN URL(s); requires both TURN credential flags |
+| `--turn-username` | none | TURN username |
+| `--turn-credential` | none | TURN credential |
+| `--webrtc-ice-policy` | `all` | ICE policy: `all` or `relay` (`relay` requires TURN) |
 | `--max-apk-upload-bytes` | `536870912` | Maximum APK file bytes accepted by the streaming multipart endpoint |
 | `--max-media-upload-bytes` | `1073741824` | Maximum media/file bytes accepted by the streaming multipart endpoint |
 | `--max-active-uploads` | `2` | Maximum upload operations reading, staging, or running through ADB concurrently |
@@ -429,14 +434,22 @@ Connect to `/ws` for the raw Annex-B H.264 stream. Send JSON control messages ov
 
 Use `/ws?frame-meta=1` to receive a 24-byte `SEMU` v2 frame metadata header before each H.264 access unit: magic `SEMU` (4B), version=2 (1B), flags (1B, bit 0 = keyframe), reserved (2B), PTS (8B BE, µs), and the server send time (8B BE, epoch µs). Same-host clients can compare the send time against their own clock to measure transit and glass-to-glass latency. The bundled UI uses this mode to avoid per-frame NAL scans and to track PTS/keyframe/latency state.
 
+With `--transport webrtc`, video is negotiated through authenticated,
+same-origin `POST /webrtc/offer` and released through `POST /webrtc/close`.
+The browser keeps `/ws?video=0` open as a control-only socket, so input still
+travels directly over scrcpy's binary control channel without duplicating video
+over WebSocket. `/api` exposes the active ICE configuration to the authenticated
+UI; `/health` redacts TURN credentials.
+
 See the [protocol reference](packages/serve-emul/docs/protocol.md) for the complete scrcpy v3/v4 framing, control packet, and `SEMU` v1/v2 wire formats.
 
 ## How It Works
 
 ```text
-+------------------+ adb forward  +-------------+  H.264 / WS   +---------+
++------------------+ adb forward  +-------------+ H.264 WS/RTC +---------+
 | scrcpy-server.jar| <----------> | serve-emul  | ------------> | Browser |
-| on device        | TCP tunnel   |   (Bun)     |  WebCodecs    | <canvas>|
+| on device        | TCP tunnel   |   (Bun)     | WebCodecs/MSE | canvas/ |
+|                  |              |             | or WebRTC     | video   |
 |  - video socket  |              |             | <------------ |         |
 |  - control socket|              |             |  input JSON   |         |
 +------------------+              +-------------+               +---------+
@@ -445,8 +458,8 @@ See the [protocol reference](packages/serve-emul/docs/protocol.md) for the compl
 1. The CLI pushes `scrcpy-server-v4.0` to `/data/local/tmp/scrcpy-server.jar`.
 2. It opens `adb forward tcp:<localPort> localabstract:scrcpy_<scid>`.
 3. It spawns `app_process` with the scrcpy server class on the device, then connects video and control sockets through the tunnel.
-4. The Bun server reads scrcpy's framed H.264 stream and forwards each access unit as a binary WebSocket message. Raw `/ws` clients receive Annex-B payloads unchanged; the built-in browser UI opts into the 24-byte frame metadata header.
-5. The browser configures a `VideoDecoder` from SPS/PPS data and draws decoded frames to a `<canvas>`. Pointer events are normalized to unit coordinates and encoded as scrcpy control socket packets.
+4. The Bun server reads scrcpy's framed H.264 stream and publishes each access unit over the selected WebSocket or WebRTC transport. Raw `/ws` clients receive Annex-B payloads unchanged; the built-in WebSocket UI opts into the 24-byte frame metadata header.
+5. The browser uses WebCodecs in a worker, falls back to MSE where necessary, or renders the WebRTC track into a `<video>`. Pointer events are normalized to unit coordinates and encoded as scrcpy control socket packets.
 
 ## Development
 
@@ -460,7 +473,7 @@ bun run --filter serve-emul build
 bun run check
 ```
 
-`dev:ui` proxies `/api`, `/health`, and `/ws` to
+`dev:ui` proxies `/api`, `/health`, `/webrtc`, and `/ws` to
 `http://localhost:3300` by default. To run the backend on another port while
 keeping the Vite UI on its normal development origin, start the two processes
 like this:

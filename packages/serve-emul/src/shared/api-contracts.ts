@@ -1,4 +1,8 @@
 import { parseGesture, type Gesture } from "./control-contracts";
+import type {
+  StreamSettings,
+  WebRtcIceServer,
+} from "../stream-settings";
 
 /** Stable error codes sent by every JSON API failure. */
 export const API_ERROR_CODES = [
@@ -290,12 +294,14 @@ export type HealthResponse = {
 };
 
 export type ApiInfoResponse = {
+  generation: number;
   serial: string;
   device: string;
   codec: string;
   size: DeviceSize;
   status: SessionStatus;
   clients: number;
+  stream: StreamSettings;
 };
 
 export type EmptyResponse = ApiSuccess;
@@ -514,9 +520,62 @@ function parseDeviceSize(value: unknown, name = "size"): DeviceSize {
   return { width, height };
 }
 
+function parseIceServer(value: unknown, index: number): WebRtcIceServer {
+  const name = `API info response.stream.iceServers[${index}]`;
+  const item = record(value, name);
+  if (!Array.isArray(item.urls) || item.urls.length === 0) {
+    fail(`${name}.urls must be a non-empty array`);
+  }
+  const username = item.username;
+  const credential = item.credential;
+  return {
+    urls: item.urls.map((url, urlIndex) =>
+      string(url, `${name}.urls[${urlIndex}]`),
+    ),
+    ...(username === undefined
+      ? {}
+      : { username: string(username, `${name}.username`) }),
+    ...(credential === undefined
+      ? {}
+      : { credential: string(credential, `${name}.credential`) }),
+  };
+}
+
+export function parseStreamSettings(value: unknown): StreamSettings {
+  const item = record(value, "API info response.stream");
+  const transport = oneOf(
+    item.transport,
+    ["websocket", "webrtc"] as const,
+    "API info response.stream.transport",
+  );
+  if (transport === "websocket") return { transport };
+  if (!Array.isArray(item.iceServers)) {
+    fail("API info response.stream.iceServers must be an array");
+  }
+  return {
+    transport,
+    codec: oneOf(
+      item.codec,
+      ["h264"] as const,
+      "API info response.stream.codec",
+    ),
+    iceServers: item.iceServers.map(parseIceServer),
+    iceTransportPolicy: oneOf(
+      item.iceTransportPolicy,
+      ["all", "relay"] as const,
+      "API info response.stream.iceTransportPolicy",
+    ),
+  };
+}
+
 export function parseApiInfoResponse(value: unknown): ApiInfoResponse {
   const root = record(value, "API info response");
+  const generation = number(root.generation, "API info response.generation");
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    fail("API info response.generation must be a non-negative safe integer");
+  }
   return {
+    generation,
     serial: string(root.serial, "API info response.serial"),
     device: string(root.device, "API info response.device"),
     codec: string(root.codec, "API info response.codec"),
@@ -527,6 +586,7 @@ export function parseApiInfoResponse(value: unknown): ApiInfoResponse {
       "API info response.status",
     ),
     clients: number(root.clients, "API info response.clients"),
+    stream: parseStreamSettings(root.stream),
   };
 }
 
