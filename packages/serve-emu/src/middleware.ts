@@ -2,10 +2,14 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import {
+  getFontScale,
+  getNetworkStatus,
   getUserRotation,
   listAllDevices,
   listDevices,
   screencapPng,
+  setFontScale,
+  setNetworkEnabled,
   setUserRotation,
   type OrientationMode,
 } from "./adb.ts";
@@ -65,6 +69,11 @@ import {
   type StreamMode,
   type StreamModeResponse,
 } from "./shared/api-contracts.ts";
+import {
+  buildWebRtcStatsReport,
+  handleWebRtcStatsRequest,
+  WebRtcStatsRequestError,
+} from "./webrtc-stats.ts";
 
 export { fromBunSocket, fromWsSocket } from "./stream-socket.ts";
 export type { StreamSocket, WsWebSocketLike } from "./stream-socket.ts";
@@ -101,6 +110,12 @@ export type AppOptions = {
   deviceState?: DeviceSessionState;
 } & BrowserOriginPolicy;
 
+export type AppClock = {
+  now(): number;
+  setInterval(callback: () => void, intervalMs: number): unknown;
+  clearInterval(timer: unknown): void;
+};
+
 type SessionStatus = "streaming" | "stopped" | "error";
 
 type Client = {
@@ -133,6 +148,13 @@ const MAX_H264_FPS = 120;
 // After a device's scrcpy start fails, wait this long before retrying so a
 // flapping device doesn't get hammered on every request.
 const SPAWN_RETRY_COOLDOWN_MS = 5_000;
+
+const SYSTEM_APP_CLOCK: AppClock = {
+  now: Date.now,
+  setInterval: (callback, intervalMs) => setInterval(callback, intervalMs),
+  clearInterval: (timer) =>
+    clearInterval(timer as ReturnType<typeof setInterval>),
+};
 
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
@@ -225,6 +247,9 @@ function combineAbortSignals(
   return AbortSignal.any([first, second]);
 }
 
+const middlewareFailure = (error: string, status: number): Response =>
+  Response.json({ ok: false, error }, { status });
+
 const STATIC_CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -280,6 +305,8 @@ export type CreateAppDependencies = {
   startSession?: typeof startEmuSession;
   /** @internal Legacy test seam retained while callers migrate to startSession. */
   startScrcpy?: typeof startScrcpy;
+  createWebRtcPublisher?: typeof createWebRtcPublisher;
+  clock?: AppClock;
   setLocation?: (
     serial: string,
     fix: GeoFix,
@@ -292,6 +319,9 @@ async function createAppInternal(
   dependencies: CreateAppDependencies = {},
 ) {
   throwIfAborted(opts.signal, "serve-emu app startup aborted");
+  const openWebRtcPublisher =
+    dependencies.createWebRtcPublisher ?? createWebRtcPublisher;
+  const clock = dependencies.clock ?? SYSTEM_APP_CLOCK;
   const uploader = createMiddlewareUploader({
     serial: opts.serial,
     maxApkUploadBytes: opts.maxApkUploadBytes,
@@ -356,13 +386,15 @@ async function createAppInternal(
   let totalBackpressureEvents = 0;
   let sourceFps = 0;
   let lastFpsFrameCount = 0;
+  let webRtcOfferedFrames = 0;
+  let webRtcForwardedFrames = 0;
   let videoResetRequests = 0;
   let lastVideoResetAt: string | null = null;
   let lastVideoResetReason: string | null = null;
   let lastVideoResetMs = 0;
   let pendingVideoResetTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingVideoResetReason: string | null = null;
-  let watchdog: ReturnType<typeof setInterval> | null = null;
+  let watchdog: unknown | null = null;
   let nextClientId = 1;
   let webRtcPublisher: WebRtcPublisher | null = null;
   let removeFatalListener: (() => void) | null = null;
@@ -433,6 +465,33 @@ async function createAppInternal(
     lastErrorMeta,
   });
 
+  const webRtcStats = (sessionId: string) => {
+    if (streamSettings.transport !== "webrtc" || !webRtcPublisher) return null;
+    const publisherSessions = webRtcPublisher.statsForSession(sessionId);
+    const publisherSession = publisherSessions[0];
+    if (
+      publisherSessions.length !== 1 ||
+      publisherSession?.sessionId !== sessionId
+    ) {
+      return null;
+    }
+    return buildWebRtcStatsReport(
+      {
+        codec: session.meta.codecId,
+        width: screen.width,
+        height: screen.height,
+        frames: frameCount,
+        fps: sourceFps,
+        configuredBitrateBps: streamEncoderSettings.h264Bitrate,
+      },
+      publisherSession,
+      {
+        offeredFrames: webRtcOfferedFrames,
+        forwardedFrames: webRtcForwardedFrames,
+      },
+    );
+  };
+
   const closeClients = (code: number, reason: string) => {
     for (const c of clients) {
       try {
@@ -457,7 +516,7 @@ async function createAppInternal(
     lastErrorCode = detail?.code ?? null;
     lastErrorMeta = detail?.meta ?? null;
     stoppedAt = new Date().toISOString();
-    if (watchdog) clearInterval(watchdog);
+    if (watchdog !== null) clock.clearInterval(watchdog);
     if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
     pendingVideoResetTimer = null;
     pendingVideoResetReason = null;
@@ -719,7 +778,7 @@ async function createAppInternal(
       );
     }
     try {
-      webRtcPublisher = await createWebRtcPublisher({
+      webRtcPublisher = await openWebRtcPublisher({
         settings: streamSettings,
         onKeyframeRequest: requestVideoReset,
       });
@@ -774,6 +833,7 @@ async function createAppInternal(
   // and inline them in front of every keyframe so each WS message is a
   // self-contained Access Unit the browser can hand straight to WebCodecs.
   let cachedConfig: Buffer | null = null;
+  let lastFpsSampleMs = clock.now();
 
   const startCaptureReader = (activeSession: EmuSession, generation: number) => {
     void (async () => {
@@ -814,7 +874,12 @@ async function createAppInternal(
           frameCount++;
           lastFrameMs = Date.now();
           const config = f.isKey ? cachedConfig : null;
-          webRtcPublisher?.sendFrame(f, config);
+          if (webRtcPublisher) {
+            webRtcOfferedFrames++;
+            if (webRtcPublisher.sendFrame(f, config).accepted) {
+              webRtcForwardedFrames++;
+            }
+          }
           let rawOut: Buffer | null = null;
           let framedOut: Buffer | null = null;
           for (const c of clients) {
@@ -996,9 +1061,14 @@ async function createAppInternal(
 
   startCaptureReader(session, sessionGeneration);
 
-  watchdog = setInterval(() => {
-    sourceFps = frameCount - lastFpsFrameCount;
+  watchdog = clock.setInterval(() => {
+    const now = clock.now();
+    const elapsedMs = now - lastFpsSampleMs;
+    if (elapsedMs <= 0) return;
+    const elapsedFrames = frameCount - lastFpsFrameCount;
+    sourceFps = (elapsedFrames * 1_000) / elapsedMs;
     lastFpsFrameCount = frameCount;
+    lastFpsSampleMs = now;
   }, 1000);
 
   const webRtcCorsHeaders = (req: Request) => corsHeadersForRequest(req, opts);
@@ -1093,6 +1163,68 @@ async function createAppInternal(
           { status: 400 },
         );
       }
+    }
+
+    if (url.pathname === "/api/network") {
+      if (req.method === "GET") {
+        try {
+          return Response.json({ ok: true, network: await getNetworkStatus(opts.serial) });
+        } catch (err) {
+          return middlewareFailure(errMsg(err), 400);
+        }
+      }
+      if (req.method === "POST") {
+        if (!isAllowedBrowserOrigin(req, opts)) {
+          return middlewareFailure("forbidden_origin", 403);
+        }
+        try {
+          const payload = await readJsonBody(req);
+          if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+            throw new Error("network payload must be an object");
+          }
+          const enabled = (payload as Record<string, unknown>).enabled;
+          if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
+          return Response.json({
+            ok: true,
+            network: await setNetworkEnabled(opts.serial, enabled),
+          });
+        } catch (err) {
+          return middlewareFailure(errMsg(err), 400);
+        }
+      }
+      return middlewareFailure("method_not_allowed", 405);
+    }
+
+    if (url.pathname === "/api/font-scale") {
+      if (req.method === "GET") {
+        try {
+          return Response.json({ ok: true, fontScale: await getFontScale(opts.serial) });
+        } catch (err) {
+          return middlewareFailure(errMsg(err), 400);
+        }
+      }
+      if (req.method === "POST") {
+        if (!isAllowedBrowserOrigin(req, opts)) {
+          return middlewareFailure("forbidden_origin", 403);
+        }
+        try {
+          const payload = await readJsonBody(req);
+          if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+            throw new Error("font scale payload must be an object");
+          }
+          const scale = Number((payload as Record<string, unknown>).scale);
+          if (!Number.isFinite(scale) || scale < 0.7 || scale > 2) {
+            throw new Error("scale must be a number between 0.7 and 2.0");
+          }
+          return Response.json({
+            ok: true,
+            fontScale: await setFontScale(opts.serial, scale),
+          });
+        } catch (err) {
+          return middlewareFailure(errMsg(err), 400);
+        }
+      }
+      return middlewareFailure("method_not_allowed", 405);
     }
 
     if (url.pathname === "/health") {
@@ -1524,7 +1656,7 @@ async function createAppInternal(
     }
     closeClients(1001, "server stopping");
     webRtcPublisher?.close();
-    if (watchdog) clearInterval(watchdog);
+    if (watchdog !== null) clock.clearInterval(watchdog);
     if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
     pendingVideoResetTimer = null;
     pendingVideoResetReason = null;
@@ -1549,6 +1681,7 @@ async function createAppInternal(
     activateDeviceState,
     isStreaming: () => status === "streaming",
     health,
+    webRtcStats,
     handleRequest,
     attachWebSocket,
     stop,
@@ -2055,8 +2188,32 @@ export function createRouter(
     sessionGenerations.delete(serial);
   };
 
+  const activeAppForStats = (requested: string | null): EmuApp | null => {
+    if (requested !== null) {
+      const app = apps.get(requested);
+      return app?.isStreaming() ? app : null;
+    }
+    const streamingApps = Array.from(apps.values()).filter((app) =>
+      app.isStreaming(),
+    );
+    if (streamingApps.length > 1) {
+      throw new WebRtcStatsRequestError(
+        "Multiple devices are streaming. Specify exactly one with ?device=<serial>.",
+        "ambiguous_device",
+      );
+    }
+    return streamingApps[0] ?? null;
+  };
+
   const handleRequest = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
+
+    // Statistics are observational: polling must never start or restart scrcpy.
+    if (url.pathname === "/webrtc/stats") {
+      return handleWebRtcStatsRequest(req, defaults, (sessionId, device) => {
+        return activeAppForStats(device)?.webRtcStats(sessionId) ?? null;
+      });
+    }
 
     // Fleet endpoint — lists every adb device, so it is not device-scoped.
     if (url.pathname === "/api/devices") {
