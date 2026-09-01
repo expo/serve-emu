@@ -117,6 +117,7 @@ describe("gRPC message framing", () => {
     };
     const messages: string[] = [];
     const failures: Error[] = [];
+    const pacingEvents = { received: 0, emitted: 0, coalesced: 0 };
     const controller = new AbortController();
     const pacer = new GrpcMessagePacer({
       stream,
@@ -125,6 +126,9 @@ describe("gRPC message framing", () => {
       signal: controller.signal,
       clock,
       onMessage: (message) => messages.push(message.toString("utf8")),
+      onPacingEvent: (event) => {
+        pacingEvents[event]++;
+      },
       onError: (error) => failures.push(error),
     });
 
@@ -137,6 +141,7 @@ describe("gRPC message framing", () => {
     );
 
     expect(messages).toEqual(["one"]);
+    expect(pacingEvents).toEqual({ received: 3, emitted: 1, coalesced: 1 });
     expect(stream.pauses).toBe(1);
     expect(stream.resumes).toBe(0);
 
@@ -149,9 +154,11 @@ describe("gRPC message framing", () => {
     clock.advance(100);
     expect(stream.resumes).toBe(1);
     expect(failures).toEqual([]);
+    expect(pacingEvents).toEqual({ received: 3, emitted: 2, coalesced: 1 });
 
     pacer.push(grpcFrame(Buffer.from("four")));
     expect(messages).toEqual(["one", "three", "four"]);
+    expect(pacingEvents).toEqual({ received: 4, emitted: 3, coalesced: 1 });
     controller.abort(new Error("stream cancelled"));
     clock.advance(1_000);
     expect(stream.resumes).toBe(1);

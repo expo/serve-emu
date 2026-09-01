@@ -9,6 +9,7 @@ import {
   IMG_FORMAT_PNG,
   IMG_FORMAT_RGB888,
   type EmuImage,
+  type GrpcMessagePacingEvent,
   type KeyboardEventRequest,
   type TouchPoint,
 } from "./emulator-grpc.ts";
@@ -35,6 +36,8 @@ import {
 } from "./scrcpy.ts";
 import type {
   EmuSession,
+  GrpcCaptureDiagnostics,
+  RollingTimingSummary,
   StreamFailure,
   StreamMeta,
 } from "./stream-session.ts";
@@ -48,6 +51,133 @@ const DISPLAY_SIZE_POLL_MS = 2_000;
 const MAX_DISPLAY_SIZE_OUTPUT_BYTES = 4_096;
 const INPUT_RELEASE_TIMEOUT_MS = 500;
 const TOUCH_PRESSURE = 1;
+const CAPTURE_DIAGNOSTIC_WINDOW = 240;
+
+class RollingTimingWindow {
+  readonly #values: Float64Array;
+  #index = 0;
+  #count = 0;
+
+  constructor(capacity: number) {
+    if (!Number.isSafeInteger(capacity) || capacity <= 0) {
+      throw new RangeError("diagnostic window capacity must be a positive integer");
+    }
+    this.#values = new Float64Array(capacity);
+  }
+
+  record(value: number): void {
+    if (!Number.isFinite(value)) return;
+    this.#values[this.#index] = value;
+    this.#index = (this.#index + 1) % this.#values.length;
+    if (this.#count < this.#values.length) this.#count++;
+  }
+
+  summary(): RollingTimingSummary | null {
+    if (this.#count === 0) return null;
+    const values = Array.from(this.#values.subarray(0, this.#count)).sort(
+      (left, right) => left - right,
+    );
+    const at = (quantile: number) =>
+      values[Math.min(values.length - 1, Math.floor(values.length * quantile))]!;
+    const round1 = (value: number) => Math.round(value * 10) / 10;
+    const latestIndex =
+      (this.#index - 1 + this.#values.length) % this.#values.length;
+    return {
+      windowSamples: this.#count,
+      latest: round1(this.#values[latestIndex]!),
+      p50: round1(at(0.5)),
+      p95: round1(at(0.95)),
+      max: round1(values[values.length - 1]!),
+    };
+  }
+}
+
+/** Collects the capture counters exposed through an EmuSession diagnostics snapshot. */
+export class GrpcCaptureDiagnosticsTracker {
+  #rawGrpcMessagesReceived = 0;
+  #rawGrpcMessagesEmitted = 0;
+  #rawGrpcMessagesCoalesced = 0;
+  #usableImages = 0;
+  #sequenceGaps = 0;
+  #lastSequence: number | null = null;
+  #lastSourceTimestampUs: bigint | null = null;
+  readonly #sourceTimestampIntervals: RollingTimingWindow;
+  readonly #productionToReceiveLatency: RollingTimingWindow;
+  #freshEncoderWriteAttempts = 0;
+  #repeatEncoderWriteAttempts = 0;
+  #acceptedEncoderWrites = 0;
+  #encoderBackpressureRejections = 0;
+
+  constructor(windowCapacity = CAPTURE_DIAGNOSTIC_WINDOW) {
+    this.#sourceTimestampIntervals = new RollingTimingWindow(windowCapacity);
+    this.#productionToReceiveLatency = new RollingTimingWindow(windowCapacity);
+  }
+
+  recordGrpcMessage(event: GrpcMessagePacingEvent): void {
+    switch (event) {
+      case "received":
+        this.#rawGrpcMessagesReceived++;
+        return;
+      case "emitted":
+        this.#rawGrpcMessagesEmitted++;
+        return;
+      case "coalesced":
+        this.#rawGrpcMessagesCoalesced++;
+        return;
+    }
+  }
+
+  recordUsableImage(
+    image: Pick<EmuImage, "seq" | "timestampUs">,
+    receivedAtMs = Date.now(),
+  ): void {
+    this.#usableImages++;
+    if (Number.isSafeInteger(image.seq) && image.seq >= 0) {
+      if (this.#lastSequence !== null && image.seq > this.#lastSequence + 1) {
+        this.#sequenceGaps += image.seq - this.#lastSequence - 1;
+      }
+      this.#lastSequence = image.seq;
+    }
+    if (image.timestampUs <= 0n) return;
+    if (
+      this.#lastSourceTimestampUs !== null &&
+      image.timestampUs > this.#lastSourceTimestampUs
+    ) {
+      this.#sourceTimestampIntervals.record(
+        Number(image.timestampUs - this.#lastSourceTimestampUs) / 1_000,
+      );
+    }
+    this.#lastSourceTimestampUs = image.timestampUs;
+    const receivedAtUs = BigInt(Math.round(receivedAtMs * 1_000));
+    this.#productionToReceiveLatency.record(
+      Number(receivedAtUs - image.timestampUs) / 1_000,
+    );
+  }
+
+  recordEncoderWrite(repeat: boolean, accepted: boolean): void {
+    if (repeat) this.#repeatEncoderWriteAttempts++;
+    else this.#freshEncoderWriteAttempts++;
+    if (accepted) this.#acceptedEncoderWrites++;
+    else this.#encoderBackpressureRejections++;
+  }
+
+  snapshot(): GrpcCaptureDiagnostics {
+    return {
+      rawGrpcMessagesReceived: this.#rawGrpcMessagesReceived,
+      rawGrpcMessagesEmitted: this.#rawGrpcMessagesEmitted,
+      rawGrpcMessagesCoalesced: this.#rawGrpcMessagesCoalesced,
+      usableImages: this.#usableImages,
+      sequenceGaps: this.#sequenceGaps,
+      sourceTimestampIntervalMs: this.#sourceTimestampIntervals.summary(),
+      productionToReceiveLatencyMs:
+        this.#productionToReceiveLatency.summary(),
+      freshEncoderWriteAttempts: this.#freshEncoderWriteAttempts,
+      repeatEncoderWriteAttempts: this.#repeatEncoderWriteAttempts,
+      acceptedEncoderWrites: this.#acceptedEncoderWrites,
+      encoderBackpressureRejections: this.#encoderBackpressureRejections,
+    };
+  }
+}
 
 const ANDROID_KEYCODE_TO_EVDEV: Record<number, number> = {
   19: 103,
@@ -796,6 +926,7 @@ export async function startGrpcSession(
       : DEFAULT_IDLE_REPEAT_MS;
   const frameIntervalMs = 1_000 / maxFps;
   const frameWritePacer = new GrpcFrameWritePacer(frameIntervalMs);
+  const captureDiagnostics = new GrpcCaptureDiagnosticsTracker();
 
   if (!/^emulator-\d+$/.test(serial)) {
     throw new Error(
@@ -894,6 +1025,7 @@ export async function startGrpcSession(
     const now = performance.now();
     const accepted = encoder.write(latest.image, nowUs());
     frameWritePacer.recordWrite(now, repeat, accepted);
+    captureDiagnostics.recordEncoderWrite(repeat, accepted);
     if (accepted) lastWriteAt = Date.now();
     if (repeat && flushTimer) {
       clearTimeout(flushTimer);
@@ -1030,8 +1162,9 @@ export async function startGrpcSession(
     displaySizePollTimer.unref?.();
   };
 
-  const onImage = (image: EmuImage) => {
+  const onImage = (image: EmuImage, receivedAtMs: number) => {
     if (closed || !isUsableRgbFrame(image)) return;
+    captureDiagnostics.recordUsableImage(image, receivedAtMs);
     latest = image;
     if (resolveFirstImage) {
       const resolve = resolveFirstImage;
@@ -1366,7 +1499,11 @@ export async function startGrpcSession(
         },
         onImage,
         lifetime.signal,
-        { maxFps },
+        {
+          maxFps,
+          onPacingEvent: (event) =>
+            captureDiagnostics.recordGrpcMessage(event),
+        },
       )
       .then(
         () => {
@@ -1415,6 +1552,7 @@ export async function startGrpcSession(
       serial,
       meta,
       controls,
+      diagnostics: () => ({ grpcCapture: captureDiagnostics.snapshot() }),
       readFrame,
       onFatal(listener) {
         listeners.add(listener);

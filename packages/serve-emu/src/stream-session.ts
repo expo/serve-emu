@@ -17,6 +17,43 @@ export type StreamFailure = {
 
 export type StreamMeta = ScrcpySession["meta"];
 
+export type RollingTimingSummary = {
+  /** Number of samples retained in the rolling window. */
+  windowSamples: number;
+  latest: number;
+  p50: number;
+  p95: number;
+  max: number;
+};
+
+/** Cumulative and rolling diagnostics for emulator gRPC screenshot capture. */
+export type GrpcCaptureDiagnostics = {
+  /** Raw framed protobuf messages parsed before the pacing/coalescing stage. */
+  rawGrpcMessagesReceived: number;
+  /** Raw messages released by the pacer for protobuf decoding. */
+  rawGrpcMessagesEmitted: number;
+  /** Pending raw messages replaced by a newer message in the same pacing window. */
+  rawGrpcMessagesCoalesced: number;
+  /** Decoded RGB images with complete, encoder-usable payloads. */
+  usableImages: number;
+  /** Missing emulator-produced sequence numbers observed between usable images. */
+  sequenceGaps: number;
+  /** Rolling intervals derived from the emulator's production timestamps. */
+  sourceTimestampIntervalMs: RollingTimingSummary | null;
+  /** Rolling emulator-production-to-host-receive latency. */
+  productionToReceiveLatencyMs: RollingTimingSummary | null;
+  freshEncoderWriteAttempts: number;
+  repeatEncoderWriteAttempts: number;
+  acceptedEncoderWrites: number;
+  /** Encoder writes rejected while ffmpeg input was backpressured. */
+  encoderBackpressureRejections: number;
+};
+
+export type EmuSessionDiagnostics = {
+  /** Present only for the grpc-screenshot capture implementation. */
+  grpcCapture?: GrpcCaptureDiagnostics;
+};
+
 /**
  * A stream source hides capture, encoding, input transport, keyframe recovery,
  * and cleanup behind one interface used by both the Bun server and middleware.
@@ -26,6 +63,8 @@ export type EmuSession = {
   readonly serial: string;
   readonly meta: StreamMeta;
   readonly controls: ControlInputQueue;
+  /** Optional source-specific live diagnostics, sampled without mutating capture. */
+  readonly diagnostics?: () => EmuSessionDiagnostics;
   /** Present only on the scrcpy adapter during the server migration. */
   readonly rawScrcpy?: ScrcpySession;
   readFrame(): Promise<VideoPacket | null>;

@@ -674,17 +674,21 @@ export async function startServer(
     const sourceFps = recoveries.get(context)?.snapshot(recoveryClock.now()).sourceFps ?? 0;
     return buildWebRtcStatsReport(
       {
+        streamMode: context.stream.mode,
         codec: context.stream.meta.codecId,
         width: context.screen.width,
         height: context.screen.height,
         frames: context.frameCount,
         fps: sourceFps,
+        configuredFps: opts.maxFps ?? SCRCPY_DEFAULTS.maxFps,
         configuredBitrateBps: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
+        frameStats: context.frameStats.summary(),
       },
       publisherSession,
       {
         offeredFrames: context.webRtcOfferedFrames,
         forwardedFrames: context.webRtcForwardedFrames,
+        grpc: context.stream.diagnostics?.().grpcCapture ?? null,
       },
     );
   };

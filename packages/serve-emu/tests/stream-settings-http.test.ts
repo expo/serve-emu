@@ -258,7 +258,7 @@ describe("stream settings HTTP API", () => {
       expect(await settings.json()).toEqual({
         maxDimension: 1280,
         h264Bitrate: 8_000_000,
-        h264Fps: 30,
+        h264Fps: 60,
       });
       expect(starts).toBe(1);
     } finally {
@@ -318,7 +318,7 @@ describe("stream settings HTTP API", () => {
       expect(await settings.json()).toEqual({
         maxDimension: 960,
         h264Bitrate: 8_000_000,
-        h264Fps: 30,
+        h264Fps: 60,
       });
       const health = await app.handleRequest(new Request("http://localhost/health"));
       expect(health.status).toBe(200);
@@ -417,12 +417,12 @@ describe("stream settings HTTP API", () => {
       expect(await (await firstPatch).json()).toEqual({
         maxDimension: 720,
         h264Bitrate: 8_000_000,
-        h264Fps: 30,
+        h264Fps: 60,
       });
       expect(await (await secondPatch).json()).toEqual({
         maxDimension: 960,
         h264Bitrate: 8_000_000,
-        h264Fps: 30,
+        h264Fps: 60,
       });
       expect(starts).toBe(3);
     } finally {

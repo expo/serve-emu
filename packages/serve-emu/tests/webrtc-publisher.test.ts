@@ -458,6 +458,7 @@ describe("WebRTC publisher signaling", () => {
       { accepted: true, awaitingKeyFrame: false },
     ]);
     expect(publisher.snapshot().detail[0]).toMatchObject({
+      sessionId: "00000000-0000-4000-8000-000000000000",
       sentFrames: 2,
       droppedFrames: 4,
       awaitingKeyFrame: false,

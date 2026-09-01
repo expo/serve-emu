@@ -661,6 +661,7 @@ class WebRtcPeer {
   snapshot() {
     return {
       id: this.id,
+      sessionId: this.sessionId,
       state: this.lastState,
       iceState: this.lastIceState,
       connected: this.connected,

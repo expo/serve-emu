@@ -29,29 +29,47 @@ describe("serve-emu WebRTC stats report", () => {
     expect(
       buildWebRtcStatsReport(
         {
+          streamMode: "grpc-screenshot",
           codec: "h264",
           width: 1080,
           height: 2400,
           frames: 1_200,
           fps: 29,
+          configuredFps: 60,
           configuredBitrateBps: 8_000_000,
+          frameStats: {
+            windowFrames: 240,
+            intervalMs: { p50: 16.7, p95: 20.1, max: 30 },
+            avgKeyFrameBytes: 90_000,
+            avgDeltaFrameBytes: 12_000,
+            keyFramesInWindow: 4,
+          },
         },
         publisherSession,
-        { offeredFrames: 1_200, forwardedFrames: 1_190 },
+        { offeredFrames: 1_200, forwardedFrames: 1_190, grpc: null },
         42,
       ),
     ).toEqual({
       sampledAt: 42,
       source: {
+        streamMode: "grpc-screenshot",
         codec: "h264",
         width: 1080,
         height: 2400,
         frames: 1_200,
         fps: 29,
+        configuredFps: 60,
         configuredBitrateBps: 8_000_000,
+        frameStats: {
+          windowFrames: 240,
+          intervalMs: { p50: 16.7, p95: 20.1, max: 30 },
+          avgKeyFrameBytes: 90_000,
+          avgDeltaFrameBytes: 12_000,
+          keyFramesInWindow: 4,
+        },
       },
       sessions: [publisherSession],
-      capture: { offeredFrames: 1_200, forwardedFrames: 1_190 },
+      capture: { offeredFrames: 1_200, forwardedFrames: 1_190, grpc: null },
     });
   });
 
@@ -60,15 +78,18 @@ describe("serve-emu WebRTC stats report", () => {
 describe("GET /webrtc/stats", () => {
   const report = buildWebRtcStatsReport(
     {
+      streamMode: "scrcpy",
       codec: "h264",
       width: 1080,
       height: 2400,
       frames: 1_200,
       fps: 29,
+      configuredFps: 60,
       configuredBitrateBps: 8_000_000,
+      frameStats: null,
     },
     publisherSession,
-    { offeredFrames: 1_200, forwardedFrames: 1_190 },
+    { offeredFrames: 1_200, forwardedFrames: 1_190, grpc: null },
     42,
   );
 

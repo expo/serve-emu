@@ -621,6 +621,139 @@ describe("createRouter stream mode", () => {
     ]);
   });
 
+  test("preserves authoritative encoder settings across source replacements", async () => {
+    const opened: Array<{
+      mode: StreamMode;
+      maxSize: number | undefined;
+      bitRate: number | undefined;
+      maxFps: number | undefined;
+    }> = [];
+    const router = createRouter(
+      { serial: "emulator-5554" },
+      {
+        listDevices: async () => [
+          { serial: "emulator-5554", state: "device" },
+        ],
+        createApp: (options) =>
+          createApp(options, {
+            startSession: async (sessionOptions) => {
+              opened.push({
+                mode: sessionOptions.mode,
+                maxSize: sessionOptions.maxSize,
+                bitRate: sessionOptions.bitRate,
+                maxFps: sessionOptions.maxFps,
+              });
+              return liveStreamSession(sessionOptions.mode);
+            },
+          }),
+      },
+    );
+
+    await router.handleRequest(
+      new Request("http://router.test/api/stream-mode"),
+    );
+    const settings = await router.handleRequest(
+      new Request("http://router.test/api/stream-settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          maxDimension: 640,
+          h264Bitrate: 4_000_000,
+          h264Fps: 48,
+        }),
+      }),
+    );
+    expect(settings.status).toBe(200);
+
+    const switched = await router.handleRequest(
+      put("/api/stream-mode", { mode: "grpc-screenshot" }),
+    );
+    expect(switched.status).toBe(200);
+    expect(opened.at(-1)).toEqual({
+      mode: "grpc-screenshot",
+      maxSize: 640,
+      bitRate: 4_000_000,
+      maxFps: 48,
+    });
+    await router.stopAll();
+  });
+
+  test("serializes settings updates with source replacements", async () => {
+    const releaseSettingsRestart = deferred<void>();
+    let settingsRestartStarted = false;
+    const opened: Array<{
+      mode: StreamMode;
+      maxSize: number | undefined;
+      bitRate: number | undefined;
+      maxFps: number | undefined;
+    }> = [];
+    const router = createRouter(
+      { serial: "emulator-5554" },
+      {
+        listDevices: async () => [
+          { serial: "emulator-5554", state: "device" },
+        ],
+        createApp: (options) =>
+          createApp(options, {
+            startSession: async (sessionOptions) => {
+              opened.push({
+                mode: sessionOptions.mode,
+                maxSize: sessionOptions.maxSize,
+                bitRate: sessionOptions.bitRate,
+                maxFps: sessionOptions.maxFps,
+              });
+              if (
+                sessionOptions.mode === "scrcpy" &&
+                sessionOptions.maxSize === 640
+              ) {
+                settingsRestartStarted = true;
+                await releaseSettingsRestart.promise;
+              }
+              return liveStreamSession(sessionOptions.mode);
+            },
+          }),
+      },
+    );
+
+    await router.handleRequest(
+      new Request("http://router.test/api/stream-mode"),
+    );
+    const settingsRequest = router.handleRequest(
+      new Request("http://router.test/api/stream-settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          maxDimension: 640,
+          h264Bitrate: 4_000_000,
+          h264Fps: 48,
+        }),
+      }),
+    );
+    await waitFor(() => settingsRestartStarted);
+    const switchRequest = router.handleRequest(
+      put("/api/stream-mode", { mode: "grpc-screenshot" }),
+    );
+    // Give an uncoordinated mode switch enough turns to snapshot stale values.
+    for (let turn = 0; turn < 5; turn++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    releaseSettingsRestart.resolve();
+
+    const [settings, switched] = await Promise.all([
+      settingsRequest,
+      switchRequest,
+    ]);
+    expect(settings.status).toBe(200);
+    expect(switched.status).toBe(200);
+    expect(opened.at(-1)).toEqual({
+      mode: "grpc-screenshot",
+      maxSize: 640,
+      bitRate: 4_000_000,
+      maxFps: 48,
+    });
+    await router.stopAll();
+  });
+
   test("preserves recorded events when only the same device's source changes", async () => {
     const router = createRouter(
       { serial: "emulator-5554" },

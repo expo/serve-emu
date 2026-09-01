@@ -500,9 +500,12 @@ describe("server recovery watchdog", () => {
       expect(response.headers.get("cache-control")).toBe("no-store");
       expect(await response.json()).toMatchObject({
         source: {
+          streamMode: "scrcpy",
           codec: "h264",
           frames: 1,
+          configuredFps: 60,
           configuredBitrateBps: 8_000_000,
+          frameStats: { windowFrames: 1 },
         },
         sessions: [{
           sessionId,

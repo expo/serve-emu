@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   GrpcFrameWritePacer,
+  GrpcCaptureDiagnosticsTracker,
   GrpcInputState,
   GrpcNativeTouchGeometryMonitor,
   H264StartupGate,
@@ -188,6 +189,66 @@ describe("gRPC screenshot session helpers", () => {
 
     pacer.recordWrite(50, false);
     expect(pacer.waitMs(50)).toBe(50);
+  });
+
+  test("reports cumulative gRPC capture loss, source timing, and encoder writes", () => {
+    const diagnostics = new GrpcCaptureDiagnosticsTracker(4);
+    for (const event of [
+      "received",
+      "emitted",
+      "received",
+      "coalesced",
+      "received",
+      "emitted",
+      "received",
+      "coalesced",
+      "received",
+      "emitted",
+    ] as const) {
+      diagnostics.recordGrpcMessage(event);
+    }
+
+    diagnostics.recordUsableImage(
+      { seq: 10, timestampUs: 1_000_000n },
+      1_002,
+    );
+    diagnostics.recordUsableImage(
+      { seq: 12, timestampUs: 1_020_000n },
+      1_025,
+    );
+    diagnostics.recordUsableImage(
+      { seq: 13, timestampUs: 1_050_000n },
+      1_057,
+    );
+    diagnostics.recordEncoderWrite(false, true);
+    diagnostics.recordEncoderWrite(false, false);
+    diagnostics.recordEncoderWrite(true, true);
+
+    expect(diagnostics.snapshot()).toEqual({
+      rawGrpcMessagesReceived: 5,
+      rawGrpcMessagesEmitted: 3,
+      rawGrpcMessagesCoalesced: 2,
+      usableImages: 3,
+      sequenceGaps: 1,
+      sourceTimestampIntervalMs: {
+        windowSamples: 2,
+        latest: 30,
+        p50: 30,
+        p95: 30,
+        max: 30,
+      },
+      productionToReceiveLatencyMs: {
+        windowSamples: 3,
+        latest: 7,
+        p50: 5,
+        p95: 7,
+        max: 7,
+      },
+      freshEncoderWriteAttempts: 2,
+      repeatEncoderWriteAttempts: 1,
+      acceptedEncoderWrites: 2,
+      encoderBackpressureRejections: 1,
+    });
   });
 
   test("refreshes native touch size only after the display-size signal changes", async () => {
