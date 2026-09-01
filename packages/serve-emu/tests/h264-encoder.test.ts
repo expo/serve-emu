@@ -5,6 +5,7 @@ import {
   H264Encoder,
   H264OutputParser,
   resolveFfmpeg,
+  videoFilter,
   type H264EncoderOpts,
 } from "../src/h264-encoder.ts";
 import type { ExecResult } from "../src/exec.ts";
@@ -36,6 +37,18 @@ function execResult(
     ...overrides,
   };
 }
+
+function hasFfmpegWithLibx264(): boolean {
+  const result = spawnSync(
+    resolveFfmpeg(),
+    ["-hide_banner", "-encoders"],
+    { encoding: "utf8" },
+  );
+  return result.status === 0 &&
+    /\blibx264\b/.test(`${result.stdout ?? ""}\n${result.stderr ?? ""}`);
+}
+
+const realFfmpegTest = hasFfmpegWithLibx264() ? test : test.skip;
 
 function nal(
   typeByte: number,
@@ -290,7 +303,15 @@ describe("H264Encoder validation", () => {
     await encoder.close();
   });
 
-  test("applies Android quarter-turn direction to encoded pixels", async () => {
+  test("maps Android quarter turns to ffmpeg rotation filters", () => {
+    const crop = "crop=trunc(iw/2)*2:trunc(ih/2)*2";
+    expect(videoFilter(0)).toBe(crop);
+    expect(videoFilter(1)).toBe(`${crop},transpose=cclock`);
+    expect(videoFilter(2)).toBe(`${crop},hflip,vflip`);
+    expect(videoFilter(3)).toBe(`${crop},transpose=clock`);
+  });
+
+  realFfmpegTest("applies Android quarter-turn direction to encoded pixels", async () => {
     // Keep both encoded dimensions at least one H.264 macroblock so this
     // real-ffmpeg test behaves consistently across libx264 builds.
     const width = 16;
@@ -315,8 +336,10 @@ describe("H264Encoder validation", () => {
     let config: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let keyFrame: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let resolveKeyFrame!: () => void;
-    const keyFrameReady = new Promise<void>((resolve) => {
+    let rejectKeyFrame!: (reason?: unknown) => void;
+    const keyFrameReady = new Promise<void>((resolve, reject) => {
       resolveKeyFrame = resolve;
+      rejectKeyFrame = reject;
     });
     const encoder = new H264Encoder({
       ...valid,
@@ -329,6 +352,9 @@ describe("H264Encoder validation", () => {
           keyFrame = frame.data;
           resolveKeyFrame();
         }
+      },
+      onExit(reason) {
+        rejectKeyFrame(new Error(reason));
       },
     });
     encoder.write(rgb, 1n);

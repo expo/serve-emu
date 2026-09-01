@@ -107,7 +107,7 @@ function validateOptions(opts: H264EncoderOpts): number {
   return bytes;
 }
 
-function videoFilter(quarterTurn: QuarterTurn): string {
+export function videoFilter(quarterTurn: QuarterTurn): string {
   const filters = ["crop=trunc(iw/2)*2:trunc(ih/2)*2"];
   if (quarterTurn === 1) filters.push("transpose=cclock");
   else if (quarterTurn === 2) filters.push("hflip", "vflip");
