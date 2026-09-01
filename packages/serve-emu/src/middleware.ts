@@ -81,6 +81,10 @@ export type AppOptions = {
   streamSettings?: StreamSettings;
 } & BrowserOriginPolicy;
 
+export type CreateAppDependencies = {
+  startScrcpy: typeof startScrcpy;
+};
+
 type SessionStatus = "streaming" | "stopped" | "error";
 
 type Client = {
@@ -106,11 +110,85 @@ const MAX_JSON_BODY_BYTES = 8 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_WEBRTC_CLOSE_BODY_BYTES = 4 * 1024;
 const MAX_LOGCAT_QUERY_BYTES = 200;
+const MAX_STREAM_DIMENSION = 4_096;
+const MIN_H264_BITRATE = 100_000;
+const MAX_H264_BITRATE = 50_000_000;
+const MAX_H264_FPS = 120;
 // After a device's scrcpy start fails, wait this long before retrying so a
 // flapping device doesn't get hammered on every request.
 const SPAWN_RETRY_COOLDOWN_MS = 5_000;
 
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+type StreamEncoderSettings = {
+  maxDimension: number;
+  h264Bitrate: number;
+  h264Fps: number;
+};
+
+type StreamEncoderSettingsPatch = Partial<StreamEncoderSettings>;
+
+const STREAM_ENCODER_SETTING_KEYS = new Set<keyof StreamEncoderSettings>([
+  "maxDimension",
+  "h264Bitrate",
+  "h264Fps",
+]);
+
+class InvalidStreamSettingsError extends Error {}
+
+function parseStreamEncoderSettingsPatch(value: unknown): StreamEncoderSettingsPatch {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new InvalidStreamSettingsError("stream settings must be an object");
+  }
+  const input = value as Record<string, unknown>;
+  const keys = Object.keys(input);
+  if (keys.length === 0) {
+    throw new InvalidStreamSettingsError("stream settings patch must not be empty");
+  }
+  const unknownKey = keys.find(
+    (key) => !STREAM_ENCODER_SETTING_KEYS.has(key as keyof StreamEncoderSettings),
+  );
+  if (unknownKey) {
+    throw new InvalidStreamSettingsError(`unknown stream setting: ${unknownKey}`);
+  }
+
+  const readInteger = (key: keyof StreamEncoderSettings, min: number, max: number) => {
+    if (!(key in input)) return undefined;
+    const setting = input[key];
+    if (
+      typeof setting !== "number" ||
+      !Number.isFinite(setting) ||
+      !Number.isInteger(setting) ||
+      setting < min ||
+      setting > max
+    ) {
+      throw new InvalidStreamSettingsError(
+        `${key} must be an integer between ${min} and ${max}`,
+      );
+    }
+    return setting;
+  };
+
+  const maxDimension = readInteger("maxDimension", 0, MAX_STREAM_DIMENSION);
+  const h264Bitrate = readInteger("h264Bitrate", MIN_H264_BITRATE, MAX_H264_BITRATE);
+  const h264Fps = readInteger("h264Fps", 1, MAX_H264_FPS);
+  return {
+    ...(maxDimension !== undefined ? { maxDimension } : {}),
+    ...(h264Bitrate !== undefined ? { h264Bitrate } : {}),
+    ...(h264Fps !== undefined ? { h264Fps } : {}),
+  };
+}
+
+function streamEncoderSettingsEqual(
+  left: StreamEncoderSettings,
+  right: StreamEncoderSettings,
+): boolean {
+  return (
+    left.maxDimension === right.maxDimension &&
+    left.h264Bitrate === right.h264Bitrate &&
+    left.h264Fps === right.h264Fps
+  );
+}
 
 const STATIC_CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -162,7 +240,10 @@ function serveStaticFile(pathname: string): Response | null {
  * an `attachWebSocket` for the H.264/gesture channel. `server.ts` (Bun) and the
  * Expo DevTools plugin both mount these onto their own transport.
  */
-export async function createApp(opts: AppOptions) {
+export async function createApp(
+  opts: AppOptions,
+  dependencies: CreateAppDependencies = { startScrcpy },
+) {
   const uploader = createMiddlewareUploader({
     serial: opts.serial,
     maxApkUploadBytes: opts.maxApkUploadBytes,
@@ -171,13 +252,18 @@ export async function createApp(opts: AppOptions) {
     maxQueuedUploads: opts.maxQueuedUploads,
     uploadQueueTimeoutMs: opts.uploadQueueTimeoutMs,
   });
+  let streamEncoderSettings: StreamEncoderSettings = {
+    maxDimension: opts.maxSize ?? 1280,
+    h264Bitrate: opts.bitRate ?? 8_000_000,
+    h264Fps: opts.maxFps ?? 30,
+  };
   let session: ScrcpySession;
   try {
-    session = await startScrcpy({
+    session = await dependencies.startScrcpy({
       serial: opts.serial,
-      maxFps: opts.maxFps,
-      bitRate: opts.bitRate,
-      maxSize: opts.maxSize,
+      maxFps: streamEncoderSettings.h264Fps,
+      bitRate: streamEncoderSettings.h264Bitrate,
+      maxSize: streamEncoderSettings.maxDimension,
       keyFrameInterval: opts.keyFrameInterval,
     });
   } catch (error) {
@@ -194,6 +280,8 @@ export async function createApp(opts: AppOptions) {
   let lastError: string | null = null;
   let stoppedAt: string | null = null;
   let stopRequested = false;
+  let captureRestarting = false;
+  let sessionGeneration = 1;
   let frameCount = 0;
   let configPacketCount = 0;
   let lastFrameMs = 0;
@@ -222,6 +310,7 @@ export async function createApp(opts: AppOptions) {
   const health = () => ({
     ok: status === "streaming",
     status,
+    captureRestarting,
     serial: opts.serial,
     device: session.meta.deviceName,
     codec: session.meta.codecId,
@@ -270,6 +359,7 @@ export async function createApp(opts: AppOptions) {
   const markTerminal = (nextStatus: Exclude<SessionStatus, "streaming">, reason: string) => {
     if (status !== "streaming") return;
     status = nextStatus;
+    captureRestarting = false;
     lastError = reason;
     stoppedAt = new Date().toISOString();
     if (watchdog) clearInterval(watchdog);
@@ -365,7 +455,12 @@ export async function createApp(opts: AppOptions) {
 
   const dispatchGesture = async (gesture: Gesture, source: string, record = true) => {
     if (status !== "streaming") throw new Error(`session is ${status}`);
+    if (captureRestarting) throw new Error("video capture is restarting");
+    const generation = sessionGeneration;
     await dispatch(session.controlSocket, gesture, screen);
+    if (generation !== sessionGeneration || captureRestarting) {
+      throw new Error("video capture restarted during input");
+    }
     if (record) sessionRecorder.recordGesture(gesture, source);
   };
 
@@ -533,6 +628,7 @@ export async function createApp(opts: AppOptions) {
   const fileImportEndpoint = (req: Request) => uploader.importFile(req);
 
   const performVideoReset = (reason: string) => {
+    if (status !== "streaming" || captureRestarting) return;
     const now = Date.now();
     lastVideoResetMs = now;
     videoResetRequests++;
@@ -544,7 +640,7 @@ export async function createApp(opts: AppOptions) {
   };
 
   const requestVideoReset = (reason: string) => {
-    if (status !== "streaming") return;
+    if (status !== "streaming" || captureRestarting) return;
     const now = Date.now();
     const remainingCooldownMs = VIDEO_RESET_COOLDOWN_MS - (now - lastVideoResetMs);
     if (remainingCooldownMs <= 0) {
@@ -629,76 +725,213 @@ export async function createApp(opts: AppOptions) {
   // self-contained Access Unit the browser can hand straight to WebCodecs.
   let cachedConfig: Buffer | null = null;
 
-  (async () => {
-    try {
-      while (!stopRequested) {
-        const f = await session.readFrame();
-        if (!f) {
-          if (!stopRequested) markTerminal("error", "scrcpy video stream ended");
-          break;
-        }
-        if (f.type === "session") {
-          // The encoder restarted with a new size (device rotation). Adopt it so
-          // touch packets keep matching the video size (scrcpy drops touches
-          // whose embedded screen size disagrees), and resync every client onto
-          // the new stream from a fresh keyframe.
-          if (f.width > 0 && f.height > 0) {
-            screen.width = f.width;
-            screen.height = f.height;
-            cachedConfig = null;
-            for (const c of clients) {
-              if (!c.video) continue;
-              c.awaitingKeyFrame = true;
-              sendJson(c.socket, { type: "video-session", size: { width: f.width, height: f.height } });
-            }
-            webRtcPublisher?.resetVideoSource();
+  const startCaptureReader = (activeSession: ScrcpySession, generation: number) => {
+    void (async () => {
+      try {
+        while (!stopRequested && generation === sessionGeneration) {
+          const f = await activeSession.readFrame();
+          if (stopRequested || generation !== sessionGeneration) break;
+          if (!f) {
+            markTerminal("error", "scrcpy video stream ended");
+            break;
           }
-          continue;
-        }
-        if (f.isConfig) {
-          cachedConfig = f.data;
-          configPacketCount++;
-          continue;
-        }
-        frameCount++;
-        lastFrameMs = Date.now();
-        const config = f.isKey ? cachedConfig : null;
-        webRtcPublisher?.sendFrame(f, config);
-        let rawOut: Buffer | null = null;
-        let framedOut: Buffer | null = null;
-        for (const c of clients) {
-          if (!c.video) continue;
-          if (c.awaitingKeyFrame && !f.isKey) {
-            c.droppedFrames++;
-            totalDroppedFrames++;
+          if (f.type === "session") {
+            // The encoder restarted with a new size (device rotation). Adopt it so
+            // touch packets keep matching the video size (scrcpy drops touches
+            // whose embedded screen size disagrees), and resync every client onto
+            // the new stream from a fresh keyframe.
+            if (f.width > 0 && f.height > 0) {
+              screen.width = f.width;
+              screen.height = f.height;
+              cachedConfig = null;
+              for (const c of clients) {
+                if (!c.video) continue;
+                c.awaitingKeyFrame = true;
+                sendJson(c.socket, {
+                  type: "video-session",
+                  size: { width: f.width, height: f.height },
+                });
+              }
+              webRtcPublisher?.resetVideoSource();
+            }
             continue;
           }
-          const out = c.frameMeta
-            ? (framedOut ??= withFrameMeta(f.data, f, config))
-            : (rawOut ??= withConfig(f.data, config));
-          sendFrame(c, out, f.isKey);
+          if (f.isConfig) {
+            cachedConfig = f.data;
+            configPacketCount++;
+            continue;
+          }
+          frameCount++;
+          lastFrameMs = Date.now();
+          const config = f.isKey ? cachedConfig : null;
+          webRtcPublisher?.sendFrame(f, config);
+          let rawOut: Buffer | null = null;
+          let framedOut: Buffer | null = null;
+          for (const c of clients) {
+            if (!c.video) continue;
+            if (c.awaitingKeyFrame && !f.isKey) {
+              c.droppedFrames++;
+              totalDroppedFrames++;
+              continue;
+            }
+            const out = c.frameMeta
+              ? (framedOut ??= withFrameMeta(f.data, f, config))
+              : (rawOut ??= withConfig(f.data, config));
+            sendFrame(c, out, f.isKey);
+          }
+        }
+      } catch (err) {
+        if (!stopRequested && generation === sessionGeneration) {
+          markTerminal("error", String(err));
         }
       }
-    } catch (err) {
-      if (!stopRequested) markTerminal("error", String(err));
+    })();
+
+    activeSession.proc.once("exit", (code, signal) => {
+      if (
+        !stopRequested &&
+        generation === sessionGeneration &&
+        status === "streaming"
+      ) {
+        markTerminal(
+          "error",
+          `scrcpy exited with code ${code ?? "null"} signal ${signal ?? "null"}`,
+        );
+      }
+    });
+    activeSession.controlSocket.once("error", (err) => {
+      if (
+        !stopRequested &&
+        generation === sessionGeneration &&
+        status === "streaming"
+      ) {
+        markTerminal("error", `scrcpy control socket error: ${err.message}`);
+      }
+    });
+  };
+
+  const validateCapture = (candidate: ScrcpySession) => {
+    if (streamSettings.transport === "webrtc" && candidate.meta.codecId !== "h264") {
+      throw new Error(
+        `WebRTC transport currently supports only H.264, but scrcpy selected ${candidate.meta.codecId}.`,
+      );
     }
-  })();
+  };
+
+  const activateCapture = async (
+    nextSession: ScrcpySession,
+    settings: StreamEncoderSettings,
+    notifyClients: boolean,
+  ): Promise<void> => {
+    try {
+      validateCapture(nextSession);
+      if (stopRequested || status !== "streaming") {
+        throw new Error(`session is ${status}`);
+      }
+    } catch (err) {
+      await nextSession.close();
+      throw err;
+    }
+
+    session = nextSession;
+    streamEncoderSettings = settings;
+    captureRestarting = false;
+    const generation = ++sessionGeneration;
+    screen.width = nextSession.meta.width;
+    screen.height = nextSession.meta.height;
+    cachedConfig = null;
+    if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
+    pendingVideoResetTimer = null;
+    pendingVideoResetReason = null;
+    lastVideoResetMs = 0;
+    if (notifyClients) {
+      for (const client of clients) {
+        if (!client.video) continue;
+        client.awaitingKeyFrame = true;
+        sendJson(client.socket, {
+          type: "video-session",
+          size: { width: screen.width, height: screen.height },
+        });
+      }
+      webRtcPublisher?.resetVideoSource();
+    }
+    startCaptureReader(nextSession, generation);
+    if (notifyClients) requestVideoReset("stream settings changed");
+  };
+
+  const startCapture = (settings: StreamEncoderSettings) =>
+    dependencies.startScrcpy({
+      serial: opts.serial,
+      maxFps: settings.h264Fps,
+      bitRate: settings.h264Bitrate,
+      maxSize: settings.maxDimension,
+      keyFrameInterval: opts.keyFrameInterval,
+    });
+
+  let streamSettingsUpdate: Promise<void> = Promise.resolve();
+  const updateStreamEncoderSettings = (
+    patch: StreamEncoderSettingsPatch,
+  ): Promise<StreamEncoderSettings> => {
+    const update = streamSettingsUpdate.then(async () => {
+      if (stopRequested || status !== "streaming") {
+        throw new Error(`session is ${status}`);
+      }
+      const previousSettings = streamEncoderSettings;
+      const nextSettings = { ...previousSettings, ...patch };
+      if (streamEncoderSettingsEqual(previousSettings, nextSettings)) {
+        return { ...previousSettings };
+      }
+
+      const previousSession = session;
+      captureRestarting = true;
+      if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
+      pendingVideoResetTimer = null;
+      pendingVideoResetReason = null;
+      ++sessionGeneration;
+      let replacement: ScrcpySession | null = null;
+      try {
+        await previousSession.close();
+        replacement = await startCapture(nextSettings);
+        const candidate = replacement;
+        replacement = null;
+        await activateCapture(candidate, nextSettings, true);
+        return { ...streamEncoderSettings };
+      } catch (updateError) {
+        if (replacement) await replacement.close().catch(() => {});
+        if (stopRequested || status !== "streaming") throw updateError;
+
+        let rollback: ScrcpySession | null = null;
+        try {
+          rollback = await startCapture(previousSettings);
+          const candidate = rollback;
+          rollback = null;
+          await activateCapture(candidate, previousSettings, true);
+        } catch (rollbackError) {
+          if (rollback) await rollback.close().catch(() => {});
+          if (stopRequested || status !== "streaming") throw updateError;
+          captureRestarting = false;
+          markTerminal(
+            "error",
+            `scrcpy stream settings update failed (${errMsg(updateError)}); rollback failed (${errMsg(rollbackError)})`,
+          );
+          throw new Error(lastError ?? errMsg(updateError));
+        }
+        throw updateError;
+      }
+    });
+    streamSettingsUpdate = update.then(
+      () => {},
+      () => {},
+    );
+    return update;
+  };
+
+  startCaptureReader(session, sessionGeneration);
 
   watchdog = setInterval(() => {
     sourceFps = frameCount - lastFpsFrameCount;
     lastFpsFrameCount = frameCount;
   }, 1000);
-
-  session.proc.once("exit", (code, signal) => {
-    if (!stopRequested && status === "streaming") {
-      markTerminal("error", `scrcpy exited with code ${code ?? "null"} signal ${signal ?? "null"}`);
-    }
-  });
-  session.controlSocket.once("error", (err) => {
-    if (!stopRequested && status === "streaming") {
-      markTerminal("error", `scrcpy control socket error: ${err.message}`);
-    }
-  });
 
   const webRtcCorsHeaders = (req: Request) => corsHeadersForRequest(req, opts);
   const webRtcJsonHeaders = (req: Request) => ({
@@ -713,6 +946,48 @@ export async function createApp(opts: AppOptions) {
 
   const handleRequest = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
+
+    if (url.pathname === "/api/stream-settings") {
+      if (req.method === "GET") {
+        await streamSettingsUpdate;
+        return Response.json(streamEncoderSettings, {
+          headers: { "Cache-Control": "no-store" },
+        });
+      }
+      if (req.method !== "PATCH") {
+        return Response.json({ error: "method_not_allowed" }, { status: 405 });
+      }
+      if (!isJsonRequest(req)) {
+        return Response.json({ error: "unsupported_media_type" }, { status: 415 });
+      }
+      let patch: StreamEncoderSettingsPatch;
+      try {
+        patch = parseStreamEncoderSettingsPatch(await readJsonBody(req));
+      } catch (err) {
+        const bodyTooLarge = err instanceof HttpBodyError && err.status === 413;
+        return Response.json(
+          {
+            error: bodyTooLarge ? "body_too_large" : "invalid_stream_settings",
+            message: errMsg(err),
+          },
+          { status: bodyTooLarge ? 413 : 400 },
+        );
+      }
+      try {
+        const settings = await updateStreamEncoderSettings(patch);
+        return Response.json(settings, {
+          headers: { "Cache-Control": "no-store" },
+        });
+      } catch (err) {
+        return Response.json(
+          {
+            error: "stream_settings_failed",
+            message: errMsg(err),
+          },
+          { status: 500 },
+        );
+      }
+    }
 
     if (url.pathname === "/api") {
       return Response.json(
@@ -1173,6 +1448,7 @@ export async function createApp(opts: AppOptions) {
   const stop = () => {
     if (stopRequested) return;
     stopRequested = true;
+    captureRestarting = false;
     if (status === "streaming") {
       status = "stopped";
       stoppedAt = new Date().toISOString();
@@ -1189,7 +1465,9 @@ export async function createApp(opts: AppOptions) {
   };
 
   return {
-    session,
+    get session() {
+      return session;
+    },
     isStreaming: () => status === "streaming",
     health,
     handleRequest,
