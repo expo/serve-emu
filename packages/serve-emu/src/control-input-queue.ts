@@ -2,6 +2,7 @@ import type { Socket } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
   compileGesture,
+  resetVideoPacket,
   type ControlStep,
   type Gesture,
   type Screen,
@@ -29,6 +30,14 @@ export class ControlInputError extends Error {
   }
 }
 
+/** A single semantic input that the active source cannot represent. */
+export class ControlInputRejectedError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "ControlInputRejectedError";
+  }
+}
+
 export type ControlInputCompletion = {
   status: "completed" | "coalesced";
 };
@@ -44,6 +53,21 @@ export type ControlPacketHandle = {
 
 export type ControlBinaryWriter = {
   write(packet: Buffer, signal: AbortSignal): Promise<void>;
+  close?: (reason: Error) => void;
+};
+
+/**
+ * Backend-neutral control adapter. It lets non-scrcpy sources share the same
+ * bounded FIFO, move coalescing, pointer-release reservations, and completion
+ * semantics as the binary scrcpy control socket.
+ */
+export type ControlSemanticDispatcher = {
+  dispatchGesture(
+    gesture: Gesture,
+    screen: Screen,
+    signal: AbortSignal,
+  ): Promise<void>;
+  resetVideo(signal: AbortSignal): Promise<void>;
   close?: (reason: Error) => void;
 };
 
@@ -220,9 +244,11 @@ type CompletionWaiter = {
 };
 
 type QueueEntry = {
+  kind: "gesture" | "packet" | "video-reset";
   steps: ControlStep[];
   bytes: number;
   gesture: Gesture | null;
+  screen: Screen | null;
   moveKey: string | null;
   coalesceKey: string | null;
   waiters: CompletionWaiter[];
@@ -242,6 +268,7 @@ export type ControlInputQueueSnapshot = {
 export type ControlInputQueueOptions = {
   writer?: ControlBinaryWriter;
   socket?: Socket;
+  dispatcher?: ControlSemanticDispatcher;
   clock?: ControlInputClock;
   maxDepth?: number;
   maxBytes?: number;
@@ -252,7 +279,8 @@ const SYSTEM_CLOCK: ControlInputClock = {
 };
 
 export class ControlInputQueue {
-  readonly #writer: ControlBinaryWriter;
+  readonly #writer: ControlBinaryWriter | null;
+  readonly #dispatcher: ControlSemanticDispatcher | null;
   readonly #clock: ControlInputClock;
   readonly #maxDepth: number;
   readonly #maxBytes: number;
@@ -267,11 +295,18 @@ export class ControlInputQueue {
   #openPointers = new Set<string>();
 
   constructor(options: ControlInputQueueOptions) {
-    if (Boolean(options.writer) === Boolean(options.socket)) {
-      throw new Error("ControlInputQueue requires exactly one writer or socket");
+    const adapters = [options.writer, options.socket, options.dispatcher].filter(
+      Boolean,
+    );
+    if (adapters.length !== 1) {
+      throw new Error(
+        "ControlInputQueue requires exactly one writer, socket, or dispatcher",
+      );
     }
     this.#writer =
-      options.writer ?? new SocketControlWriter(options.socket as Socket);
+      options.writer ??
+      (options.socket ? new SocketControlWriter(options.socket) : null);
+    this.#dispatcher = options.dispatcher ?? null;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#maxDepth = positiveInteger(
       options.maxDepth ?? DEFAULT_CONTROL_QUEUE_MAX_DEPTH,
@@ -321,6 +356,7 @@ export class ControlInputQueue {
       tail.steps = compiled.steps;
       tail.bytes = compiled.bytes;
       tail.gesture = compiled.gesture;
+      tail.screen = { ...screen };
       tail.waiters.push(waiter.waiter);
       return { gesture: compiled.gesture, completion: waiter.promise };
     }
@@ -334,9 +370,11 @@ export class ControlInputQueue {
       }
     }
     this.#pending.push({
+      kind: "gesture",
       steps: compiled.steps,
       bytes: compiled.bytes,
       gesture: compiled.gesture,
+      screen: { ...screen },
       moveKey,
       coalesceKey: null,
       waiters: [waiter.waiter],
@@ -350,6 +388,11 @@ export class ControlInputQueue {
     options: { coalesceKey?: string } = {},
   ): ControlPacketHandle {
     this.#assertOpen();
+    if (!this.#writer) {
+      throw new Error(
+        "binary control packets are unavailable for this stream source",
+      );
+    }
     if (!Buffer.isBuffer(packet) || packet.length === 0) {
       throw new Error("control packet must be a non-empty Buffer");
     }
@@ -362,19 +405,64 @@ export class ControlInputQueue {
       this.#reserveCoalesced(tail, bytes);
       const previous = tail.waiters.at(-1);
       if (previous) previous.status = "coalesced";
+      tail.kind = "packet";
       tail.steps = [{ delayMs: 0, packet: Buffer.from(packet) }];
       tail.bytes = bytes;
+      tail.gesture = null;
+      tail.screen = null;
       tail.waiters.push(waiter.waiter);
       return { completion: waiter.promise };
     }
 
     this.#reserveNew(bytes);
     this.#pending.push({
+      kind: "packet",
       steps: [{ delayMs: 0, packet: Buffer.from(packet) }],
       bytes,
       gesture: null,
+      screen: null,
       moveKey: null,
       coalesceKey,
+      waiters: [waiter.waiter],
+    });
+    this.#schedule();
+    return { completion: waiter.promise };
+  }
+
+  /** Queue a source-specific keyframe request in control-message order. */
+  enqueueVideoReset(): ControlPacketHandle {
+    if (this.#writer) {
+      return this.enqueuePacket(resetVideoPacket(), {
+        coalesceKey: "reset-video",
+      });
+    }
+
+    this.#assertOpen();
+    const bytes = 1;
+    const waiter = this.#createWaiter();
+    const tail = this.#pending.at(-1);
+    if (tail?.coalesceKey === "reset-video") {
+      this.#reserveCoalesced(tail, bytes);
+      const previous = tail.waiters.at(-1);
+      if (previous) previous.status = "coalesced";
+      tail.kind = "video-reset";
+      tail.steps = [];
+      tail.bytes = bytes;
+      tail.gesture = null;
+      tail.screen = null;
+      tail.waiters.push(waiter.waiter);
+      return { completion: waiter.promise };
+    }
+
+    this.#reserveNew(bytes);
+    this.#pending.push({
+      kind: "video-reset",
+      steps: [],
+      bytes,
+      gesture: null,
+      screen: null,
+      moveKey: null,
+      coalesceKey: "reset-video",
       waiters: [waiter.waiter],
     });
     this.#schedule();
@@ -393,7 +481,8 @@ export class ControlInputQueue {
             { cause: reason },
           );
     this.#controller.abort(this.#closedError);
-    this.#writer.close?.(this.#closedError);
+    this.#writer?.close?.(this.#closedError);
+    this.#dispatcher?.close?.(this.#closedError);
     this.#openPointers.clear();
 
     const pending = this.#pending;
@@ -505,7 +594,7 @@ export class ControlInputQueue {
         const entry = this.#pending.shift()!;
         this.#active = entry;
         try {
-          await this.#dispatch(entry.steps);
+          await this.#dispatch(entry);
           if (this.#controller.signal.aborted) {
             throw signalError(
               this.#controller.signal,
@@ -516,6 +605,15 @@ export class ControlInputQueue {
             waiter.resolve({ status: waiter.status });
           }
         } catch (err) {
+          if (
+            !this.#controller.signal.aborted &&
+            err instanceof ControlInputRejectedError
+          ) {
+            this.#rejectEntry(entry, err);
+            this.#release(entry);
+            this.#active = null;
+            continue;
+          }
           const failure =
             this.#controller.signal.aborted
               ? signalError(
@@ -526,7 +624,7 @@ export class ControlInputQueue {
               ? err
               : new ControlInputError(
                   "control-dispatch-failed",
-                  `scrcpy control dispatch failed: ${err instanceof Error ? err.message : String(err)}`,
+                  `control dispatch failed: ${err instanceof Error ? err.message : String(err)}`,
                   undefined,
                   { cause: err },
                 );
@@ -545,8 +643,25 @@ export class ControlInputQueue {
     }
   }
 
-  async #dispatch(steps: ControlStep[]): Promise<void> {
-    for (const step of steps) {
+  async #dispatch(entry: QueueEntry): Promise<void> {
+    if (this.#dispatcher) {
+      if (entry.kind === "gesture") {
+        await this.#dispatcher.dispatchGesture(
+          entry.gesture as Gesture,
+          entry.screen as Screen,
+          this.#controller.signal,
+        );
+      } else if (entry.kind === "video-reset") {
+        await this.#dispatcher.resetVideo(this.#controller.signal);
+      } else {
+        throw new Error(
+          "binary control packets are unavailable for this stream source",
+        );
+      }
+      return;
+    }
+
+    for (const step of entry.steps) {
       if (this.#controller.signal.aborted) {
         throw signalError(
           this.#controller.signal,
@@ -562,7 +677,7 @@ export class ControlInputQueue {
           "control input queue closed",
         );
       }
-      await this.#writer.write(step.packet, this.#controller.signal);
+      await this.#writer!.write(step.packet, this.#controller.signal);
       if (this.#controller.signal.aborted) {
         throw signalError(
           this.#controller.signal,

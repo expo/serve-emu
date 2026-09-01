@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
+import { logControlAcknowledgement } from "./control-ack";
 import { scanAU } from "./h264";
 import { MsePlayer } from "./mse-player";
 import { parseFramePacket } from "../../shared/frame-meta";
@@ -564,6 +565,7 @@ export function useStream(
       ws.onerror = () => setStatus("connection error");
       ws.onmessage = (event) => {
         if (typeof event.data === "string") {
+          logControlAcknowledgement(event.data);
           try {
             const message = JSON.parse(event.data) as {
               type?: string;
@@ -660,13 +662,7 @@ export function useStream(
       ws.onerror = () => setStatus("input connection error");
       ws.onmessage = (event) => {
         if (typeof event.data !== "string") return;
-        try {
-          const message = JSON.parse(event.data) as {
-            ok?: boolean;
-            error?: string;
-          };
-          if (message.ok === false && message.error) setStatus(message.error);
-        } catch {}
+        logControlAcknowledgement(event.data);
       };
       ws.onclose = () => {
         if (directWsRef.current === ws) directWsRef.current = null;

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { spawn } from "node:child_process";
 import {
+  getDisplayRotation,
   getDeviceSize,
   getFontScale,
   getNetworkStatus,
@@ -172,6 +173,60 @@ describe("ADB screenshot and shell commands", () => {
 });
 
 describe("ADB display controls", () => {
+  test("reads the active WindowManager display rotation", async () => {
+    const cases = [
+      { raw: "DisplayRotation\n  mRotation=0 mDeferredRotationPauseCount=0\n", rotation: 0 },
+      { raw: "DisplayRotation\n  mRotation=3 mDeferredRotationPauseCount=0\n", rotation: 3 },
+      { raw: "mCurrentRotation=ROTATION_90\n", rotation: 1 },
+      { raw: "mDisplayRotation=ROTATION_180\n", rotation: 2 },
+    ] as const;
+
+    for (const entry of cases) {
+      const runExec = (async () => result(entry.raw)) as typeof execText;
+      await expect(getDisplayRotation("device-1", runExec)).resolves.toBe(
+        entry.rotation,
+      );
+    }
+
+    const malformed = (async () =>
+      result("display rotation unavailable")) as typeof execText;
+    await expect(getDisplayRotation("device-1", malformed)).rejects.toThrow(
+      "Could not parse active display rotation",
+    );
+  });
+
+  test("uses the active default display instead of stale virtual displays", async () => {
+    const runExec = (async () =>
+      result([
+        "Display: mDisplayId=1903",
+        "  overrideConfig={ mDisplayRotation=ROTATION_0 }",
+        "  DisplayRotation",
+        "    mRotation=0",
+        "Display: mDisplayId=0 (organized)",
+        "  overrideConfig={ mDisplayRotation=ROTATION_90 }",
+        "  DisplayRotation",
+        "    mRotation=1",
+        "    mCurrentRotation=ROTATION_90",
+      ].join("\n"))) as typeof execText;
+
+    await expect(getDisplayRotation("device-1", runExec)).resolves.toBe(1);
+  });
+
+  test("makes rotation polling cancellable background work", async () => {
+    const controller = new AbortController();
+    let options: Parameters<typeof execText>[2] | undefined;
+    const runExec = (async (_command, _args, nextOptions) => {
+      options = nextOptions;
+      return result("DisplayRotation\n  mRotation=0\n");
+    }) as typeof execText;
+
+    await expect(
+      getDisplayRotation("device-1", runExec, controller.signal),
+    ).resolves.toBe(0);
+    expect(options?.signal).toBe(controller.signal);
+    expect(options?.lane).toBe("background");
+  });
+
   test("parses physical or override display sizes and rejects malformed output", async () => {
     const successful = (async () =>
       result("Physical size: 1440x2960\nOverride size: 1080x2220\n")) as typeof execText;

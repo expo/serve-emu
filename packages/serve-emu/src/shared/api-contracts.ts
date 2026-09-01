@@ -69,6 +69,21 @@ export type DeviceSelectionResponse = ApiSuccess<{
   device: string;
 }>;
 
+export const STREAM_MODES = ["scrcpy", "grpc-screenshot"] as const;
+export type StreamMode = (typeof STREAM_MODES)[number];
+export function isStreamMode(value: unknown): value is StreamMode {
+  return (
+    typeof value === "string" &&
+    STREAM_MODES.some((mode) => mode === value)
+  );
+}
+export type StreamModeResponse = ApiSuccess<{
+  serial: string;
+  mode: StreamMode;
+  availableModes: StreamMode[];
+  sessionGeneration: number;
+}>;
+
 export type AvdStartResponse = ApiSuccess<{
   serial: string;
   avd: string;
@@ -267,6 +282,7 @@ export type HealthResponse = {
   status: SessionStatus;
   serial: string;
   device: string;
+  streamMode?: StreamMode;
   codec: string;
   size: DeviceSize;
   clients: number;
@@ -289,7 +305,7 @@ export type HealthResponse = {
   lastError: string | null;
   lastErrorCode: string | null;
   lastErrorMeta: Record<string, string | number> | null;
-  /** Changes whenever the active scrcpy device session changes. */
+  /** Changes whenever the active device session or stream source changes. */
   sessionGeneration?: number;
 };
 
@@ -297,6 +313,7 @@ export type ApiInfoResponse = {
   generation: number;
   serial: string;
   device: string;
+  streamMode?: StreamMode;
   codec: string;
   size: DeviceSize;
   status: SessionStatus;
@@ -336,6 +353,10 @@ export type ApiContractMap = {
   "/api/device-grid": { GET: EndpointContract<undefined, DeviceGridResponse> };
   "/api/devices/select": {
     POST: EndpointContract<{ serial: string }, DeviceSelectionResponse>;
+  };
+  "/api/stream-mode": {
+    GET: EndpointContract<undefined, StreamModeResponse>;
+    PUT: EndpointContract<{ mode: StreamMode }, StreamModeResponse>;
   };
   "/api/avds/start": {
     POST: EndpointContract<{ avd: string; select?: boolean }, AvdStartResponse>;
@@ -578,6 +599,15 @@ export function parseApiInfoResponse(value: unknown): ApiInfoResponse {
     generation,
     serial: string(root.serial, "API info response.serial"),
     device: string(root.device, "API info response.device"),
+    ...(root.streamMode === undefined
+      ? {}
+      : {
+          streamMode: oneOf(
+            root.streamMode,
+            STREAM_MODES,
+            "API info response.streamMode",
+          ),
+        }),
     codec: string(root.codec, "API info response.codec"),
     size: parseDeviceSize(root.size, "API info response.size"),
     status: oneOf(
@@ -626,6 +656,49 @@ function parseOkDeviceResponse(value: unknown, kind: "selection" | "avd-start"):
 
 export function parseDeviceSelectionResponse(value: unknown): DeviceSelectionResponse {
   return parseOkDeviceResponse(value, "selection") as DeviceSelectionResponse;
+}
+
+export function parseStreamModeResponse(value: unknown): StreamModeResponse {
+  const root = record(value, "stream mode response");
+  if (root.ok !== true) fail("stream mode response.ok must be true");
+  const serial = string(root.serial, "stream mode response.serial");
+  if (!serial) fail("stream mode response.serial must not be empty");
+  const mode = oneOf(root.mode, STREAM_MODES, "stream mode response.mode");
+  if (!Array.isArray(root.availableModes)) {
+    fail("stream mode response.availableModes must be an array");
+  }
+  const availableModes = root.availableModes.map((value, index) =>
+    oneOf(
+      value,
+      STREAM_MODES,
+      `stream mode response.availableModes[${index}]`,
+    ),
+  );
+  if (availableModes.length === 0) {
+    fail("stream mode response.availableModes must not be empty");
+  }
+  if (new Set(availableModes).size !== availableModes.length) {
+    fail("stream mode response.availableModes must not contain duplicates");
+  }
+  if (!availableModes.includes(mode)) {
+    fail("stream mode response.mode must be available");
+  }
+  const sessionGeneration = number(
+    root.sessionGeneration,
+    "stream mode response.sessionGeneration",
+  );
+  if (!Number.isSafeInteger(sessionGeneration) || sessionGeneration < 0) {
+    fail(
+      "stream mode response.sessionGeneration must be a non-negative safe integer",
+    );
+  }
+  return {
+    ok: true,
+    serial,
+    mode,
+    availableModes,
+    sessionGeneration,
+  };
 }
 
 export function parseAvdStartResponse(value: unknown): AvdStartResponse {
@@ -1066,6 +1139,15 @@ export function parseHealthResponse(value: unknown): HealthResponse {
     status: oneOf(root.status, ["streaming", "stopped", "error"] as const, "health response.status"),
     serial: string(root.serial, "health response.serial"),
     device: string(root.device, "health response.device"),
+    ...(root.streamMode === undefined
+      ? {}
+      : {
+          streamMode: oneOf(
+            root.streamMode,
+            STREAM_MODES,
+            "health response.streamMode",
+          ),
+        }),
     codec: string(root.codec, "health response.codec"),
     size: parseDeviceSize(root.size, "health response.size"),
     clients: number(root.clients, "health response.clients"),
@@ -1121,6 +1203,10 @@ export const API_SUCCESS_PARSERS = {
   "/api/devices": { GET: parseDeviceListResponse },
   "/api/device-grid": { GET: parseDeviceGridResponse },
   "/api/devices/select": { POST: parseDeviceSelectionResponse },
+  "/api/stream-mode": {
+    GET: parseStreamModeResponse,
+    PUT: parseStreamModeResponse,
+  },
   "/api/avds/start": { POST: parseAvdStartResponse },
   "/api/avds/stop": { POST: parseAvdStopResponse },
   "/api/orientation": { GET: parseOrientationResponse, POST: parseOrientationResponse },

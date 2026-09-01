@@ -132,6 +132,46 @@ export async function getDeviceSize(
   return { width: Number(m[1]), height: Number(m[2]) };
 }
 
+export type DisplayRotation = 0 | 1 | 2 | 3;
+
+/** Read the active display rotation rather than the user's rotation policy. */
+export async function getDisplayRotation(
+  serial: string,
+  runExec: typeof execText = execText,
+  signal?: AbortSignal,
+): Promise<DisplayRotation> {
+  const r = await runExec(
+    "adb",
+    ["-s", serial, "shell", "dumpsys", "window", "displays"],
+    { timeout: ADB_QUERY_TIMEOUT_MS, signal, lane: "background" },
+  );
+  if (execFailed(r)) {
+    throw new Error(`dumpsys window displays failed: ${execFailure(r)}`);
+  }
+
+  const defaultDisplayMarker = r.stdout.match(
+    /(?:^|\n)[ \t]*Display:\s+mDisplayId=0\b/,
+  );
+  let displayState = r.stdout;
+  if (defaultDisplayMarker?.index !== undefined) {
+    const start = defaultDisplayMarker.index + defaultDisplayMarker[0].length;
+    const remainder = r.stdout.slice(start);
+    const nextDisplay = remainder.search(/\n[ \t]*Display:\s+mDisplayId=/);
+    displayState = nextDisplay === -1
+      ? remainder
+      : remainder.slice(0, nextDisplay);
+  }
+
+  const match = displayState.match(
+    /\bm(?:Current|Display)?Rotation=(?:ROTATION_)?(0|1|2|3|90|180|270)\b/,
+  );
+  if (!match) {
+    throw new Error("Could not parse active display rotation");
+  }
+  const value = Number(match[1]);
+  return (value > 3 ? value / 90 : value) as DisplayRotation;
+}
+
 function orientationFromRotation(mode: "free" | "lock" | "unknown", rotation: number | null): OrientationStatus["orientation"] {
   if (mode === "free") return "auto";
   if (rotation === 0 || rotation === 2) return "portrait";

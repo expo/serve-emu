@@ -3,11 +3,13 @@ import {
   API_ERROR_CODES,
   API_SUCCESS_PARSERS,
   isApiFailure,
+  isStreamMode,
   parseApiFailure,
   parseApiResponse,
   parseDeviceGridResponse,
   parseHealthResponse,
   parseLogcatEventJson,
+  parseStreamModeResponse,
   type ApiPath,
   type ApiRequest,
   type ApiResponse,
@@ -31,6 +33,13 @@ const routeSnapshot = {
 };
 
 describe("API contracts", () => {
+  test("recognizes only supported stream modes", () => {
+    expect(isStreamMode("scrcpy")).toBe(true);
+    expect(isStreamMode("grpc-screenshot")).toBe(true);
+    expect(isStreamMode("screen-copy")).toBe(false);
+    expect(isStreamMode(null)).toBe(false);
+  });
+
   test("accepts every stable failure code and rejects drift", () => {
     for (const code of API_ERROR_CODES) {
       expect(parseApiFailure({ ok: false, error: { code, message: "safe" } })).toEqual({
@@ -66,6 +75,41 @@ describe("API contracts", () => {
     expect(() => parseDeviceGridResponse({ ok: true, devices: [] })).toThrow("currentSerial");
   });
 
+  test("validates stream mode availability and session identity", () => {
+    const response = parseStreamModeResponse({
+      ok: true,
+      serial: "emulator-5554",
+      mode: "grpc-screenshot",
+      availableModes: ["scrcpy", "grpc-screenshot"],
+      sessionGeneration: 7,
+    });
+    expect(response).toEqual({
+      ok: true,
+      serial: "emulator-5554",
+      mode: "grpc-screenshot",
+      availableModes: ["scrcpy", "grpc-screenshot"],
+      sessionGeneration: 7,
+    });
+    expect(() =>
+      parseStreamModeResponse({
+        ...response,
+        mode: "screen-copy",
+      }),
+    ).toThrow("mode");
+    expect(() =>
+      parseStreamModeResponse({
+        ...response,
+        availableModes: ["scrcpy"],
+      }),
+    ).toThrow("must be available");
+    expect(() =>
+      parseStreamModeResponse({
+        ...response,
+        sessionGeneration: -1,
+      }),
+    ).toThrow("non-negative safe integer");
+  });
+
   test("the endpoint parser registry validates mutations and failures", () => {
     expect(parseApiResponse("/api/apps/launch", "POST", { ok: true, output: "started" })).toEqual({
       ok: true,
@@ -98,7 +142,7 @@ describe("API contracts", () => {
     ) as Record<ApiPath, true>;
     expect(request.latitude).toBe(51.5072);
     expect(response.ok).toBe(true);
-    expect(Object.keys(paths).length).toBe(31);
+    expect(Object.keys(paths).length).toBe(32);
   });
 
   test("validates health and logcat network boundaries without casts", () => {
@@ -115,6 +159,7 @@ describe("API contracts", () => {
       status: "streaming",
       serial: "emulator-5554",
       device: "Pixel",
+      streamMode: "grpc-screenshot",
       codec: "h264",
       size: { width: 1080, height: 1920 },
       clients: 0,
@@ -140,7 +185,10 @@ describe("API contracts", () => {
       sessionGeneration: 4,
     };
 
-    expect(parseHealthResponse(health).sessionGeneration).toBe(4);
+    expect(parseHealthResponse(health)).toMatchObject({
+      streamMode: "grpc-screenshot",
+      sessionGeneration: 4,
+    });
     expect(() => parseHealthResponse({ ...health, clientsDetail: [{}] })).toThrow(
       "clientsDetail[0].id",
     );

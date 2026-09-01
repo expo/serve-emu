@@ -1,5 +1,6 @@
 import type { ApiDependencies } from "../dependencies.ts";
 import type { ContractApiRoute } from "./types.ts";
+import { isStreamMode } from "../../shared/api-contracts.ts";
 import {
   downstream,
   invalid,
@@ -13,6 +14,25 @@ export function deviceRoutes(): ContractApiRoute<ApiDependencies>[] {
       method: "GET",
       path: "/api",
       handler: ({ deps }) => Response.json(deps.getInfo()),
+    },
+    {
+      method: "GET",
+      path: "/api/stream-mode",
+      handler: ({ deps }) => Response.json(deps.getStreamMode()),
+    },
+    {
+      method: "PUT",
+      path: "/api/stream-mode",
+      handler: async ({ request, deps }) => {
+        const body = await readObject(request, "stream mode payload");
+        const mode = body.mode;
+        if (!isStreamMode(mode)) {
+          invalid("mode must be scrcpy or grpc-screenshot");
+        }
+        return Response.json(
+          await downstream("switch stream mode", () => deps.setStreamMode(mode)),
+        );
+      },
     },
     {
       method: "GET",
