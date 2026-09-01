@@ -1,6 +1,5 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import {
   getUserRotation,
@@ -27,11 +26,10 @@ import {
   stopEmulator,
 } from "./emulator.ts";
 import { getNightMode, isNightMode, setNightMode } from "./ui-mode.ts";
-import { startScrcpy, type ScrcpySession } from "./scrcpy.ts";
-import { dispatch, parseGesture, resetVideoPacket, type Gesture, type Screen } from "./input.ts";
+import { DeviceSessionState } from "./device-session-state.ts";
+import { parseGesture, type Gesture, type Screen } from "./input.ts";
 import { parseGeoFix, setEmulatorLocationAsync, type GeoFix } from "./location.ts";
-import { parseRoutePlaybackRequest, RoutePlayback } from "./route-playback.ts";
-import { SessionRecorder } from "./session-recorder.ts";
+import { parseRoutePlaybackRequest } from "./route-playback.ts";
 import type { StreamSocket } from "./stream-socket.ts";
 import {
   DEFAULT_STREAM_SETTINGS,
@@ -52,11 +50,27 @@ import {
 import { createWebRtcPublisher, type WebRtcPublisher } from "./webrtc-publisher.ts";
 import { HttpBodyError, readBodyLimited, readJsonLimited } from "./request-body.ts";
 import { createMiddlewareUploader } from "./middleware-upload.ts";
+import {
+  adaptScrcpySession,
+  startEmuSession,
+  type EmuSession,
+} from "./stream-session.ts";
+import {
+  ScrcpyStreamError,
+  startScrcpy,
+  type ScrcpySession,
+} from "./scrcpy.ts";
+import {
+  STREAM_MODES,
+  type StreamMode,
+  type StreamModeResponse,
+} from "./shared/api-contracts.ts";
 
 export { fromBunSocket, fromWsSocket } from "./stream-socket.ts";
 export type { StreamSocket, WsWebSocketLike } from "./stream-socket.ts";
 export { pickDevice } from "./adb.ts";
 export type { ScrcpySession } from "./scrcpy.ts";
+export type { EmuSession } from "./stream-session.ts";
 export type {
   StreamSettings,
   WebRtcIceServer,
@@ -69,6 +83,8 @@ const UI_DIR = join(here, "..", "dist", "ui");
 
 export type AppOptions = {
   serial: string;
+  /** Cancels stream-source startup and closes it if cancellation races readiness. */
+  signal?: AbortSignal;
   maxFps?: number;
   bitRate?: number;
   maxSize?: number;
@@ -79,11 +95,11 @@ export type AppOptions = {
   maxQueuedUploads?: number;
   uploadQueueTimeoutMs?: number;
   streamSettings?: StreamSettings;
+  /** Screen capture and input source. Defaults to scrcpy. */
+  streamMode?: StreamMode;
+  /** @internal Shared by router-managed source generations for one device. */
+  deviceState?: DeviceSessionState;
 } & BrowserOriginPolicy;
-
-export type CreateAppDependencies = {
-  startScrcpy: typeof startScrcpy;
-};
 
 type SessionStatus = "streaming" | "stopped" | "error";
 
@@ -190,6 +206,25 @@ function streamEncoderSettingsEqual(
   );
 }
 
+function abortError(signal: AbortSignal, fallback: string): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException(fallback, "AbortError");
+}
+
+function throwIfAborted(signal: AbortSignal | undefined, fallback: string): void {
+  if (signal?.aborted) throw abortError(signal, fallback);
+}
+
+function combineAbortSignals(
+  first: AbortSignal | undefined,
+  second: AbortSignal | undefined,
+): AbortSignal | undefined {
+  if (!first) return second;
+  if (!second || first === second) return first;
+  return AbortSignal.any([first, second]);
+}
+
 const STATIC_CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -235,15 +270,28 @@ function serveStaticFile(pathname: string): Response | null {
 }
 
 /**
- * Build a transport-agnostic serve-emu app for one device: starts scrcpy, owns
+ * Build a transport-agnostic serve-emu app for one device: starts its selected
+ * stream source, owns
  * the client set + video fan-out, and exposes a fetch-style `handleRequest` plus
  * an `attachWebSocket` for the H.264/gesture channel. `server.ts` (Bun) and the
  * Expo DevTools plugin both mount these onto their own transport.
  */
-export async function createApp(
+export type CreateAppDependencies = {
+  startSession?: typeof startEmuSession;
+  /** @internal Legacy test seam retained while callers migrate to startSession. */
+  startScrcpy?: typeof startScrcpy;
+  setLocation?: (
+    serial: string,
+    fix: GeoFix,
+    signal: AbortSignal,
+  ) => Promise<void>;
+};
+
+async function createAppInternal(
   opts: AppOptions,
-  dependencies: CreateAppDependencies = { startScrcpy },
+  dependencies: CreateAppDependencies = {},
 ) {
+  throwIfAborted(opts.signal, "serve-emu app startup aborted");
   const uploader = createMiddlewareUploader({
     serial: opts.serial,
     maxApkUploadBytes: opts.maxApkUploadBytes,
@@ -257,19 +305,35 @@ export async function createApp(
     h264Bitrate: opts.bitRate ?? 8_000_000,
     h264Fps: opts.maxFps ?? 30,
   };
-  let session: ScrcpySession;
+  const openSession: typeof startEmuSession =
+    dependencies.startSession ??
+    (dependencies.startScrcpy
+      ? async (options) =>
+          adaptScrcpySession(await dependencies.startScrcpy!(options))
+      : startEmuSession);
+  let openedSession: EmuSession | null = null;
   try {
-    session = await dependencies.startScrcpy({
+    openedSession = await openSession({
       serial: opts.serial,
+      signal: opts.signal,
       maxFps: streamEncoderSettings.h264Fps,
       bitRate: streamEncoderSettings.h264Bitrate,
       maxSize: streamEncoderSettings.maxDimension,
       keyFrameInterval: opts.keyFrameInterval,
+      mode: opts.streamMode ?? "scrcpy",
     });
+    throwIfAborted(opts.signal, "serve-emu app startup aborted");
   } catch (error) {
+    if (openedSession) {
+      try {
+        await openedSession.close();
+      } catch {}
+    }
     await uploader.close(error);
     throw error;
   }
+  if (!openedSession) throw new Error("stream source did not start");
+  let session: EmuSession = openedSession;
 
   const clients = new Set<Client>();
   const screen: Screen = { width: session.meta.width, height: session.meta.height };
@@ -278,9 +342,12 @@ export async function createApp(
   const startedAt = new Date(startedMs).toISOString();
   let status: SessionStatus = "streaming";
   let lastError: string | null = null;
+  let lastErrorCode: string | null = null;
+  let lastErrorMeta: Record<string, string | number> | null = null;
   let stoppedAt: string | null = null;
   let stopRequested = false;
   let captureRestarting = false;
+  let captureRestartController: AbortController | null = null;
   let sessionGeneration = 1;
   let frameCount = 0;
   let configPacketCount = 0;
@@ -296,16 +363,31 @@ export async function createApp(
   let pendingVideoResetTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingVideoResetReason: string | null = null;
   let watchdog: ReturnType<typeof setInterval> | null = null;
-  let lastLocation: (GeoFix & { appliedAt: string }) | null = null;
   let nextClientId = 1;
   let webRtcPublisher: WebRtcPublisher | null = null;
-  const sessionRecorder = new SessionRecorder();
-  const routePlayback = new RoutePlayback({
-    applyLocation: (fix) => setEmulatorLocationAsync(opts.serial, fix),
-    onLocation: (fix) => {
-      lastLocation = fix;
-    },
-  });
+  let removeFatalListener: (() => void) | null = null;
+  const deviceStateOwner = {};
+  const deviceState =
+    opts.deviceState ??
+    new DeviceSessionState({
+      serial: opts.serial,
+      generation: 0,
+      applyLocation:
+        dependencies.setLocation ??
+        ((serial, fix, signal) =>
+          setEmulatorLocationAsync(serial, fix, signal)),
+    });
+  try {
+    deviceState.acquire(deviceStateOwner);
+  } catch (error) {
+    await Promise.allSettled([
+      session.close(),
+      uploader.close(error),
+    ]);
+    throw error;
+  }
+  const sessionRecorder = deviceState.recorder;
+  const routePlayback = deviceState.route;
 
   const health = () => ({
     ok: status === "streaming",
@@ -313,6 +395,7 @@ export async function createApp(
     captureRestarting,
     serial: opts.serial,
     device: session.meta.deviceName,
+    streamMode: session.mode,
     codec: session.meta.codecId,
     size: { width: screen.width, height: screen.height },
     clients: clients.size,
@@ -325,9 +408,10 @@ export async function createApp(
     videoResetRequests,
     lastVideoResetAt,
     lastVideoResetReason,
-    location: lastLocation,
+    location: deviceState.lastLocation,
     route: routePlayback.snapshot(),
     session: sessionRecorder.snapshot(),
+    logcat: deviceState.logcat.snapshot(),
     uploads: uploader.snapshot(),
     stream: redactedStreamSettings(streamSettings),
     webrtc: webRtcPublisher?.snapshot() ?? null,
@@ -345,6 +429,8 @@ export async function createApp(
     stoppedAt,
     lastFrameAt: lastFrameMs > 0 ? new Date(lastFrameMs).toISOString() : null,
     lastError,
+    lastErrorCode,
+    lastErrorMeta,
   });
 
   const closeClients = (code: number, reason: string) => {
@@ -356,20 +442,31 @@ export async function createApp(
     clients.clear();
   };
 
-  const markTerminal = (nextStatus: Exclude<SessionStatus, "streaming">, reason: string) => {
+  const markTerminal = (
+    nextStatus: Exclude<SessionStatus, "streaming">,
+    reason: string,
+    detail?: {
+      code?: string;
+      meta?: Record<string, string | number> | null;
+    },
+  ) => {
     if (status !== "streaming") return;
     status = nextStatus;
     captureRestarting = false;
     lastError = reason;
+    lastErrorCode = detail?.code ?? null;
+    lastErrorMeta = detail?.meta ?? null;
     stoppedAt = new Date().toISOString();
     if (watchdog) clearInterval(watchdog);
     if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
     pendingVideoResetTimer = null;
     pendingVideoResetReason = null;
-    routePlayback.close();
+    void deviceState.release(deviceStateOwner, reason);
     webRtcPublisher?.close();
     void uploader.close(new Error(reason));
-    session.close();
+    removeFatalListener?.();
+    removeFatalListener = null;
+    void session.close();
     closeClients(nextStatus === "error" ? 1011 : 1000, reason);
   };
 
@@ -457,111 +554,58 @@ export async function createApp(
     if (status !== "streaming") throw new Error(`session is ${status}`);
     if (captureRestarting) throw new Error("video capture is restarting");
     const generation = sessionGeneration;
-    await dispatch(session.controlSocket, gesture, screen);
+    const handle = session.controls.enqueue(gesture, screen);
+    try {
+      await handle.completion;
+    } catch (error) {
+      if (generation !== sessionGeneration || captureRestarting) {
+        throw new Error("video capture restarted during input");
+      }
+      throw error;
+    }
     if (generation !== sessionGeneration || captureRestarting) {
       throw new Error("video capture restarted during input");
     }
-    if (record) sessionRecorder.recordGesture(gesture, source);
+    if (record) sessionRecorder.recordGesture(handle.gesture, source);
   };
 
   const applyLocation = async (fix: GeoFix, source: string, record = true) => {
     routePlayback.stop();
-    await setEmulatorLocationAsync(opts.serial, fix);
-    lastLocation = { ...fix, appliedAt: new Date().toISOString() };
+    const location = await deviceState.applyLocation(fix);
     if (record) sessionRecorder.recordLocation(fix, source);
-    return lastLocation;
+    return location;
   };
 
-  const resolvePackagePids = (packageName: string): Set<string> => {
-    if (!/^[A-Za-z0-9_.:-]+$/.test(packageName)) return new Set();
-    const r = spawnSync("adb", ["-s", opts.serial, "shell", "pidof", packageName], {
-      encoding: "utf8",
-      timeout: 2_000,
+  const activateDeviceState = (): void => {
+    deviceState.activate(deviceStateOwner, {
+      dispatchGesture: async (gesture, signal) => {
+        if (signal.aborted) {
+          throw signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException("session replay cancelled", "AbortError");
+        }
+        await dispatchGesture(gesture, "session:replay", false);
+      },
     });
-    if (r.status !== 0) return new Set();
-    return new Set(r.stdout.trim().split(/\s+/).filter(Boolean));
   };
+  if (!deviceState.hasActiveInput) activateDeviceState();
 
   const logcatStream = (req: Request, url: URL) => {
     const packageName = (url.searchParams.get("package") ?? "").trim().slice(0, MAX_LOGCAT_QUERY_BYTES);
     const search = (url.searchParams.get("search") ?? "").trim().slice(0, MAX_LOGCAT_QUERY_BYTES).toLowerCase();
-    const proc = spawn("adb", ["-s", opts.serial, "logcat", "-v", "threadtime"]);
-    const encoder = new TextEncoder();
-    let pidSet = packageName ? resolvePackagePids(packageName) : new Set<string>();
-    let pidTimer: ReturnType<typeof setInterval> | null = null;
-    let buffer = "";
-
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        const send = (event: string, value: unknown) => {
-          try {
-            controller.enqueue(
-              encoder.encode(`event: ${event}\ndata: ${JSON.stringify(value)}\n\n`),
-            );
-          } catch {}
-        };
-        const matches = (line: string) => {
-          if (search && !line.toLowerCase().includes(search)) return false;
-          if (!packageName) return true;
-          const parts = line.trim().split(/\s+/, 5);
-          const pid = parts[2];
-          return (pid && pidSet.has(pid)) || line.includes(packageName);
-        };
-        const consume = (chunk: Buffer) => {
-          buffer += chunk.toString("utf8");
-          const lines = buffer.split(/\r?\n/);
-          buffer = lines.pop() ?? "";
-          for (const line of lines) {
-            if (line && matches(line)) send("log", { line, at: new Date().toISOString() });
-          }
-        };
-
-        send("ready", {
-          serial: opts.serial,
-          package: packageName || null,
-          pids: Array.from(pidSet),
-          search: search || null,
-        });
-        if (packageName) {
-          pidTimer = setInterval(() => {
-            pidSet = resolvePackagePids(packageName);
-          }, 5_000);
-        }
-        proc.stdout.on("data", consume);
-        proc.stderr.on("data", (chunk) => {
-          const text = chunk.toString("utf8").trim();
-          if (text) send("error", { line: text, at: new Date().toISOString() });
-        });
-        proc.once("exit", (code, signal) => {
-          send("close", { code, signal });
-          try {
-            controller.close();
-          } catch {}
-          if (pidTimer) clearInterval(pidTimer);
-        });
-        proc.once("error", (err) => {
-          send("error", { line: err.message, at: new Date().toISOString() });
-          try {
-            controller.close();
-          } catch {}
-          if (pidTimer) clearInterval(pidTimer);
-        });
-      },
-      cancel() {
-        if (pidTimer) clearInterval(pidTimer);
-        try {
-          proc.kill("SIGTERM");
-        } catch {}
-      },
-    });
-
-    return new Response(stream, {
-      headers: {
-        ...corsHeadersForRequest(req, opts, "GET"),
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-      },
+    const response = deviceState.logcat.subscribe(
+      { packageName, search },
+      req.signal,
+    );
+    const headers = new Headers(response.headers);
+    for (const [name, value] of Object.entries(
+      corsHeadersForRequest(req, opts, "GET"),
+    )) {
+      headers.set(name, value);
+    }
+    return new Response(response.body, {
+      status: response.status,
+      headers,
     });
   };
 
@@ -635,7 +679,7 @@ export async function createApp(
     lastVideoResetAt = new Date(now).toISOString();
     lastVideoResetReason = reason;
     try {
-      session.controlSocket.write(resetVideoPacket());
+      void session.controls.enqueueVideoReset().completion.catch(() => {});
     } catch {}
   };
 
@@ -665,10 +709,13 @@ export async function createApp(
 
   if (streamSettings.transport === "webrtc") {
     if (session.meta.codecId !== "h264") {
-      session.close();
-      routePlayback.close();
+      await session.close();
+      await deviceState.release(
+        deviceStateOwner,
+        "WebRTC codec validation failed",
+      );
       throw new Error(
-        `WebRTC transport currently supports only H.264, but scrcpy selected ${session.meta.codecId}.`,
+        `WebRTC transport currently supports only H.264, but the selected stream source uses ${session.meta.codecId}.`,
       );
     }
     try {
@@ -677,8 +724,11 @@ export async function createApp(
         onKeyframeRequest: requestVideoReset,
       });
     } catch (err) {
-      session.close();
-      routePlayback.close();
+      await session.close();
+      await deviceState.release(
+        deviceStateOwner,
+        "WebRTC publisher startup failed",
+      );
       throw err;
     }
   }
@@ -725,14 +775,14 @@ export async function createApp(
   // self-contained Access Unit the browser can hand straight to WebCodecs.
   let cachedConfig: Buffer | null = null;
 
-  const startCaptureReader = (activeSession: ScrcpySession, generation: number) => {
+  const startCaptureReader = (activeSession: EmuSession, generation: number) => {
     void (async () => {
       try {
         while (!stopRequested && generation === sessionGeneration) {
           const f = await activeSession.readFrame();
           if (stopRequested || generation !== sessionGeneration) break;
           if (!f) {
-            markTerminal("error", "scrcpy video stream ended");
+            markTerminal("error", "video stream ended");
             break;
           }
           if (f.type === "session") {
@@ -782,44 +832,39 @@ export async function createApp(
         }
       } catch (err) {
         if (!stopRequested && generation === sessionGeneration) {
-          markTerminal("error", String(err));
+          if (err instanceof ScrcpyStreamError) {
+            markTerminal("error", err.message, {
+              code: err.code,
+              meta: err.meta ?? null,
+            });
+          } else {
+            markTerminal("error", String(err));
+          }
         }
       }
     })();
 
-    activeSession.proc.once("exit", (code, signal) => {
-      if (
-        !stopRequested &&
-        generation === sessionGeneration &&
-        status === "streaming"
-      ) {
-        markTerminal(
-          "error",
-          `scrcpy exited with code ${code ?? "null"} signal ${signal ?? "null"}`,
-        );
-      }
-    });
-    activeSession.controlSocket.once("error", (err) => {
-      if (
-        !stopRequested &&
-        generation === sessionGeneration &&
-        status === "streaming"
-      ) {
-        markTerminal("error", `scrcpy control socket error: ${err.message}`);
+    removeFatalListener?.();
+    removeFatalListener = activeSession.onFatal((failure) => {
+      if (!stopRequested && generation === sessionGeneration && status === "streaming") {
+        markTerminal("error", failure.message, {
+          code: failure.code,
+          meta: failure.meta ?? null,
+        });
       }
     });
   };
 
-  const validateCapture = (candidate: ScrcpySession) => {
+  const validateCapture = (candidate: EmuSession) => {
     if (streamSettings.transport === "webrtc" && candidate.meta.codecId !== "h264") {
       throw new Error(
-        `WebRTC transport currently supports only H.264, but scrcpy selected ${candidate.meta.codecId}.`,
+        `WebRTC transport currently supports only H.264, but the selected stream source uses ${candidate.meta.codecId}.`,
       );
     }
   };
 
   const activateCapture = async (
-    nextSession: ScrcpySession,
+    nextSession: EmuSession,
     settings: StreamEncoderSettings,
     notifyClients: boolean,
   ): Promise<void> => {
@@ -859,13 +904,19 @@ export async function createApp(
     if (notifyClients) requestVideoReset("stream settings changed");
   };
 
-  const startCapture = (settings: StreamEncoderSettings) =>
-    dependencies.startScrcpy({
+  const startCapture = (
+    settings: StreamEncoderSettings,
+    mode: StreamMode,
+    signal: AbortSignal,
+  ) =>
+    openSession({
       serial: opts.serial,
+      signal: combineAbortSignals(opts.signal, signal),
       maxFps: settings.h264Fps,
       bitRate: settings.h264Bitrate,
       maxSize: settings.maxDimension,
       keyFrameInterval: opts.keyFrameInterval,
+      mode,
     });
 
   let streamSettingsUpdate: Promise<void> = Promise.resolve();
@@ -883,15 +934,24 @@ export async function createApp(
       }
 
       const previousSession = session;
+      const previousMode = previousSession.mode;
+      const restartController = new AbortController();
+      captureRestartController = restartController;
       captureRestarting = true;
       if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
       pendingVideoResetTimer = null;
       pendingVideoResetReason = null;
       ++sessionGeneration;
-      let replacement: ScrcpySession | null = null;
+      removeFatalListener?.();
+      removeFatalListener = null;
+      let replacement: EmuSession | null = null;
       try {
         await previousSession.close();
-        replacement = await startCapture(nextSettings);
+        replacement = await startCapture(
+          nextSettings,
+          previousMode,
+          restartController.signal,
+        );
         const candidate = replacement;
         replacement = null;
         await activateCapture(candidate, nextSettings, true);
@@ -900,9 +960,13 @@ export async function createApp(
         if (replacement) await replacement.close().catch(() => {});
         if (stopRequested || status !== "streaming") throw updateError;
 
-        let rollback: ScrcpySession | null = null;
+        let rollback: EmuSession | null = null;
         try {
-          rollback = await startCapture(previousSettings);
+          rollback = await startCapture(
+            previousSettings,
+            previousMode,
+            restartController.signal,
+          );
           const candidate = rollback;
           rollback = null;
           await activateCapture(candidate, previousSettings, true);
@@ -917,6 +981,10 @@ export async function createApp(
           throw new Error(lastError ?? errMsg(updateError));
         }
         throw updateError;
+      } finally {
+        if (captureRestartController === restartController) {
+          captureRestartController = null;
+        }
       }
     });
     streamSettingsUpdate = update.then(
@@ -995,6 +1063,7 @@ export async function createApp(
           generation: 0,
           serial: opts.serial,
           device: session.meta.deviceName,
+          streamMode: session.mode,
           codec: session.meta.codecId,
           size: { width: screen.width, height: screen.height },
           status,
@@ -1252,17 +1321,12 @@ export async function createApp(
           typeof payload === "object" && payload !== null && !Array.isArray(payload)
             ? Number((payload as Record<string, unknown>).multiplier ?? 1)
             : 1;
-        const replay = sessionRecorder.replay(
-          {
-            dispatchGesture: (gesture) => dispatchGesture(gesture, "session:replay", false),
-            setLocation: async (fix) => {
-              await applyLocation(fix, "session:replay", false);
-            },
-          },
+        const replay = sessionRecorder.startReplay(
+          deviceState.replayHandlers,
           multiplier,
         );
-        void replay.catch(() => {});
-        return Response.json({ ok: true, session: sessionRecorder.snapshot() });
+        void replay.completion.catch(() => {});
+        return Response.json({ ok: true, session: replay.snapshot });
       } catch (err) {
         return Response.json(
           { ok: false, error: err instanceof Error ? err.message : String(err) },
@@ -1273,7 +1337,10 @@ export async function createApp(
 
     if (url.pathname === "/api/session/replay/stop") {
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-      return Response.json({ ok: true, session: sessionRecorder.stopReplay() });
+      return Response.json({
+        ok: true,
+        session: await sessionRecorder.cancelAndWait(),
+      });
     }
 
     if (url.pathname === "/api/apps/install") {
@@ -1329,14 +1396,14 @@ export async function createApp(
         return Response.json({
           serial: opts.serial,
           emulator: /^emulator-\d+$/.test(opts.serial),
-          location: lastLocation,
+          location: deviceState.lastLocation,
         });
       }
       if (req.method === "POST") {
         try {
           const fix = parseGeoFix(await readJsonBody(req));
-          lastLocation = await applyLocation(fix, "rest:location");
-          return Response.json({ ok: true, location: lastLocation });
+          const location = await applyLocation(fix, "rest:location");
+          return Response.json({ ok: true, location });
         } catch (err) {
           return Response.json(
             { ok: false, error: err instanceof Error ? err.message : String(err) },
@@ -1445,10 +1512,12 @@ export async function createApp(
     });
   };
 
-  const stop = () => {
+  const stop = async (): Promise<void> => {
     if (stopRequested) return;
     stopRequested = true;
     captureRestarting = false;
+    captureRestartController?.abort(new Error("server stopping"));
+    captureRestartController = null;
     if (status === "streaming") {
       status = "stopped";
       stoppedAt = new Date().toISOString();
@@ -1459,15 +1528,25 @@ export async function createApp(
     if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
     pendingVideoResetTimer = null;
     pendingVideoResetReason = null;
-    routePlayback.close();
-    void uploader.close(new Error("server stopping"));
-    session.close();
+    removeFatalListener?.();
+    removeFatalListener = null;
+    await Promise.all([
+      uploader.close(new Error("server stopping")),
+      session.close(),
+      deviceState.release(deviceStateOwner, "server stopping"),
+    ]);
   };
 
   return {
     get session() {
+      return session.rawScrcpy ?? session;
+    },
+    // Router and new integrations use the source-neutral interface explicitly.
+    get streamSession() {
       return session;
     },
+    deviceState,
+    activateDeviceState,
     isStreaming: () => status === "streaming",
     health,
     handleRequest,
@@ -1476,7 +1555,51 @@ export async function createApp(
   };
 }
 
-export type EmuApp = Awaited<ReturnType<typeof createApp>>;
+export type EmuApp = Awaited<ReturnType<typeof createAppInternal>>;
+export type ScrcpyEmuApp = Omit<EmuApp, "session"> & {
+  session: ScrcpySession;
+};
+
+type RouterStreamSession = Pick<EmuSession, "mode" | "meta">;
+
+/**
+ * Read the backend-neutral session exposed by current apps while continuing to
+ * accept older/custom router fakes that only provide the historical `session`.
+ */
+function streamSessionForApp(app: EmuApp): RouterStreamSession {
+  const streamSession = (app as EmuApp & { streamSession?: EmuSession })
+    .streamSession;
+  if (streamSession) return streamSession;
+  const session = app.session as ScrcpySession | EmuSession;
+  return "mode" in session
+    ? session
+    : { mode: "scrcpy", meta: session.meta };
+}
+
+function deviceStateForApp(app: EmuApp): DeviceSessionState | undefined {
+  return (app as EmuApp & { deviceState?: DeviceSessionState }).deviceState;
+}
+
+function activateDeviceStateForApp(app: EmuApp): void {
+  (
+    app as EmuApp & { activateDeviceState?: () => void }
+  ).activateDeviceState?.();
+}
+
+export function createApp(
+  opts: AppOptions & { streamMode?: "scrcpy" },
+  dependencies?: CreateAppDependencies,
+): Promise<ScrcpyEmuApp>;
+export function createApp(
+  opts: AppOptions,
+  dependencies?: CreateAppDependencies,
+): Promise<EmuApp>;
+export function createApp(
+  opts: AppOptions,
+  dependencies: CreateAppDependencies = {},
+): Promise<EmuApp> {
+  return createAppInternal(opts, dependencies);
+}
 
 export type RouterDefaults = Partial<AppOptions>;
 
@@ -1514,9 +1637,79 @@ export function createRouter(
   const apps = new Map<string, EmuApp>();
   const pending = new Map<string, Promise<EmuApp>>();
   const failureAt = new Map<string, number>();
+  const streamModeOverrides = new Map<string, StreamMode>();
+  const streamModeQueues = new Map<string, Promise<void>>();
+  const sessionGenerations = new Map<string, number>();
+  const operationControllers = new Map<string, Set<AbortController>>();
   const stoppingSerials = new Set<string>();
   let selectedSerial = defaults.serial ?? null;
   let selectionRevision = 0;
+  let stopped = false;
+  let stopAllTask: Promise<void> | null = null;
+
+  const beginOperation = (
+    serial: string,
+    parentSignal?: AbortSignal,
+  ): {
+    signal: AbortSignal;
+    finish(): void;
+  } => {
+    const controller = new AbortController();
+    const abortFromParent = () =>
+      controller.abort(
+        abortError(parentSignal!, `operation for ${serial} was aborted`),
+      );
+    parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+    if (parentSignal?.aborted) abortFromParent();
+    let controllers = operationControllers.get(serial);
+    if (!controllers) {
+      controllers = new Set();
+      operationControllers.set(serial, controllers);
+    }
+    controllers.add(controller);
+    let finished = false;
+    return {
+      signal: controller.signal,
+      finish() {
+        if (finished) return;
+        finished = true;
+        parentSignal?.removeEventListener("abort", abortFromParent);
+        controllers!.delete(controller);
+        if (controllers!.size === 0) operationControllers.delete(serial);
+      },
+    };
+  };
+
+  const abortOperations = (serial: string, reason: Error): void => {
+    for (const controller of operationControllers.get(serial) ?? []) {
+      controller.abort(reason);
+    }
+  };
+
+  const abortAllOperations = (reason: Error): void => {
+    for (const controllers of operationControllers.values()) {
+      for (const controller of controllers) controller.abort(reason);
+    }
+  };
+
+  const initiateAppStop = (app: EmuApp): Promise<void> => {
+    try {
+      return Promise.resolve(app.stop()).then(
+        () => {},
+        () => {},
+      );
+    } catch {
+      return Promise.resolve();
+    }
+  };
+
+  const assertReadyForPublication = (app: EmuApp): void => {
+    if (!app.isStreaming()) {
+      throw new Error(
+        `${streamSessionForApp(app).mode} stopped before publication`,
+      );
+    }
+  };
 
   // Resolve the serial a request targets: an explicit (connected) `?device=`,
   // else the configured default if still attached, else the first online
@@ -1554,17 +1747,46 @@ export function createRouter(
     return first.serial;
   };
 
-  // Get (or lazily start) the app for a serial. A dead session is torn down so
-  // the next call re-initializes; repeated start failures are throttled.
-  const getApp = (serial: string): Promise<EmuApp> => {
-    const existing = apps.get(serial);
-    if (existing) {
-      if (existing.isStreaming()) return Promise.resolve(existing);
-      try {
-        existing.stop();
-      } catch {}
-      apps.delete(serial);
+  const createConfiguredApp = async (
+    serial: string,
+    streamMode =
+      streamModeOverrides.get(serial) ?? defaults.streamMode ?? "scrcpy",
+    parentSignal?: AbortSignal,
+    deviceState?: DeviceSessionState,
+  ): Promise<EmuApp> => {
+    const operation = beginOperation(serial, parentSignal);
+    let created: EmuApp | null = null;
+    try {
+      throwIfAborted(operation.signal, `app startup for ${serial} was aborted`);
+      created = await createDeviceApp({
+        ...defaults,
+        serial,
+        streamMode,
+        deviceState,
+        signal: combineAbortSignals(defaults.signal, operation.signal),
+      });
+      throwIfAborted(operation.signal, `app startup for ${serial} was aborted`);
+      return created;
+    } catch (error) {
+      if (created) await initiateAppStop(created);
+      throw error;
+    } finally {
+      operation.finish();
     }
+  };
+
+  // Get (or lazily start) the app for a serial without joining the stream-mode
+  // queue. Queue operations use this helper internally to avoid self-deadlock.
+  const getAppUnqueued = (
+    serial: string,
+    parentSignal?: AbortSignal,
+  ): Promise<EmuApp> => {
+    if (stopped) return Promise.reject(new Error("serve-emu router is stopped"));
+    if (stoppingSerials.has(serial)) {
+      return Promise.reject(new Error(`device ${serial} is stopping`));
+    }
+    const existing = apps.get(serial);
+    if (existing?.isStreaming()) return Promise.resolve(existing);
     const inFlight = pending.get(serial);
     if (inFlight) return inFlight;
     if (Date.now() - (failureAt.get(serial) ?? 0) < SPAWN_RETRY_COOLDOWN_MS) {
@@ -1572,21 +1794,175 @@ export function createRouter(
         new Error(`serve-emu start for ${serial} is cooling down after a failure`),
       );
     }
+
     const promise = (async () => {
-      const created = await createDeviceApp({ ...defaults, serial });
+      if (existing) {
+        try {
+          await existing.stop();
+        } catch {}
+        if (apps.get(serial) === existing) apps.delete(serial);
+      }
+      const created = await createConfiguredApp(
+        serial,
+        undefined,
+        parentSignal,
+      );
+      if (stopped || stoppingSerials.has(serial)) {
+        try {
+          await created.stop();
+        } catch {}
+        throw new Error(
+          stopped
+            ? "serve-emu router stopped while the device session was starting"
+            : `device ${serial} stopped while its session was starting`,
+        );
+      }
+      try {
+        assertReadyForPublication(created);
+        activateDeviceStateForApp(created);
+        assertReadyForPublication(created);
+      } catch (error) {
+        await initiateAppStop(created);
+        throw error;
+      }
+      sessionGenerations.set(
+        serial,
+        sessionGenerations.has(serial)
+          ? (sessionGenerations.get(serial) ?? 0) + 1
+          : 0,
+      );
       apps.set(serial, created);
       return created;
     })();
     pending.set(serial, promise);
     promise.then(
-      () => pending.delete(serial),
       () => {
-        pending.delete(serial);
-        failureAt.set(serial, Date.now());
+        if (pending.get(serial) === promise) pending.delete(serial);
+      },
+      () => {
+        if (pending.get(serial) === promise) pending.delete(serial);
+        if (!stopped && !stoppingSerials.has(serial)) {
+          failureAt.set(serial, Date.now());
+        }
       },
     );
     return promise;
   };
+
+  const enqueueStreamModeOperation = <T>(
+    serial: string,
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> => {
+    if (stopped) return Promise.reject(new Error("serve-emu router is stopped"));
+    const operationLifetime = beginOperation(serial);
+    const previous = streamModeQueues.get(serial) ?? Promise.resolve();
+    const result = previous.then(() => {
+      throwIfAborted(
+        operationLifetime.signal,
+        `stream operation for ${serial} was aborted`,
+      );
+      return operation(operationLifetime.signal);
+    });
+    const tail = result.then(
+      () => {},
+      () => {},
+    );
+    streamModeQueues.set(serial, tail);
+    void tail.then(() => {
+      operationLifetime.finish();
+      if (streamModeQueues.get(serial) === tail) {
+        streamModeQueues.delete(serial);
+      }
+    });
+    return result;
+  };
+
+  // Regular requests wait for an already-queued source transition, ensuring
+  // they capture one complete app generation rather than racing publication.
+  const getApp = (serial: string): Promise<EmuApp> => {
+    const queue = streamModeQueues.get(serial);
+    return queue ? queue.then(() => getAppUnqueued(serial)) : getAppUnqueued(serial);
+  };
+
+  const performStreamModeSwitch = async (
+    serial: string,
+    streamMode: StreamMode,
+    signal: AbortSignal,
+  ): Promise<EmuApp> => {
+    if (stopped) throw new Error("serve-emu router is stopped");
+    if (stoppingSerials.has(serial)) {
+      throw new Error(`device ${serial} is stopping`);
+    }
+    const inFlight = pending.get(serial);
+    if (inFlight) await inFlight.catch(() => {});
+    if (stopped) throw new Error("serve-emu router is stopped");
+    if (stoppingSerials.has(serial)) {
+      throw new Error(`device ${serial} is stopping`);
+    }
+
+    const current = apps.get(serial);
+    if (
+      current?.isStreaming() &&
+      streamSessionForApp(current).mode === streamMode
+    ) {
+      streamModeOverrides.set(serial, streamMode);
+      return current;
+    }
+
+    // Stage the requested source while the previous app remains published and
+    // its existing sockets continue streaming. Only a ready replacement is
+    // made visible; startup failure leaves the working app untouched.
+    const replacement = await createConfiguredApp(
+      serial,
+      streamMode,
+      signal,
+      current ? deviceStateForApp(current) : undefined,
+    );
+    if (stopped || stoppingSerials.has(serial)) {
+      try {
+        await replacement.stop();
+      } catch {}
+      throw new Error(
+        stopped
+          ? "serve-emu router stopped while the stream mode was switching"
+          : `device ${serial} stopped while its stream mode was switching`,
+      );
+    }
+
+    const previous = apps.get(serial);
+    try {
+      assertReadyForPublication(replacement);
+      activateDeviceStateForApp(replacement);
+      assertReadyForPublication(replacement);
+    } catch (error) {
+      if (previous?.isStreaming()) activateDeviceStateForApp(previous);
+      await initiateAppStop(replacement);
+      throw error;
+    }
+    streamModeOverrides.set(serial, streamMode);
+    failureAt.delete(serial);
+    sessionGenerations.set(
+      serial,
+      sessionGenerations.has(serial)
+        ? (sessionGenerations.get(serial) ?? 0) + 1
+        : 0,
+    );
+    apps.set(serial, replacement);
+    if (previous && previous !== replacement) {
+      try {
+        await previous.stop();
+      } catch {}
+    }
+    return replacement;
+  };
+
+  const switchStreamMode = (
+    serial: string,
+    streamMode: StreamMode,
+  ): Promise<EmuApp> =>
+    enqueueStreamModeOperation(serial, (signal) =>
+      performStreamModeSwitch(serial, streamMode, signal),
+    );
 
   // Resolve + start in one step.
   const ensure = async (requested?: string | null): Promise<{ serial: string; app: EmuApp }> => {
@@ -1610,6 +1986,19 @@ export function createRouter(
       })),
     });
   };
+
+  const streamModeResponse = (
+    serial: string,
+    app: EmuApp,
+  ): StreamModeResponse => ({
+    ok: true,
+    serial,
+    mode: streamSessionForApp(app).mode,
+    availableModes: /^emulator-\d+$/.test(serial)
+      ? [...STREAM_MODES]
+      : ["scrcpy"],
+    sessionGeneration: sessionGenerations.get(serial) ?? 0,
+  });
 
   const readRouterPayload = async (req: Request): Promise<Record<string, unknown>> => {
     const payload = await readJsonLimited(req, MAX_JSON_BODY_BYTES);
@@ -1635,22 +2024,35 @@ export function createRouter(
   };
 
   const stopApp = async (serial: string): Promise<void> => {
-    const inFlight = pending.get(serial);
-    let stoppedInFlight: EmuApp | null = null;
-    if (inFlight) {
-      stoppedInFlight = await inFlight.catch(() => null);
-      try {
-        stoppedInFlight?.stop();
-      } catch {}
-    }
+    stoppingSerials.add(serial);
+    abortOperations(
+      serial,
+      new Error(`device ${serial} is stopping`),
+    );
+
+    // Start closing the published app before joining startup/switch promises.
+    // Those promises may be waiting for ADB discovery or the first video frame.
     const app = apps.get(serial);
-    if (app && app !== stoppedInFlight) {
-      try {
-        app.stop();
-      } catch {}
-    }
     apps.delete(serial);
+    const liveStop = app ? initiateAppStop(app) : Promise.resolve();
+    const inFlight = pending.get(serial);
+    const sourceQueue = streamModeQueues.get(serial);
+    await Promise.allSettled([
+      liveStop,
+      ...(inFlight ? [inFlight] : []),
+      ...(sourceQueue ? [sourceQueue] : []),
+    ]);
+
+    // A dependency that ignored cancellation may have completed late. The
+    // guarded publication paths normally prevent this, but close defensively.
+    const lateApp = apps.get(serial);
+    if (lateApp && lateApp !== app) await initiateAppStop(lateApp);
+    apps.delete(serial);
+    pending.delete(serial);
     failureAt.delete(serial);
+    streamModeOverrides.delete(serial);
+    streamModeQueues.delete(serial);
+    sessionGenerations.delete(serial);
   };
 
   const handleRequest = async (req: Request): Promise<Response> => {
@@ -1663,6 +2065,74 @@ export function createRouter(
         return await devicesResponse();
       } catch (err) {
         return Response.json({ ok: false, error: errMsg(err) }, { status: 400 });
+      }
+    }
+
+    // Source changes replace the stream app while retaining its device state,
+    // so this endpoint is owned by the router rather than one app generation.
+    if (url.pathname === "/api/stream-mode") {
+      if (req.method !== "GET" && req.method !== "PUT") {
+        return new Response("method not allowed", {
+          status: 405,
+          headers: { Allow: "GET, PUT" },
+        });
+      }
+
+      let serial: string;
+      try {
+        serial = await resolveSerial(url.searchParams.get("device"));
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: errMsg(err) },
+          { status: 503 },
+        );
+      }
+
+      if (req.method === "GET") {
+        try {
+          const app = await enqueueStreamModeOperation(serial, (signal) =>
+            getAppUnqueued(serial, signal),
+          );
+          return Response.json(streamModeResponse(serial, app));
+        } catch (err) {
+          return Response.json(
+            { ok: false, error: errMsg(err) },
+            { status: 503 },
+          );
+        }
+      }
+
+      let streamMode: StreamMode;
+      try {
+        const payload = await readRouterPayload(req);
+        const mode = payload.mode;
+        if (
+          typeof mode !== "string" ||
+          !STREAM_MODES.includes(mode as StreamMode)
+        ) {
+          throw new Error(`mode must be one of: ${STREAM_MODES.join(", ")}`);
+        }
+        if (mode === "grpc-screenshot" && !/^emulator-\d+$/.test(serial)) {
+          throw new Error(
+            "grpc-screenshot is only available for Android Emulator devices",
+          );
+        }
+        streamMode = mode as StreamMode;
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: errMsg(err) },
+          { status: 400 },
+        );
+      }
+
+      try {
+        const app = await switchStreamMode(serial, streamMode);
+        return Response.json(streamModeResponse(serial, app));
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: errMsg(err) },
+          { status: 503 },
+        );
       }
     }
 
@@ -1706,7 +2176,7 @@ export function createRouter(
         return Response.json({
           ok: true,
           serial,
-          device: app.session.meta.deviceName,
+          device: streamSessionForApp(app).meta.deviceName,
         });
       } catch (err) {
         return Response.json(
@@ -1736,7 +2206,7 @@ export function createRouter(
             ok: true,
             serial: launch.serial,
             avd,
-            device: app.session.meta.deviceName,
+            device: streamSessionForApp(app).meta.deviceName,
           });
         } catch (err) {
           launch.stop();
@@ -1829,13 +2299,38 @@ export function createRouter(
     app.attachWebSocket(socket, { frameMeta: opts.frameMeta, video: opts.video });
   };
 
-  const stopAll = () => {
-    for (const app of apps.values()) {
-      try {
-        app.stop();
-      } catch {}
-    }
+  const stopAll = (): Promise<void> => {
+    if (stopAllTask) return stopAllTask;
+    stopped = true;
+    abortAllOperations(new Error("serve-emu router is stopping"));
+
+    // Invoke every live stop synchronously before waiting for startup/source
+    // transitions to observe cancellation and settle.
+    const liveApps = Array.from(new Set(apps.values()));
     apps.clear();
+    const liveStops = liveApps.map(initiateAppStop);
+    const startupTasks = [...pending.values()];
+    const sourceTasks = [...streamModeQueues.values()];
+    stopAllTask = (async () => {
+      await Promise.allSettled([
+        ...liveStops,
+        ...startupTasks,
+        ...sourceTasks,
+      ]);
+      // Publication paths reject once `stopped` is true. Close anything a
+      // custom dependency nevertheless inserted before clearing bookkeeping.
+      await Promise.allSettled(
+        Array.from(new Set(apps.values()), initiateAppStop),
+      );
+      apps.clear();
+      pending.clear();
+      failureAt.clear();
+      streamModeOverrides.clear();
+      streamModeQueues.clear();
+      sessionGenerations.clear();
+      operationControllers.clear();
+    })();
+    return stopAllTask;
   };
 
   return {

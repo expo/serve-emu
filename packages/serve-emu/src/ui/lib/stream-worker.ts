@@ -1,4 +1,5 @@
 import { buildCodecString, scanAU } from "./h264";
+import { logControlAcknowledgement } from "./control-ack";
 import { epochNowMs, parseFramePacket } from "../../shared/frame-meta";
 import {
   StreamSessionResources,
@@ -496,6 +497,7 @@ const connect = (reason: "connect" | "reconnect") => {
   sock.onmessage = (e) => {
     if (stopped || ws !== sock) return;
     if (typeof e.data === "string") {
+      logControlAcknowledgement(e.data);
       try {
         const msg = JSON.parse(e.data) as { type?: string; size?: { width: number; height: number } };
         if (

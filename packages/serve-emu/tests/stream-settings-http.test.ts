@@ -4,6 +4,8 @@ import { createApp } from "../src/middleware.ts";
 import type { ScrcpySession, StartOpts } from "../src/scrcpy.ts";
 import type { StreamSocket } from "../src/stream-socket.ts";
 
+type CapturedStartOpts = StartOpts & { mode?: "scrcpy" };
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -49,6 +51,7 @@ function fakeSession(
 ): ScrcpySession {
   const proc = new EventEmitter();
   const controlSocket = Object.assign(new EventEmitter(), {
+    writable: true,
     write: (data: string | Uint8Array) => {
       onControlWrite?.(data);
       return true;
@@ -77,7 +80,7 @@ function fakeSession(
 
 describe("stream settings HTTP API", () => {
   test("GET /api/stream-settings reports the active scrcpy encoder settings", async () => {
-    const starts: StartOpts[] = [];
+    const starts: CapturedStartOpts[] = [];
     const app = await createApp(
       {
         serial: "emulator-test",
@@ -107,10 +110,12 @@ describe("stream settings HTTP API", () => {
       expect(starts).toHaveLength(1);
       expect(starts[0]).toEqual({
         serial: "emulator-test",
+        signal: undefined,
         maxSize: 960,
         bitRate: 4_000_000,
         maxFps: 24,
         keyFrameInterval: undefined,
+        mode: "scrcpy",
       });
     } finally {
       app.stop();
@@ -118,7 +123,7 @@ describe("stream settings HTTP API", () => {
   });
 
   test("PATCH /api/stream-settings replaces capture and reports its authoritative settings", async () => {
-    const starts: StartOpts[] = [];
+    const starts: CapturedStartOpts[] = [];
     const app = await createApp(
       { serial: "emulator-test" },
       {
@@ -160,10 +165,12 @@ describe("stream settings HTTP API", () => {
       expect(app.session.meta).toMatchObject({ width: 405, height: 720 });
       expect(starts[1]).toEqual({
         serial: "emulator-test",
+        signal: expect.any(AbortSignal),
         maxSize: 720,
         bitRate: 3_000_000,
         maxFps: 20,
         keyFrameInterval: undefined,
+        mode: "scrcpy",
       });
     } finally {
       app.stop();
@@ -448,6 +455,7 @@ describe("stream settings HTTP API", () => {
     );
     const socket = new TestStreamSocket();
     app.attachWebSocket(socket, { frameMeta: false });
+    await new Promise((resolve) => setTimeout(resolve, 0));
     const writesBeforeRestart = oldControlWrites;
 
     const patch = app.handleRequest(
