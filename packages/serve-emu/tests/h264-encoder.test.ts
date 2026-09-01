@@ -291,8 +291,10 @@ describe("H264Encoder validation", () => {
   });
 
   test("applies Android quarter-turn direction to encoded pixels", async () => {
-    const width = 4;
-    const height = 8;
+    // Keep both encoded dimensions at least one H.264 macroblock so this
+    // real-ffmpeg test behaves consistently across libx264 builds.
+    const width = 16;
+    const height = 32;
     const rgb = Buffer.alloc(width * height * 3);
     const colors = [
       [255, 0, 0],
@@ -301,7 +303,7 @@ describe("H264Encoder validation", () => {
       [255, 255, 255],
     ];
     for (let y = 0; y < height; y++) {
-      const color = colors[Math.floor(y / 2)]!;
+      const color = colors[Math.floor(y / (height / colors.length))]!;
       for (let x = 0; x < width; x++) {
         const offset = (y * width + x) * 3;
         rgb[offset] = color[0]!;
@@ -361,7 +363,8 @@ describe("H264Encoder validation", () => {
     );
     expect(decoded.status).toBe(0);
 
-    const topRow = [0, 2, 4, 6].map((x) => {
+    const topRow = colors.map((_, index) => {
+      const x = index * (height / colors.length);
       const offset = x * 3;
       return [...decoded.stdout.subarray(offset, offset + 3)];
     });
