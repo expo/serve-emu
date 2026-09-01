@@ -83,12 +83,12 @@ import {
   startSessionReplayResponse,
   stopSessionReplayResponse,
 } from "./session-replay-api.ts";
-import { createSessionReplayHandlers } from "./session-replay-session.ts";
 import {
   ActiveDeviceSession,
   DeviceSessionManager,
   SessionChangedError,
 } from "./device-session-context.ts";
+import type { DeviceSessionState } from "./device-session-state.ts";
 import { routePlaybackErrorResponse } from "./route-playback-api.ts";
 import { JsonResponseTracker } from "./json-response.ts";
 import { parseSessionPageQuery } from "./session-api.ts";
@@ -504,6 +504,7 @@ export async function startServer(
     serial: string,
     generation: number,
     stream: EmuSession,
+    deviceState?: DeviceSessionState,
   ): DeviceContext => {
     if (
       streamSettings.transport === "webrtc" &&
@@ -518,6 +519,7 @@ export async function startServer(
       generation,
       stream,
       applyLocation: setLocation,
+      deviceState,
     });
     context.registerCleanup(() =>
       uploads.cancelGeneration(
@@ -1459,6 +1461,21 @@ export async function startServer(
   };
 
   const activateContext = (context: DeviceContext) => {
+    context.deviceState.activate(context, {
+      dispatchGesture: (gesture, signal) => {
+        if (signal.aborted) {
+          throw signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException("session replay cancelled", "AbortError");
+        }
+        return enqueueGesture(
+          context,
+          gesture,
+          "session:replay",
+          false,
+        ).completion.then(() => {});
+      },
+    });
     const recovery = createRecovery(context);
     recoveries.set(context, recovery);
     context.registerCleanup(() => recovery.stop());
@@ -1472,10 +1489,11 @@ export async function startServer(
     generation: number,
     mode: StreamMode,
     signal: AbortSignal,
+    deviceState?: DeviceSessionState,
   ): Promise<DeviceContext> => {
     const stream = await openStream(serial, mode, signal);
     try {
-      return createContext(serial, generation, stream);
+      return createContext(serial, generation, stream, deviceState);
     } catch (error) {
       await stream.close().catch(() => {});
       throw error;
@@ -1555,7 +1573,13 @@ export async function startServer(
     }
     const context = await sessions.replace(
       (current, generation, signal) =>
-        prepareContext(current.serial, generation, mode, signal),
+        prepareContext(
+          current.serial,
+          generation,
+          mode,
+          signal,
+          current.deviceState,
+        ),
       activateContext,
       "stream source switched",
       (current) => {
@@ -2261,37 +2285,15 @@ export async function startServer(
             ? errorResponse(err)
             : sessionReplayErrorResponse(err, 400);
         }
+        const replayDeviceState = requestContext.deviceState;
         const isCurrentReplaySession = () =>
           replayAdmissionEpoch === replayRecorder.replayAdmissionEpoch &&
-          replayRecorder === requestContext.recorder &&
-          sessions.isCurrent(requestContext);
-        const handlers = createSessionReplayHandlers({
-          generation: requestContext.generation,
-          getGeneration: () => sessions.current.generation,
-          dispatchGesture: (gesture) =>
-            enqueueGesture(
-              requestContext,
-              gesture,
-              "session:replay",
-              false,
-            ).completion.then(() => {}),
-          setLocation: async (fix, signal) => {
-            requestContext.route.stop();
-            await setLocation(requestContext.serial, fix, signal);
-            if (!isCurrentReplaySession()) {
-              throw new SessionReplayConflictError(
-                "device session changed during session replay",
-              );
-            }
-            requestContext.lastLocation = {
-              ...fix,
-              appliedAt: new Date().toISOString(),
-            };
-          },
-        });
+          replayRecorder === replayDeviceState.recorder &&
+          sessions.current.deviceState === replayDeviceState &&
+          !replayDeviceState.disposed;
         return startSessionReplayResponse(
           replayRecorder,
-          handlers,
+          replayDeviceState.replayHandlers,
           multiplier,
           isCurrentReplaySession,
         );
@@ -2301,8 +2303,9 @@ export async function startServer(
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
         const stoppedRecorder = requestContext.recorder;
+        const stoppedDeviceState = requestContext.deviceState;
         const response = await stopSessionReplayResponse(stoppedRecorder);
-        if (!sessions.isCurrent(requestContext)) {
+        if (sessions.current.deviceState !== stoppedDeviceState) {
           return sessionReplayErrorResponse(
             new SessionReplayConflictError(
               "device session changed while stopping session replay",

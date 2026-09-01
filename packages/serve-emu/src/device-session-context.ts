@@ -1,12 +1,9 @@
 import type { AccessibilitySnapshot } from "./accessibility.ts";
 import { ControlInputQueue } from "./control-input-queue.ts";
+import { DeviceSessionState } from "./device-session-state.ts";
 import { FrameStatWindow } from "./frame-stat-window.ts";
 import type { Screen } from "./input.ts";
 import type { GeoFix } from "./location.ts";
-import { LogcatHub } from "./logcat.ts";
-import { RoutePlayback } from "./route-playback.ts";
-import { SessionRecorder } from "./session-recorder.ts";
-import { disposeReplayBefore } from "./session-replay-lifecycle.ts";
 import type { SessionStatus } from "./session-status.ts";
 import type { EmuSession } from "./stream-session.ts";
 
@@ -38,7 +35,8 @@ type ActiveDeviceSessionOpts<TClient extends SessionClient> = {
   serial: string;
   generation: number;
   stream: EmuSession;
-  applyLocation: (serial: string, fix: GeoFix, signal: AbortSignal) => Promise<void>;
+  applyLocation?: (serial: string, fix: GeoFix, signal: AbortSignal) => Promise<void>;
+  deviceState?: DeviceSessionState;
   closeClient?: (client: TClient, code: number, reason: string) => void;
   inputQueue?: ControlInputQueue;
   now?: () => number;
@@ -50,11 +48,12 @@ export type DisposeDeviceSessionOpts = {
 };
 
 /**
- * Everything whose lifetime is tied to one selected Android device.
+ * Everything whose lifetime is tied to one stream generation.
  *
- * A context is never reused. Device switches publish a newly prepared context
- * and then dispose the previous generation. Async work may finish late, but it
- * can only see this context's state and its aborted signal, never the next one.
+ * A context is never reused. Device or source switches publish a prepared
+ * generation and then dispose the previous stream resources. Same-device
+ * source generations share `deviceState`; a real device switch does not.
+ * Async stream work can only see this context and its aborted signal.
  */
 export class ActiveDeviceSession<
   TClient extends SessionClient = SessionClient,
@@ -63,10 +62,8 @@ export class ActiveDeviceSession<
   readonly generation: number;
   readonly stream: EmuSession;
   readonly screen: Screen;
-  readonly recorder = new SessionRecorder();
-  readonly logcat: LogcatHub;
+  readonly deviceState: DeviceSessionState;
   readonly inputQueue: ControlInputQueue;
-  readonly route: RoutePlayback;
   readonly clients = new Set<TClient>();
   readonly abortController = new AbortController();
   readonly frameStats = new FrameStatWindow(FRAME_STAT_WINDOW);
@@ -90,7 +87,6 @@ export class ActiveDeviceSession<
   lastVideoResetAt: string | null = null;
   lastVideoResetReason: string | null = null;
   lastVideoResetMs = 0;
-  lastLocation: (GeoFix & { appliedAt: string }) | null = null;
   cachedConfig: Buffer | null = null;
   watchdog: ReturnType<typeof setInterval> | null = null;
 
@@ -108,7 +104,6 @@ export class ActiveDeviceSession<
 
   constructor(opts: ActiveDeviceSessionOpts<TClient>) {
     this.serial = opts.serial;
-    this.logcat = new LogcatHub(opts.serial);
     this.generation = opts.generation;
     this.stream = opts.stream;
     this.screen = {
@@ -126,16 +121,45 @@ export class ActiveDeviceSession<
     this.inputQueue =
       opts.inputQueue ??
       opts.stream.controls;
-    this.route = new RoutePlayback({
-      applyLocation: async (fix, signal) => {
-        this.assertUsable();
-        await opts.applyLocation(this.serial, fix, signal);
-        this.assertUsable();
-      },
-      onLocation: (fix) => {
-        if (!this.signal.aborted) this.lastLocation = fix;
-      },
-    });
+    const applyLocation = opts.applyLocation;
+    this.deviceState =
+      opts.deviceState ??
+      new DeviceSessionState({
+        serial: opts.serial,
+        generation: opts.generation,
+        applyLocation: async (serial, fix, signal) => {
+          if (!applyLocation) {
+            throw new Error("applyLocation is required for a new device state");
+          }
+          await applyLocation(serial, fix, signal);
+        },
+      });
+    if (this.deviceState.serial !== this.serial) {
+      throw new Error(
+        `device state for ${this.deviceState.serial} cannot be used by ${this.serial}`,
+      );
+    }
+    this.deviceState.acquire(this);
+  }
+
+  get recorder() {
+    return this.deviceState.recorder;
+  }
+
+  get logcat() {
+    return this.deviceState.logcat;
+  }
+
+  get route() {
+    return this.deviceState.route;
+  }
+
+  get lastLocation(): (GeoFix & { appliedAt: string }) | null {
+    return this.deviceState.lastLocation;
+  }
+
+  set lastLocation(value: (GeoFix & { appliedAt: string }) | null) {
+    this.deviceState.lastLocation = value;
   }
 
   get signal(): AbortSignal {
@@ -259,15 +283,7 @@ export class ActiveDeviceSession<
     this.stoppedAt = new Date(this.#now()).toISOString();
     this.abortController.abort(new SessionChangedError(this.generation, null));
     this.inputQueue.close(new Error(reason));
-    this.logcat.close(reason);
-    const replayDisposed = disposeReplayBefore({
-      recorder: this.recorder,
-      stopRoute: () => {
-        this.route.stop();
-        this.route.close();
-      },
-      afterReplayStopped: () => {},
-    });
+    const deviceStateReleased = this.deviceState.release(this, reason);
     if (this.watchdog) clearInterval(this.watchdog);
     this.watchdog = null;
     this.closeClients(opts.clientCode ?? (nextStatus === "error" ? 1011 : 1000), reason);
@@ -278,14 +294,10 @@ export class ActiveDeviceSession<
 
     void (async () => {
       for (const cleanup of cleanups) this.#startCleanup(cleanup);
-      await replayDisposed;
+      await deviceStateReleased;
       await this.stream.close().catch(() => {});
       await Promise.allSettled(drains);
       await this.#drainCleanups();
-      // A route start that was awaiting its initial location can otherwise
-      // create a timer after the first close(). Close again after draining it.
-      this.route.stop();
-      this.route.close();
     })().then(finishDispose, finishDispose);
     return this.#disposeTask;
   }

@@ -1,8 +1,12 @@
 import {
   spawn,
-  spawnSync,
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
+import {
+  execText,
+  type ExecOpts,
+  type ExecResult,
+} from "./exec.ts";
 import type { VideoFrame } from "./scrcpy.ts";
 
 /**
@@ -17,6 +21,8 @@ import type { VideoFrame } from "./scrcpy.ts";
 export type H264EncoderOpts = {
   width: number;
   height: number;
+  /** Android display rotation quarter turns applied before encoding. */
+  quarterTurn?: QuarterTurn;
   fps: number;
   bitRate: number;
   /** Seconds between forced keyframes; 0 uses libx264's default keyint. */
@@ -25,6 +31,8 @@ export type H264EncoderOpts = {
   /** Called once when ffmpeg or its output parser fails unexpectedly. */
   onExit: (reason: string) => void;
 };
+
+export type QuarterTurn = 0 | 1 | 2 | 3;
 
 const NAL_IDR = 5;
 const NAL_SPS = 7;
@@ -39,6 +47,8 @@ const MAX_BIT_RATE = 0x7fff_ffff;
 const PROCESS_GRACE_MS = 250;
 const PROCESS_TERM_MS = 500;
 const PROCESS_KILL_MS = 500;
+const FFMPEG_PROBE_TIMEOUT_MS = 10_000;
+const FFMPEG_PROBE_MAX_BYTES = 8 * 1024 * 1024;
 
 type Nal = { pos: number; dataPos: number; type: number };
 
@@ -83,6 +93,10 @@ function validateOptions(opts: H264EncoderOpts): number {
   if (typeof opts.onFrame !== "function" || typeof opts.onExit !== "function") {
     throw new TypeError("onFrame and onExit must be functions");
   }
+  const quarterTurn = opts.quarterTurn ?? 0;
+  if (!Number.isInteger(quarterTurn) || quarterTurn < 0 || quarterTurn > 3) {
+    throw new RangeError("quarterTurn must be an integer from 0 through 3");
+  }
 
   const bytes = width * height * 3;
   if (!Number.isSafeInteger(bytes) || bytes > MAX_RAW_FRAME_BYTES) {
@@ -91,6 +105,14 @@ function validateOptions(opts: H264EncoderOpts): number {
     );
   }
   return bytes;
+}
+
+function videoFilter(quarterTurn: QuarterTurn): string {
+  const filters = ["crop=trunc(iw/2)*2:trunc(ih/2)*2"];
+  if (quarterTurn === 1) filters.push("transpose=cclock");
+  else if (quarterTurn === 2) filters.push("hflip", "vflip");
+  else if (quarterTurn === 3) filters.push("transpose=clock");
+  return filters.join(",");
 }
 
 function wait(ms: number): Promise<void> {
@@ -257,28 +279,76 @@ export function resolveFfmpeg(): string {
   return process.env.SERVE_EMU_FFMPEG?.trim() || "ffmpeg";
 }
 
-export function assertFfmpegAvailable(): void {
-  const binary = resolveFfmpeg();
-  const result = spawnSync(binary, ["-hide_banner", "-encoders"], {
-    encoding: "utf8",
-    timeout: 10_000,
-    maxBuffer: 8 * 1024 * 1024,
-  });
-  if (result.error || result.status !== 0) {
-    throw new Error(
-      `ffmpeg not found or unusable (tried "${binary}"): ${result.error?.message ?? result.stderr.trim() ?? `exit ${result.status}`}`,
-    );
-  }
-  if (!/\blibx264\b/.test(`${result.stdout}\n${result.stderr}`)) {
-    throw new Error(
-      `ffmpeg at "${binary}" does not include the libx264 encoder required by the grpc backend`,
-    );
-  }
+export type FfmpegProbeRunner = (
+  binary: string,
+  args: string[],
+  options: ExecOpts,
+) => Promise<ExecResult<string>>;
+
+export type FfmpegAvailabilityProbeOptions = {
+  resolveBinary?: () => string;
+  runExec?: FfmpegProbeRunner;
+};
+
+function probeAbortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("ffmpeg capability probe aborted", "AbortError");
 }
+
+/**
+ * Build an asynchronous, abortable capability check which caches successes.
+ * Failures are deliberately retryable so installing ffmpeg/libx264 does not
+ * require restarting serve-emu.
+ */
+export function createFfmpegAvailabilityProbe(
+  options: FfmpegAvailabilityProbeOptions = {},
+): (signal?: AbortSignal) => Promise<void> {
+  const resolveBinary = options.resolveBinary ?? resolveFfmpeg;
+  const runExec = options.runExec ?? execText;
+  const available = new Set<string>();
+
+  return async (signal?: AbortSignal): Promise<void> => {
+    if (signal?.aborted) throw probeAbortReason(signal);
+    const binary = resolveBinary();
+    if (available.has(binary)) return;
+
+    const result = await runExec(
+      binary,
+      ["-hide_banner", "-encoders"],
+      {
+        timeout: FFMPEG_PROBE_TIMEOUT_MS,
+        maxBuffer: FFMPEG_PROBE_MAX_BYTES,
+        signal,
+        lane: "background",
+      },
+    );
+    if (signal?.aborted) throw probeAbortReason(signal);
+    if (result.error || result.status !== 0) {
+      const detail = result.timedOut
+        ? `capability probe timed out after ${FFMPEG_PROBE_TIMEOUT_MS}ms`
+        : result.error?.message ||
+          result.stderr.trim() ||
+          `exit ${result.status}`;
+      throw new Error(
+        `ffmpeg not found or unusable (tried "${binary}"): ${detail}`,
+      );
+    }
+    if (!/\blibx264\b/.test(`${result.stdout}\n${result.stderr}`)) {
+      throw new Error(
+        `ffmpeg at "${binary}" does not include the libx264 encoder required by the grpc backend`,
+      );
+    }
+    available.add(binary);
+  };
+}
+
+export const assertFfmpegAvailable = createFfmpegAvailabilityProbe();
 
 export class H264Encoder {
   readonly width: number;
   readonly height: number;
+  readonly quarterTurn: QuarterTurn;
   readonly encodedWidth: number;
   readonly encodedHeight: number;
   readonly #opts: H264EncoderOpts;
@@ -296,8 +366,12 @@ export class H264Encoder {
     this.#opts = opts;
     this.width = opts.width;
     this.height = opts.height;
-    this.encodedWidth = opts.width - (opts.width % 2);
-    this.encodedHeight = opts.height - (opts.height % 2);
+    this.quarterTurn = opts.quarterTurn ?? 0;
+    const croppedWidth = opts.width - (opts.width % 2);
+    const croppedHeight = opts.height - (opts.height % 2);
+    const transposed = this.quarterTurn === 1 || this.quarterTurn === 3;
+    this.encodedWidth = transposed ? croppedHeight : croppedWidth;
+    this.encodedHeight = transposed ? croppedWidth : croppedHeight;
     this.#parser = new H264OutputParser({
       fps: opts.fps,
       onFrame: opts.onFrame,
@@ -335,7 +409,7 @@ export class H264Encoder {
         "pipe:0",
         "-an",
         "-vf",
-        "crop=trunc(iw/2)*2:trunc(ih/2)*2",
+        videoFilter(this.quarterTurn),
         "-pix_fmt",
         "yuv420p",
         "-c:v",

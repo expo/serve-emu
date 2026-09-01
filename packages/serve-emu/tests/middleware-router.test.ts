@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, test } from "bun:test";
 import type { Device } from "../src/adb.ts";
+import { ControlInputQueue } from "../src/control-input-queue.ts";
 import {
   createApp,
   createRouter,
@@ -294,6 +295,36 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   throw new Error("condition was not reached");
 }
 
+function liveStreamSession(
+  mode: StreamMode,
+  onFatalListener?: (listener: Parameters<EmuSession["onFatal"]>[0]) => void,
+): EmuSession {
+  const frames = deferred<null>();
+  const controls = new ControlInputQueue({
+    writer: { async write() {} },
+  });
+  return {
+    mode,
+    serial: "emulator-5554",
+    meta: {
+      deviceName: `Pixel_8 (${mode})`,
+      codecId: "h264",
+      width: 1080,
+      height: 1920,
+    },
+    controls,
+    readFrame: () => frames.promise,
+    onFatal(listener) {
+      onFatalListener?.(listener);
+      return () => {};
+    },
+    async close() {
+      controls.close();
+      frames.resolve(null);
+    },
+  };
+}
+
 describe("createApp session compatibility and cancellation", () => {
   test("keeps the raw scrcpy session public and exposes a neutral stream session", async () => {
     const proc = new EventEmitter();
@@ -360,6 +391,38 @@ describe("createApp session compatibility and cancellation", () => {
     expect(startupSignal?.aborted).toBe(true);
     await expect(starting).rejects.toThrow("test startup cancelled");
   });
+
+  test("retains structured fatal failure details on /health", async () => {
+    const fatalListeners: Array<Parameters<EmuSession["onFatal"]>[0]> = [];
+    const app = await createApp(
+      { serial: "emulator-5554" },
+      {
+        startSession: async () =>
+          liveStreamSession("scrcpy", (listener) => {
+            fatalListeners.push(listener);
+          }),
+      },
+    );
+
+    const fatalListener = fatalListeners[0];
+    if (!fatalListener) throw new Error("fatal listener was not registered");
+    fatalListener({
+      message: "encoder exited",
+      code: "encoder-exit",
+      meta: { exitCode: 23, phase: "encode" },
+    });
+
+    const response = await app.handleRequest(
+      new Request("http://router.test/health"),
+    );
+    expect(response.status).toBe(503);
+    expect(await responseJson(response)).toMatchObject({
+      lastError: "encoder exited",
+      lastErrorCode: "encoder-exit",
+      lastErrorMeta: { exitCode: 23, phase: "encode" },
+    });
+    await app.stop();
+  });
 });
 
 describe("createRouter stream mode", () => {
@@ -408,6 +471,80 @@ describe("createRouter stream mode", () => {
       "emulator-5554",
       "emulator-5554",
     ]);
+  });
+
+  test("preserves recorded events when only the same device's source changes", async () => {
+    const router = createRouter(
+      { serial: "emulator-5554" },
+      {
+        listDevices: async () => [
+          { serial: "emulator-5554", state: "device" },
+        ],
+        listAllDevices: async () => [
+          { serial: "emulator-5554", state: "device" },
+        ],
+        createApp: (options) =>
+          createApp(options, {
+            startSession: async ({ mode }) => liveStreamSession(mode),
+            setLocation: async () => {},
+          }),
+      },
+    );
+
+    const tap = await router.handleRequest(
+      post("/api/tap", { x: 0.25, y: 0.75 }),
+    );
+    expect(tap.status).toBe(200);
+    const location = await router.handleRequest(
+      post("/api/location", {
+        latitude: 52.3676,
+        longitude: 4.9041,
+      }),
+    );
+    expect(location.status).toBe(200);
+    const route = await router.handleRequest(
+      post("/api/route", {
+        waypoints: [
+          { latitude: 52.3676, longitude: 4.9041 },
+          { latitude: 52.52, longitude: 13.405 },
+        ],
+        speedKph: 1,
+        intervalMs: 60_000,
+        loop: true,
+      }),
+    );
+    expect(route.status).toBe(200);
+    const before = await router.handleRequest(
+      new Request("http://router.test/api/session"),
+    );
+    expect((await responseJson(before)).events).toHaveLength(2);
+    const healthBefore = await responseJson(
+      await router.handleRequest(
+        new Request("http://router.test/health"),
+      ),
+    );
+    expect((healthBefore.route as JsonObject).status).toBe("running");
+
+    expect(
+      (
+        await router.handleRequest(
+          put("/api/stream-mode", { mode: "grpc-screenshot" }),
+        )
+      ).status,
+    ).toBe(200);
+
+    const after = await router.handleRequest(
+      new Request("http://router.test/api/session"),
+    );
+    expect((await responseJson(after)).events).toHaveLength(2);
+    const healthAfter = await responseJson(
+      await router.handleRequest(
+        new Request("http://router.test/health"),
+      ),
+    );
+    expect(healthAfter.location).toEqual(healthBefore.location);
+    expect((healthAfter.route as JsonObject).status).toBe("running");
+    await router.stopAll();
   });
 
   test("stages replacements atomically and orders PUT/PUT/GET per device", async () => {
@@ -541,6 +678,50 @@ describe("createRouter stream mode", () => {
       sessionGeneration: 0,
     });
     expect(stopped).toEqual([]);
+  });
+
+  test("keeps the active source when a staged replacement stops before publication", async () => {
+    const stopped: string[] = [];
+    const router = createRouter(
+      { serial: "emulator-5554" },
+      {
+        listDevices: async () => [
+          { serial: "emulator-5554", state: "device" },
+        ],
+        listAllDevices: async () => [
+          { serial: "emulator-5554", state: "device" },
+        ],
+        createApp: async ({ serial, streamMode }) => {
+          const app = fakeApp(serial, stopped, streamMode ?? "scrcpy");
+          if (streamMode === "grpc-screenshot") {
+            app.isStreaming = () => false;
+          }
+          return app;
+        },
+      },
+    );
+    await router.handleRequest(
+      new Request("http://router.test/api/stream-mode"),
+    );
+
+    const failed = await router.handleRequest(
+      put("/api/stream-mode", { mode: "grpc-screenshot" }),
+    );
+    expect(failed.status).toBe(503);
+    expect(await responseJson(failed)).toEqual({
+      ok: false,
+      error: "grpc-screenshot stopped before publication",
+    });
+
+    const current = await router.handleRequest(
+      new Request("http://router.test/api/stream-mode"),
+    );
+    expect(await responseJson(current)).toMatchObject({
+      mode: "scrcpy",
+      sessionGeneration: 0,
+    });
+    expect(stopped).toEqual(["emulator-5554"]);
+    await router.stopAll();
   });
 
   test("rejects gRPC for physical devices before creating an app", async () => {

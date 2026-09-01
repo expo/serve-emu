@@ -513,11 +513,243 @@ function grpcFrame(message: Buffer): Buffer {
   return output;
 }
 
+class GrpcFrameError extends Error {}
+
+export class GrpcMessageParser {
+  readonly #maxMessageBytes: number;
+  readonly #onMessage: (message: Buffer) => void;
+  readonly #header = Buffer.allocUnsafe(5);
+  #headerBytes = 0;
+  #message: Buffer | null = null;
+  #messageBytes = 0;
+
+  constructor(
+    maxMessageBytes: number,
+    onMessage: (message: Buffer) => void,
+  ) {
+    if (!Number.isInteger(maxMessageBytes) || maxMessageBytes < 0) {
+      throw new RangeError("maxMessageBytes must be a non-negative integer");
+    }
+    this.#maxMessageBytes = Math.min(
+      maxMessageBytes,
+      MAX_GRPC_MESSAGE_BYTES,
+    );
+    this.#onMessage = onMessage;
+  }
+
+  push(chunk: Buffer): void {
+    let offset = 0;
+    while (offset < chunk.length) {
+      if (this.#message === null) {
+        const copyBytes = Math.min(
+          5 - this.#headerBytes,
+          chunk.length - offset,
+        );
+        chunk.copy(
+          this.#header,
+          this.#headerBytes,
+          offset,
+          offset + copyBytes,
+        );
+        this.#headerBytes += copyBytes;
+        offset += copyBytes;
+        if (this.#headerBytes < 5) continue;
+
+        if (this.#header[0] !== 0) {
+          throw new GrpcFrameError("compressed gRPC frames are unsupported");
+        }
+        const length = this.#header.readUInt32BE(1);
+        if (length > this.#maxMessageBytes) {
+          throw new GrpcFrameError(
+            `gRPC message ${length} exceeds ${this.#maxMessageBytes} byte limit`,
+          );
+        }
+        this.#headerBytes = 0;
+        this.#message = Buffer.allocUnsafe(length);
+        this.#messageBytes = 0;
+        if (length === 0) this.#emitMessage();
+        continue;
+      }
+
+      const copyBytes = Math.min(
+        this.#message.length - this.#messageBytes,
+        chunk.length - offset,
+      );
+      chunk.copy(
+        this.#message,
+        this.#messageBytes,
+        offset,
+        offset + copyBytes,
+      );
+      this.#messageBytes += copyBytes;
+      offset += copyBytes;
+      if (this.#messageBytes === this.#message.length) this.#emitMessage();
+    }
+  }
+
+  #emitMessage(): void {
+    const message = this.#message!;
+    this.#message = null;
+    this.#messageBytes = 0;
+    this.#onMessage(message);
+  }
+}
+
+export type GrpcMessagePacingClock = {
+  now(): number;
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
+};
+
+type PausableGrpcStream = {
+  pause(): void;
+  resume(): void;
+};
+
+const SYSTEM_PACING_CLOCK: GrpcMessagePacingClock = {
+  now: () => performance.now(),
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (handle) =>
+    clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+/**
+ * Applies transport backpressure between streamed gRPC messages. The parser
+ * consumes the current chunk but retains only its newest pending raw message,
+ * so a burst cannot trigger multiple expensive decodes in one frame slot.
+ */
+export class GrpcMessagePacer {
+  readonly #stream: PausableGrpcStream;
+  readonly #parser: GrpcMessageParser;
+  readonly #messageIntervalMs: number;
+  readonly #onMessage: (message: Buffer) => void;
+  readonly #onError: (error: Error) => void;
+  readonly #clock: GrpcMessagePacingClock;
+  readonly #signal: AbortSignal | undefined;
+  readonly #onAbort = () => this.close();
+  #pendingMessage: Buffer | null = null;
+  #timer: unknown = null;
+  #nextMessageAt: number | null = null;
+  #paused = false;
+  #closed = false;
+
+  constructor(options: {
+    stream: PausableGrpcStream;
+    maxMessageBytes: number;
+    messageIntervalMs: number;
+    onMessage: (message: Buffer) => void;
+    onError: (error: Error) => void;
+    signal?: AbortSignal;
+    clock?: GrpcMessagePacingClock;
+  }) {
+    if (
+      !Number.isFinite(options.messageIntervalMs) ||
+      options.messageIntervalMs <= 0
+    ) {
+      throw new RangeError("messageIntervalMs must be a positive number");
+    }
+    this.#stream = options.stream;
+    this.#parser = new GrpcMessageParser(
+      options.maxMessageBytes,
+      (message) => this.#handleMessage(message),
+    );
+    this.#messageIntervalMs = options.messageIntervalMs;
+    this.#onMessage = options.onMessage;
+    this.#onError = options.onError;
+    this.#clock = options.clock ?? SYSTEM_PACING_CLOCK;
+    this.#signal = options.signal;
+    if (options.signal?.aborted) this.#closed = true;
+    else options.signal?.addEventListener("abort", this.#onAbort, { once: true });
+  }
+
+  push(chunk: Buffer): void {
+    if (this.#closed || chunk.length === 0) return;
+    try {
+      this.#parser.push(chunk);
+    } catch (error) {
+      this.#fail(error);
+    }
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    if (this.#timer !== null) this.#clock.clearTimeout(this.#timer);
+    this.#timer = null;
+    this.#pendingMessage = null;
+    this.#signal?.removeEventListener("abort", this.#onAbort);
+  }
+
+  #handleMessage(message: Buffer): void {
+    if (this.#closed) return;
+    if (this.#paused) {
+      // A data chunk may already contain several frames when pause() takes
+      // effect. Keep only the newest raw protobuf and decode it next slot.
+      this.#pendingMessage = message;
+      return;
+    }
+    this.#emitMessage(message);
+  }
+
+  #emitMessage(message: Buffer): void {
+    if (!this.#paused) {
+      this.#paused = true;
+      this.#stream.pause();
+    }
+    const now = this.#clock.now();
+    this.#nextMessageAt = Math.max(
+      (this.#nextMessageAt ?? now) + this.#messageIntervalMs,
+      now + this.#messageIntervalMs,
+    );
+    this.#onMessage(message);
+    this.#scheduleNextSlot();
+  }
+
+  #scheduleNextSlot(): void {
+    this.#timer = this.#clock.setTimeout(
+      () => this.#onNextSlot(),
+      Math.max(0, this.#nextMessageAt! - this.#clock.now()),
+    );
+    if (
+      typeof this.#timer === "object" &&
+      this.#timer !== null &&
+      "unref" in this.#timer
+    ) {
+      (this.#timer as { unref(): void }).unref();
+    }
+  }
+
+  #onNextSlot(): void {
+    this.#timer = null;
+    if (this.#closed) return;
+    try {
+      if (this.#pendingMessage) {
+        const message = this.#pendingMessage;
+        this.#pendingMessage = null;
+        this.#emitMessage(message);
+        return;
+      }
+      this.#paused = false;
+      this.#stream.resume();
+    } catch (error) {
+      this.#fail(error);
+    }
+  }
+
+  #fail(error: unknown): void {
+    if (this.#closed) return;
+    const cause = error instanceof Error ? error : new Error(String(error));
+    this.close();
+    this.#onError(cause);
+  }
+}
+
 type RequestOptions = {
   onMessage?: (message: Buffer) => void;
   signal?: AbortSignal;
   timeoutMs?: number;
   maxMessageBytes?: number;
+  messageIntervalMs?: number;
 };
 
 export class EmulatorGrpcClient {
@@ -570,16 +802,24 @@ export class EmulatorGrpcClient {
         options.maxMessageBytes ?? MAX_GRPC_MESSAGE_BYTES,
         MAX_GRPC_MESSAGE_BYTES,
       );
-      let pending = Buffer.alloc(0);
       let grpcStatus: string | null = null;
       let grpcMessage = "";
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | null = null;
+      let pacer: GrpcMessagePacer | null = null;
+      const onMessage = (body: Buffer) => {
+        if (options.onMessage) options.onMessage(body);
+        else messages.push(body);
+      };
+      const parser = options.messageIntervalMs
+        ? null
+        : new GrpcMessageParser(maxMessageBytes, onMessage);
 
       const settle = (error?: Error) => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
+        pacer?.close();
         options.signal?.removeEventListener("abort", onAbort);
         if (error) reject(error);
         else resolve(messages);
@@ -599,6 +839,25 @@ export class EmulatorGrpcClient {
           grpcMessage = String(values["grpc-message"] ?? "");
         }
       };
+      const cancelForFrameError = (error: unknown) => {
+        const cause = error instanceof Error ? error : new Error(String(error));
+        settle(
+          cause instanceof GrpcFrameError
+            ? new Error(`${method}: ${cause.message}`)
+            : cause,
+        );
+        stream.close(http2.constants.NGHTTP2_CANCEL);
+      };
+      if (options.messageIntervalMs) {
+        pacer = new GrpcMessagePacer({
+          stream,
+          maxMessageBytes,
+          messageIntervalMs: options.messageIntervalMs,
+          onMessage,
+          onError: cancelForFrameError,
+          signal: options.signal,
+        });
+      }
 
       stream.on("response", (values) =>
         takeStatus(values as Record<string, unknown>),
@@ -608,42 +867,11 @@ export class EmulatorGrpcClient {
       );
       stream.on("data", (chunk: Buffer) => {
         if (settled) return;
-        const ownedChunk = Buffer.from(chunk);
-        pending = pending.length
-          ? Buffer.concat([pending, ownedChunk])
-          : ownedChunk;
-        for (;;) {
-          if (pending.length < 5) break;
-          if (pending[0] !== 0) {
-            settle(new Error(`${method}: compressed gRPC frames are unsupported`));
-            stream.close(http2.constants.NGHTTP2_CANCEL);
-            return;
-          }
-          const length = pending.readUInt32BE(1);
-          if (length > maxMessageBytes) {
-            settle(
-              new Error(
-                `${method}: gRPC message ${length} exceeds ${maxMessageBytes} byte limit`,
-              ),
-            );
-            stream.close(http2.constants.NGHTTP2_CANCEL);
-            return;
-          }
-          if (pending.length < 5 + length) break;
-          const body = pending.subarray(5, 5 + length);
-          pending = pending.subarray(5 + length);
-          try {
-            if (options.onMessage) options.onMessage(body);
-            else messages.push(body);
-          } catch (error) {
-            settle(error instanceof Error ? error : new Error(String(error)));
-            stream.close(http2.constants.NGHTTP2_CANCEL);
-            return;
-          }
-        }
-        if (pending.length > maxMessageBytes + 5) {
-          settle(new Error(`${method}: buffered gRPC data exceeds limit`));
-          stream.close(http2.constants.NGHTTP2_CANCEL);
+        try {
+          if (pacer) pacer.push(chunk);
+          else parser!.push(chunk);
+        } catch (error) {
+          cancelForFrameError(error);
         }
       });
       stream.on("error", (error: Error) => {
@@ -690,10 +918,21 @@ export class EmulatorGrpcClient {
     format: ImageFormatRequest,
     onImage: (image: EmuImage) => void,
     signal: AbortSignal,
+    options: { maxFps?: number } = {},
   ): Promise<void> {
+    const messageIntervalMs = options.maxFps === undefined
+      ? undefined
+      : 1_000 / options.maxFps;
+    if (
+      messageIntervalMs !== undefined &&
+      (!Number.isFinite(messageIntervalMs) || messageIntervalMs <= 0)
+    ) {
+      throw new RangeError("maxFps must be a positive number");
+    }
     try {
       await this.#request("streamScreenshot", encodeImageFormat(format), {
         signal,
+        messageIntervalMs,
         onMessage: (message) => onImage(decodeEmulatorImage(message)),
       });
     } catch (error) {

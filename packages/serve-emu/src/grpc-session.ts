@@ -10,11 +10,21 @@ import {
   IMG_FORMAT_RGB888,
   type EmuImage,
   type KeyboardEventRequest,
+  type TouchPoint,
 } from "./emulator-grpc.ts";
+import {
+  getDisplayRotation,
+  type DisplayRotation,
+} from "./adb.ts";
 import { execText, type ExecResult } from "./exec.ts";
-import { H264Encoder, assertFfmpegAvailable } from "./h264-encoder.ts";
+import {
+  H264Encoder,
+  assertFfmpegAvailable,
+  type QuarterTurn,
+} from "./h264-encoder.ts";
 import {
   normalizeTextForControl,
+  originalTextForControl,
   type Gesture,
 } from "./input.ts";
 import {
@@ -33,6 +43,10 @@ const FLUSH_MS = 40;
 const DEFAULT_IDLE_REPEAT_MS = 500;
 const FIRST_FRAME_TIMEOUT_MS = 10_000;
 const MAX_QUEUED_PACKETS = 256;
+const DISPLAY_ROTATION_POLL_MS = 500;
+const DISPLAY_SIZE_POLL_MS = 2_000;
+const MAX_DISPLAY_SIZE_OUTPUT_BYTES = 4_096;
+const INPUT_RELEASE_TIMEOUT_MS = 500;
 const TOUCH_PRESSURE = 1;
 
 const ANDROID_KEYCODE_TO_EVDEV: Record<number, number> = {
@@ -369,6 +383,345 @@ export function isUsableRgbFrame(image: EmuImage): boolean {
   );
 }
 
+export type GrpcDisplayGeometry = {
+  quarterTurn: QuarterTurn;
+  encodedSize: { width: number; height: number };
+  touchSize: { width: number; height: number };
+  mapTouch(unitX: number, unitY: number): { x: number; y: number };
+};
+
+export function resolveGrpcDisplayGeometry(options: {
+  inputWidth: number;
+  inputHeight: number;
+  nativeWidth: number;
+  nativeHeight: number;
+  quarterTurn: QuarterTurn;
+}): GrpcDisplayGeometry {
+  const croppedWidth = options.inputWidth - (options.inputWidth % 2);
+  const croppedHeight = options.inputHeight - (options.inputHeight % 2);
+  const transposed = options.quarterTurn === 1 || options.quarterTurn === 3;
+  const encodedSize = transposed
+    ? { width: croppedHeight, height: croppedWidth }
+    : { width: croppedWidth, height: croppedHeight };
+  const touchSize = {
+    width: options.nativeWidth,
+    height: options.nativeHeight,
+  };
+
+  const toPixel = (unit: number, size: number) =>
+    Math.max(0, Math.min(size - 1, Math.round(unit * size)));
+
+  return {
+    quarterTurn: options.quarterTurn,
+    encodedSize,
+    touchSize,
+    mapTouch(unitX, unitY) {
+      // sendTouch consumes coordinates in the emulator's unrotated physical
+      // surface. Map the point back through the inverse of ffmpeg's display
+      // transform so a click follows the pixels the browser presents.
+      if (options.quarterTurn === 1) {
+        return {
+          x: toPixel(1 - unitY, touchSize.width),
+          y: toPixel(unitX, touchSize.height),
+        };
+      }
+      if (options.quarterTurn === 2) {
+        return {
+          x: toPixel(1 - unitX, touchSize.width),
+          y: toPixel(1 - unitY, touchSize.height),
+        };
+      }
+      if (options.quarterTurn === 3) {
+        return {
+          x: toPixel(unitY, touchSize.width),
+          y: toPixel(1 - unitX, touchSize.height),
+        };
+      }
+      return {
+        x: toPixel(unitX, touchSize.width),
+        y: toPixel(unitY, touchSize.height),
+      };
+    },
+  };
+}
+
+export class GrpcFrameWritePacer {
+  readonly #frameIntervalMs: number;
+  #nextFreshWriteAt = 0;
+
+  constructor(frameIntervalMs: number) {
+    if (!Number.isFinite(frameIntervalMs) || frameIntervalMs <= 0) {
+      throw new RangeError("frameIntervalMs must be a positive number");
+    }
+    this.#frameIntervalMs = frameIntervalMs;
+  }
+
+  reset(now: number): void {
+    this.#nextFreshWriteAt = now;
+  }
+
+  recordWrite(now: number, repeat: boolean, accepted = true): void {
+    if (repeat || !accepted) return;
+    this.#nextFreshWriteAt = Math.max(
+      this.#nextFreshWriteAt + this.#frameIntervalMs,
+      now + this.#frameIntervalMs,
+    );
+  }
+
+  waitMs(now: number): number {
+    return Math.max(0, this.#nextFreshWriteAt - now);
+  }
+}
+
+type GrpcInputClient = {
+  sendTouch(points: TouchPoint[], signal?: AbortSignal): Promise<void>;
+  sendKey(event: KeyboardEventRequest, signal?: AbortSignal): Promise<void>;
+};
+
+function keyIdentity(event: KeyboardEventRequest): string | null {
+  if (event.evdev !== undefined) return `evdev:${event.evdev}`;
+  if (event.key) return `key:${event.key}`;
+  return null;
+}
+
+/** Tracks possibly-sent downs so cancellation can finish with explicit ups. */
+export class GrpcInputState {
+  readonly #client: GrpcInputClient;
+  readonly #activeTouches = new Map<number, TouchPoint>();
+  readonly #activeKeys = new Map<string, KeyboardEventRequest>();
+  #tail: Promise<void> = Promise.resolve();
+
+  constructor(client: GrpcInputClient) {
+    this.#client = client;
+  }
+
+  sendTouch(points: TouchPoint[], signal: AbortSignal): Promise<void> {
+    return this.#enqueue(async () => {
+      for (const point of points) {
+        if (point.pressure > 0) this.#activeTouches.set(point.identifier, point);
+      }
+      await this.#client.sendTouch(points, signal);
+      for (const point of points) {
+        if (point.pressure === 0) this.#activeTouches.delete(point.identifier);
+      }
+    });
+  }
+
+  sendKey(event: KeyboardEventRequest, signal: AbortSignal): Promise<void> {
+    return this.#enqueue(async () => {
+      const identity = keyIdentity(event);
+      if (identity && event.eventType === "down") {
+        this.#activeKeys.set(identity, event);
+      }
+      await this.#client.sendKey(event, signal);
+      if (identity && event.eventType === "up") {
+        this.#activeKeys.delete(identity);
+      }
+    });
+  }
+
+  releaseAll(signal: AbortSignal): Promise<void> {
+    return this.#enqueue(async () => {
+      let firstFailure: unknown;
+      const touches = [...this.#activeTouches.values()].map((point) => ({
+        ...point,
+        pressure: 0,
+      }));
+      if (touches.length > 0) {
+        try {
+          await this.#client.sendTouch(touches, signal);
+          for (const point of touches) {
+            this.#activeTouches.delete(point.identifier);
+          }
+        } catch (error) {
+          firstFailure = error;
+        }
+      }
+
+      for (const [identity, event] of [...this.#activeKeys]) {
+        try {
+          await this.#client.sendKey(
+            { ...event, eventType: "up", text: undefined },
+            signal,
+          );
+          this.#activeKeys.delete(identity);
+        } catch (error) {
+          firstFailure ??= error;
+        }
+      }
+      if (firstFailure) throw firstFailure;
+    });
+  }
+
+  #enqueue(operation: () => Promise<void>): Promise<void> {
+    const result = this.#tail.then(operation);
+    this.#tail = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+}
+
+/**
+ * The emulator translates KeyboardEvent.text through evdev and may silently
+ * ignore arbitrary Unicode, so keep this path intentionally ASCII-only:
+ * https://android.googlesource.com/platform/external/qemu/+/refs/heads/emu-master-dev/android/android-grpc/emulator_controller.proto
+ *
+ * A future Unicode implementation could use the emulator clipboard mechanism:
+ * https://android.googlesource.com/platform/external/qemu/+/refs/heads/emu-master-dev/android/android-grpc/services/emulator-controller/server/src/android/emulation/control/clipboard/Clipboard.cpp
+ */
+export function normalizeGrpcText(text: string): string {
+  for (let index = 0; index < text.length; index++) {
+    if (text.charCodeAt(index) > 0x7f) {
+      throw new ControlInputRejectedError(
+        "grpc-screenshot supports ASCII text only",
+      );
+    }
+  }
+  return normalizeTextForControl(text);
+}
+
+export function normalizeGrpcGestureText(
+  gesture: Extract<Gesture, { type: "text" }>,
+): string {
+  return normalizeGrpcText(originalTextForControl(gesture));
+}
+
+export function parseDisplaySizeSignal(output: string): string {
+  if (Buffer.byteLength(output) > MAX_DISPLAY_SIZE_OUTPUT_BYTES) {
+    throw new Error(
+      `display size response exceeds ${MAX_DISPLAY_SIZE_OUTPUT_BYTES} byte limit`,
+    );
+  }
+  const sizes = new Map<string, string>();
+  for (const match of output.matchAll(
+    /\b(Physical|Override) size:\s*(\d{1,5})x(\d{1,5})\b/g,
+  )) {
+    const width = Number(match[2]);
+    const height = Number(match[3]);
+    if (width <= 0 || height <= 0) continue;
+    sizes.set(match[1]!.toLowerCase(), `${width}x${height}`);
+  }
+  if (sizes.size === 0) {
+    throw new Error("could not parse emulator display size");
+  }
+  return ["physical", "override"]
+    .flatMap((kind) => {
+      const size = sizes.get(kind);
+      return size ? [`${kind}:${size}`] : [];
+    })
+    .join(";");
+}
+
+export class GrpcNativeTouchGeometryMonitor {
+  readonly #readDisplaySizeSignal: (signal: AbortSignal) => Promise<string>;
+  readonly #readNativeImage: (
+    signal: AbortSignal,
+  ) => Promise<{ width: number; height: number }>;
+  readonly #onNativeSize: (size: { width: number; height: number }) => void;
+  #displaySizeSignal: string | null;
+  #pollTask: Promise<void> | null = null;
+
+  constructor(options: {
+    initialDisplaySizeSignal: string | null;
+    readDisplaySizeSignal: (signal: AbortSignal) => Promise<string>;
+    readNativeImage: (
+      signal: AbortSignal,
+    ) => Promise<{ width: number; height: number }>;
+    onNativeSize: (size: { width: number; height: number }) => void;
+  }) {
+    this.#displaySizeSignal = options.initialDisplaySizeSignal;
+    this.#readDisplaySizeSignal = options.readDisplaySizeSignal;
+    this.#readNativeImage = options.readNativeImage;
+    this.#onNativeSize = options.onNativeSize;
+  }
+
+  poll(signal: AbortSignal): Promise<void> {
+    if (this.#pollTask) return this.#pollTask;
+    const task = this.#pollOnce(signal).finally(() => {
+      if (this.#pollTask === task) this.#pollTask = null;
+    });
+    this.#pollTask = task;
+    return task;
+  }
+
+  async #pollOnce(signal: AbortSignal): Promise<void> {
+    throwIfAborted(signal, "display size refresh aborted");
+    const nextSignal = await this.#readDisplaySizeSignal(signal);
+    if (nextSignal === this.#displaySizeSignal) return;
+    const image = await this.#readNativeImage(signal);
+    throwIfAborted(signal, "display size refresh aborted");
+    if (
+      !Number.isSafeInteger(image.width) ||
+      !Number.isSafeInteger(image.height) ||
+      image.width <= 0 ||
+      image.height <= 0
+    ) {
+      throw new Error("emulator returned invalid native touch dimensions");
+    }
+    this.#onNativeSize({ width: image.width, height: image.height });
+    this.#displaySizeSignal = nextSignal;
+  }
+}
+
+export type GrpcSessionDependencies = {
+  readDisplayRotation?: (
+    serial: string,
+    signal: AbortSignal,
+  ) => Promise<DisplayRotation>;
+  readDisplaySizeSignal?: (
+    serial: string,
+    signal: AbortSignal,
+  ) => Promise<string>;
+};
+
+const defaultReadDisplayRotation: NonNullable<
+  GrpcSessionDependencies["readDisplayRotation"]
+> = (serial, signal) => getDisplayRotation(serial, execText, signal);
+
+const defaultReadDisplaySizeSignal: NonNullable<
+  GrpcSessionDependencies["readDisplaySizeSignal"]
+> = async (serial, signal) => {
+  const result = await execText(
+    "adb",
+    ["-s", serial, "shell", "wm", "size"],
+    {
+      timeout: 5_000,
+      maxBuffer: MAX_DISPLAY_SIZE_OUTPUT_BYTES + 1,
+      signal,
+      lane: "background",
+    },
+  );
+  if (result.status !== 0 || result.error) {
+    throw commandFailure("could not read emulator display size", result);
+  }
+  return parseDisplaySizeSignal(result.stdout);
+};
+
+export async function readInitialDisplayRotation(
+  readRotation: () => Promise<DisplayRotation>,
+  signal: AbortSignal,
+  reportWarning: (message: string) => void = console.warn,
+): Promise<DisplayRotation | null> {
+  try {
+    return await readRotation();
+  } catch (error) {
+    throwIfAborted(signal, "gRPC screenshot startup aborted");
+    reportWarning(
+      `serve-emu could not read the initial display rotation; starting with the emulator screenshot rotation and polling for recovery: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  }
+}
+
+function rotationFromEmulatorImage(rotation: number): DisplayRotation {
+  const quarterTurns = rotation > 3 ? rotation / 90 : rotation;
+  return Number.isInteger(quarterTurns) && quarterTurns >= 0 && quarterTurns <= 3
+    ? (quarterTurns as DisplayRotation)
+    : 0;
+}
+
 function positiveNumber(value: number, name: string, maximum: number): number {
   if (!Number.isFinite(value) || value <= 0 || value > maximum) {
     throw new Error(`${name} must be a positive number`);
@@ -405,8 +758,13 @@ function nonNegativeInteger(
  */
 export async function startGrpcSession(
   options: StartOpts,
+  dependencies: GrpcSessionDependencies = {},
 ): Promise<EmuSession> {
   const serial = options.serial;
+  const readDisplayRotation =
+    dependencies.readDisplayRotation ?? defaultReadDisplayRotation;
+  const readDisplaySizeSignal =
+    dependencies.readDisplaySizeSignal ?? defaultReadDisplaySizeSignal;
   const maxFps = positiveNumber(
     options.maxFps ?? SCRCPY_DEFAULTS.maxFps,
     "maxFps",
@@ -437,13 +795,13 @@ export async function startGrpcSession(
       ? configuredRepeatFrameMs
       : DEFAULT_IDLE_REPEAT_MS;
   const frameIntervalMs = 1_000 / maxFps;
+  const frameWritePacer = new GrpcFrameWritePacer(frameIntervalMs);
 
   if (!/^emulator-\d+$/.test(serial)) {
     throw new Error(
       `grpc-screenshot requires an Android Emulator serial; received ${serial}`,
     );
   }
-  assertFfmpegAvailable();
   const lifetime = new AbortController();
   const abortFromParent = () =>
     lifetime.abort(
@@ -454,6 +812,7 @@ export async function startGrpcSession(
 
   let endpoint: Awaited<ReturnType<typeof ensureEmulatorGrpcEndpoint>>;
   try {
+    await assertFfmpegAvailable(lifetime.signal);
     endpoint = await ensureEmulatorGrpcEndpoint(serial, lifetime.signal);
   } catch (error) {
     options.signal?.removeEventListener("abort", abortFromParent);
@@ -470,11 +829,14 @@ export async function startGrpcSession(
   let encoder: H264Encoder | null = null;
   let latest: EmuImage | null = null;
   let lastWriteAt = 0;
-  let nextWriteAt = 0;
   let writeTimer: ReturnType<typeof setTimeout> | null = null;
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   let idleTimer: ReturnType<typeof setInterval> | null = null;
+  let rotationPollTimer: ReturnType<typeof setTimeout> | null = null;
+  let displaySizePollTimer: ReturnType<typeof setTimeout> | null = null;
+  let displayRotation: DisplayRotation = 0;
   let nativePortrait = { width: 0, height: 0 };
+  let nativeTouchGeometryMonitor: GrpcNativeTouchGeometryMonitor | null = null;
   let sessionMeta: StreamMeta | null = null;
   let resolveFirstImage: ((image: EmuImage) => void) | null = null;
   let rejectFirstImage: ((error: Error) => void) | null = null;
@@ -520,23 +882,40 @@ export async function startGrpcSession(
   };
   const nowUs = () => BigInt(Math.round(performance.now() * 1_000));
   const writeFrame = (repeat: boolean) => {
-    if (closed || lifetime.signal.aborted || !encoder || !latest) return;
+    if (
+      closed ||
+      lifetime.signal.aborted ||
+      fatalFailure ||
+      !encoder ||
+      !latest
+    ) {
+      return;
+    }
     const now = performance.now();
     const accepted = encoder.write(latest.image, nowUs());
-    lastWriteAt = Date.now();
-    nextWriteAt = Math.max(nextWriteAt + frameIntervalMs, now + frameIntervalMs);
-    if (flushTimer) clearTimeout(flushTimer);
-    flushTimer = null;
+    frameWritePacer.recordWrite(now, repeat, accepted);
+    if (accepted) lastWriteAt = Date.now();
+    if (repeat && flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
     if (!repeat && accepted) {
+      if (flushTimer) clearTimeout(flushTimer);
       flushTimer = setTimeout(() => {
         flushTimer = null;
         writeFrame(true);
       }, FLUSH_MS);
+    } else if (!repeat && !writeTimer) {
+      writeTimer = setTimeout(() => {
+        writeTimer = null;
+        scheduleWrite();
+      }, Math.min(FLUSH_MS, frameIntervalMs));
+      writeTimer.unref?.();
     }
   };
   const scheduleWrite = () => {
     if (writeTimer || closed || !encoder || !latest) return;
-    const waitMs = nextWriteAt - performance.now();
+    const waitMs = frameWritePacer.waitMs(performance.now());
     if (waitMs <= 0) {
       writeFrame(false);
       return;
@@ -546,21 +925,28 @@ export async function startGrpcSession(
       writeFrame(false);
     }, waitMs);
   };
-  const evenSize = (image: EmuImage) => ({
-    width: image.width - (image.width % 2),
-    height: image.height - (image.height % 2),
-  });
+  const currentGeometry = (image = latest) => {
+    if (!image) return null;
+    return resolveGrpcDisplayGeometry({
+      inputWidth: image.width,
+      inputHeight: image.height,
+      nativeWidth: nativePortrait.width,
+      nativeHeight: nativePortrait.height,
+      quarterTurn: displayRotation,
+    });
+  };
   const startEncoder = (announceSize: boolean, clearPending: boolean) => {
     if (closed || lifetime.signal.aborted || !latest) return;
     clearWriteTimers();
     void encoder?.close();
     if (clearPending) packetQueue.length = 0;
-    const size = evenSize(latest);
+    const geometry = currentGeometry(latest)!;
+    const size = geometry.encodedSize;
     if (size.width <= 0 || size.height <= 0) {
       emitFatal({ message: "emulator returned an image too small to encode" });
       return;
     }
-    nextWriteAt = performance.now();
+    frameWritePacer.reset(performance.now());
     if (sessionMeta) {
       sessionMeta.width = size.width;
       sessionMeta.height = size.height;
@@ -568,6 +954,7 @@ export async function startGrpcSession(
     encoder = new H264Encoder({
       width: latest.width,
       height: latest.height,
+      quarterTurn: geometry.quarterTurn,
       fps: maxFps,
       bitRate,
       keyFrameInterval,
@@ -585,6 +972,64 @@ export async function startGrpcSession(
     writeFrame(false);
   };
 
+  const scheduleRotationPoll = () => {
+    if (closed || lifetime.signal.aborted || rotationPollTimer) return;
+    rotationPollTimer = setTimeout(() => {
+      rotationPollTimer = null;
+      void (async () => {
+        try {
+          const nextRotation = await readDisplayRotation(
+            serial,
+            lifetime.signal,
+          );
+          if (closed || lifetime.signal.aborted) return;
+          if (nextRotation !== displayRotation) {
+            displayRotation = nextRotation;
+            startEncoder(true, true);
+          }
+        } catch (error) {
+          if (!closed && !lifetime.signal.aborted) {
+            console.warn(
+              `serve-emu could not refresh display rotation: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        } finally {
+          scheduleRotationPoll();
+        }
+      })();
+    }, DISPLAY_ROTATION_POLL_MS);
+    rotationPollTimer.unref?.();
+  };
+
+  const refreshNativeTouchGeometry = (): Promise<void> => {
+    if (!nativeTouchGeometryMonitor || closed || lifetime.signal.aborted) {
+      return Promise.resolve();
+    }
+    return nativeTouchGeometryMonitor.poll(lifetime.signal).catch((error) => {
+      if (!closed && !lifetime.signal.aborted) {
+        console.warn(
+          `serve-emu could not refresh native touch geometry: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
+  };
+
+  const scheduleDisplaySizePoll = () => {
+    if (
+      closed ||
+      lifetime.signal.aborted ||
+      displaySizePollTimer ||
+      !nativeTouchGeometryMonitor
+    ) {
+      return;
+    }
+    displaySizePollTimer = setTimeout(() => {
+      displaySizePollTimer = null;
+      void refreshNativeTouchGeometry().finally(scheduleDisplaySizePoll);
+    }, DISPLAY_SIZE_POLL_MS);
+    displaySizePollTimer.unref?.();
+  };
+
   const onImage = (image: EmuImage) => {
     if (closed || !isUsableRgbFrame(image)) return;
     latest = image;
@@ -598,18 +1043,14 @@ export async function startGrpcSession(
       encoder &&
       (image.width !== encoder.width || image.height !== encoder.height)
     ) {
+      void refreshNativeTouchGeometry();
       startEncoder(true, true);
       return;
     }
     scheduleWrite();
   };
 
-  const currentNativeSize = () => {
-    const rotation = latest?.rotation ?? 0;
-    return rotation === 1 || rotation === 3
-      ? { width: nativePortrait.height, height: nativePortrait.width }
-      : nativePortrait;
-  };
+  const inputState = new GrpcInputState(client);
   const touch = async (
     unitX: number,
     unitY: number,
@@ -617,17 +1058,23 @@ export async function startGrpcSession(
     identifier: number,
     signal: AbortSignal,
   ) => {
-    const native = currentNativeSize();
+    const geometry = currentGeometry();
+    if (!geometry) {
+      throw new ControlInputRejectedError(
+        "gRPC touch input is unavailable before the first video frame",
+      );
+    }
     if (identifier > 0x7fffffff) {
       throw new ControlInputRejectedError(
         "gRPC touch pointerId must fit in a signed 32-bit integer",
       );
     }
-    await client.sendTouch(
+    const point = geometry.mapTouch(unitX, unitY);
+    await inputState.sendTouch(
       [
         {
-          x: Math.min(native.width - 1, Math.round(unitX * native.width)),
-          y: Math.min(native.height - 1, Math.round(unitY * native.height)),
+          x: point.x,
+          y: point.y,
           identifier,
           pressure,
         },
@@ -700,13 +1147,13 @@ export async function startGrpcSession(
         );
       case "key": {
         for (const event of androidKeyGestureToKeyboardEvents(gesture)) {
-          await client.sendKey(event, signal);
+          await inputState.sendKey(event, signal);
         }
         return;
       }
       case "text":
-        return client.sendKey(
-          { text: normalizeTextForControl(gesture.text) },
+        return inputState.sendKey(
+          { text: normalizeGrpcGestureText(gesture) },
           signal,
         );
       case "back":
@@ -714,22 +1161,47 @@ export async function startGrpcSession(
           ? swipeTouch(0.002, 0.5, 0.28, 0.5, 180, 0, signal)
           : navigationMode === 0 || navigationMode === 1
             ? tapTouch(0.17, 0.985, signal)
-            : client.sendKey({ key: "GoBack" }, signal);
+            : inputState.sendKey({ key: "GoBack" }, signal);
       case "home":
         return navigationMode === 2
           ? swipeTouch(0.5, 0.995, 0.5, 0.65, 250, 0, signal)
           : navigationMode === 0 || navigationMode === 1
             ? tapTouch(0.5, 0.985, signal)
-            : client.sendKey({ key: "GoHome" }, signal);
+            : inputState.sendKey({ key: "GoHome" }, signal);
       case "recents":
         return navigationMode === 0
           ? tapTouch(0.83, 0.985, signal)
           : navigationMode === 1 || navigationMode === 2
             ? swipeTouch(0.5, 0.995, 0.5, 0.55, 280, 500, signal)
-            : client.sendKey({ key: "AppSwitch" }, signal);
+            : inputState.sendKey({ key: "AppSwitch" }, signal);
       case "power":
         return toggleDevicePower(serial, signal);
     }
+  };
+
+  let inputReleaseTask: Promise<void> | null = null;
+  const releaseInput = (): Promise<void> => {
+    if (inputReleaseTask) return inputReleaseTask;
+    const cleanup = new AbortController();
+    const timer = setTimeout(
+      () => cleanup.abort(new Error("gRPC input release timed out")),
+      INPUT_RELEASE_TIMEOUT_MS,
+    );
+    timer.unref?.();
+    let task!: Promise<void>;
+    task = inputState
+      .releaseAll(cleanup.signal)
+      .catch((error) => {
+        console.warn(
+          `serve-emu could not release gRPC input state: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      })
+      .finally(() => {
+        clearTimeout(timer);
+        if (inputReleaseTask === task) inputReleaseTask = null;
+      });
+    inputReleaseTask = task;
+    return task;
   };
 
   const controls = new ControlInputQueue({
@@ -739,6 +1211,9 @@ export async function startGrpcSession(
       async resetVideo(signal) {
         throwIfAborted(signal, "gRPC video reset aborted");
         startEncoder(false, true);
+      },
+      close() {
+        void releaseInput();
       },
     },
   });
@@ -755,14 +1230,21 @@ export async function startGrpcSession(
     clearWriteTimers();
     if (idleTimer) clearInterval(idleTimer);
     idleTimer = null;
+    if (rotationPollTimer) clearTimeout(rotationPollTimer);
+    rotationPollTimer = null;
+    if (displaySizePollTimer) clearTimeout(displaySizePollTimer);
+    displaySizePollTimer = null;
     controls.close(new Error("gRPC screenshot session closed"));
+    const inputRelease = releaseInput();
     const encoderClose = encoder?.close() ?? Promise.resolve();
     encoder = null;
-    client.close();
     listeners.clear();
     packetQueue.length = 0;
     wakeReaders();
-    void encoderClose.then(finishClose, finishClose);
+    void Promise.allSettled([inputRelease, encoderClose]).then(() => {
+      client.close();
+      finishClose();
+    });
     return closeTask;
   };
   const onParentAbort = () => {
@@ -778,7 +1260,26 @@ export async function startGrpcSession(
 
   try {
     throwIfAborted(lifetime.signal, "gRPC screenshot startup aborted");
-    navigationMode = await readNavigationMode(serial, lifetime.signal);
+    const [
+      initialNavigationMode,
+      initialDisplayRotation,
+      initialDisplaySizeSignal,
+    ] = await Promise.all([
+      readNavigationMode(serial, lifetime.signal),
+      readInitialDisplayRotation(
+        () => readDisplayRotation(serial, lifetime.signal),
+        lifetime.signal,
+      ),
+      readDisplaySizeSignal(serial, lifetime.signal).catch((error) => {
+        throwIfAborted(lifetime.signal, "gRPC screenshot startup aborted");
+        console.warn(
+          `serve-emu could not read the initial display size: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return null;
+      }),
+    ]);
+    navigationMode = initialNavigationMode;
+    throwIfAborted(lifetime.signal, "gRPC screenshot startup aborted");
     if (!(await isDeviceAwake(serial, lifetime.signal))) {
       await runPowerCommand(serial, "wakeup", lifetime.signal);
       await sleep(100, lifetime.signal);
@@ -806,11 +1307,22 @@ export async function startGrpcSession(
         );
       }
     }
-    const probeLandscape = probe.rotation === 1 || probe.rotation === 3;
+    displayRotation =
+      initialDisplayRotation ?? rotationFromEmulatorImage(probe.rotation);
     nativePortrait = {
-      width: probeLandscape ? probe.height : probe.width,
-      height: probeLandscape ? probe.width : probe.height,
+      width: probe.width,
+      height: probe.height,
     };
+    nativeTouchGeometryMonitor = new GrpcNativeTouchGeometryMonitor({
+      initialDisplaySizeSignal,
+      readDisplaySizeSignal: (signal) =>
+        readDisplaySizeSignal(serial, signal),
+      readNativeImage: (signal) =>
+        client.getScreenshot({ format: IMG_FORMAT_PNG }, signal),
+      onNativeSize: (size) => {
+        nativePortrait = size;
+      },
+    });
     const existingFailure = getFatalFailure();
     if (existingFailure) throw new Error(existingFailure.message);
 
@@ -854,6 +1366,7 @@ export async function startGrpcSession(
         },
         onImage,
         lifetime.signal,
+        { maxFps },
       )
       .then(
         () => {
@@ -886,8 +1399,10 @@ export async function startGrpcSession(
         writeFrame(true);
       }
     }, Math.max(16, Math.min(250, repeatFrameMs / 2)));
+    scheduleRotationPoll();
+    scheduleDisplaySizePoll();
 
-    const size = evenSize(first);
+    const size = currentGeometry(first)!.encodedSize;
     const meta: StreamMeta = {
       deviceName: endpoint.avdName ?? serial,
       codecId: "h264",

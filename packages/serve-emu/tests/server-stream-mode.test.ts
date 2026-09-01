@@ -80,6 +80,17 @@ const putMode = (
     body: JSON.stringify({ mode }),
   });
 
+const postJson = (
+  captured: CapturedServer,
+  path: string,
+  body: Record<string, unknown>,
+): Promise<Response> =>
+  request(captured, path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
 describe("server stream source switching", () => {
   test("rejects an explicit initial gRPC source for a physical device", async () => {
     let openCalls = 0;
@@ -169,6 +180,75 @@ describe("server stream source switching", () => {
 
     await started.stop();
     expect(grpc.closeCalls()).toBe(1);
+  });
+
+  test("preserves same-device recording, location, and active route state across a source switch", async () => {
+    const initial = fakeSession("emulator-5554", "scrcpy");
+    const grpc = fakeSession("emulator-5554", "grpc-screenshot");
+    let openCount = 0;
+    const captured: CapturedServer = { options: null };
+    const started = await startServer(
+      { serial: "emulator-5554", port: 3300 },
+      {
+        openSession: async () => {
+          openCount += 1;
+          return openCount === 1 ? initial.session : grpc.session;
+        },
+        setLocation: async () => {},
+        serve: capturingServe(captured),
+      },
+    );
+
+    expect(
+      (
+        await postJson(captured, "/api/tap", {
+          x: 0.25,
+          y: 0.75,
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(captured, "/api/location", {
+          latitude: 52.3676,
+          longitude: 4.9041,
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(captured, "/api/route", {
+          waypoints: [
+            { latitude: 52.3676, longitude: 4.9041 },
+            { latitude: 52.52, longitude: 13.405 },
+          ],
+          speedKph: 1,
+          intervalMs: 60_000,
+          loop: true,
+        })
+      ).status,
+    ).toBe(200);
+
+    const before = (await (
+      await request(captured, "/health")
+    ).json()) as {
+      location: unknown;
+      route: { status: string };
+      session: { eventCount: number };
+    };
+    expect(before.session.eventCount).toBe(2);
+    expect(before.route.status).toBe("running");
+
+    expect((await putMode(captured, "grpc-screenshot")).status).toBe(200);
+
+    const after = (await (
+      await request(captured, "/health")
+    ).json()) as typeof before;
+    expect(after.session.eventCount).toBe(2);
+    expect(after.location).toEqual(before.location);
+    expect(after.route.status).toBe("running");
+
+    await started.stop();
   });
 
   test("does not offer or start gRPC capture for a physical device", async () => {

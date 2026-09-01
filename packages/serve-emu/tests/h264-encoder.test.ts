@@ -1,10 +1,41 @@
+import { spawnSync } from "node:child_process";
 import { describe, expect, test } from "bun:test";
 import {
+  createFfmpegAvailabilityProbe,
   H264Encoder,
   H264OutputParser,
+  resolveFfmpeg,
   type H264EncoderOpts,
 } from "../src/h264-encoder.ts";
+import type { ExecResult } from "../src/exec.ts";
 import type { VideoFrame } from "../src/scrcpy.ts";
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve(value: T | PromiseLike<T>): void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: Deferred<T>["resolve"];
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function execResult(
+  overrides: Partial<ExecResult<string>> = {},
+): ExecResult<string> {
+  return {
+    status: 0,
+    signal: null,
+    stdout: " V..... libx264 H.264 / AVC / MPEG-4 AVC",
+    stderr: "",
+    timedOut: false,
+    error: null,
+    ...overrides,
+  };
+}
 
 function nal(
   typeByte: number,
@@ -116,6 +147,98 @@ describe("H264OutputParser", () => {
   });
 });
 
+describe("ffmpeg availability probe", () => {
+  test("runs asynchronously in the background and caches a successful binary", async () => {
+    const completion = deferred<ExecResult<string>>();
+    const calls: Array<{
+      binary: string;
+      args: string[];
+      options: Record<string, unknown>;
+    }> = [];
+    const probe = createFfmpegAvailabilityProbe({
+      resolveBinary: () => "test-ffmpeg",
+      runExec: (binary, args, options) => {
+        calls.push({ binary, args, options });
+        return completion.promise;
+      },
+    });
+
+    let settled = false;
+    const first = probe().finally(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(calls).toEqual([
+      {
+        binary: "test-ffmpeg",
+        args: ["-hide_banner", "-encoders"],
+        options: {
+          timeout: 10_000,
+          maxBuffer: 8 * 1024 * 1024,
+          signal: undefined,
+          lane: "background",
+        },
+      },
+    ]);
+
+    completion.resolve(execResult());
+    await first;
+    await probe();
+    expect(calls).toHaveLength(1);
+  });
+
+  test("passes cancellation to the process and does not cache an aborted probe", async () => {
+    const calls: AbortSignal[] = [];
+    const probe = createFfmpegAvailabilityProbe({
+      resolveBinary: () => "test-ffmpeg",
+      runExec: async (_binary, _args, options) => {
+        const signal = options.signal!;
+        calls.push(signal);
+        if (calls.length > 1) return execResult();
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return execResult({
+          status: null,
+          error: new Error("command was aborted"),
+        });
+      },
+    });
+    const controller = new AbortController();
+    const reason = new Error("source switch cancelled startup");
+    const first = probe(controller.signal);
+
+    controller.abort(reason);
+    await expect(first).rejects.toBe(reason);
+    await expect(probe()).resolves.toBeUndefined();
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toBe(controller.signal);
+  });
+
+  test("keeps actionable binary and libx264 failures", async () => {
+    const missing = createFfmpegAvailabilityProbe({
+      resolveBinary: () => "/missing/ffmpeg",
+      runExec: async () =>
+        execResult({
+          status: null,
+          error: new Error("spawn /missing/ffmpeg ENOENT"),
+        }),
+    });
+    await expect(missing()).rejects.toThrow(
+      'ffmpeg not found or unusable (tried "/missing/ffmpeg"): spawn /missing/ffmpeg ENOENT',
+    );
+
+    const missingX264 = createFfmpegAvailabilityProbe({
+      resolveBinary: () => "ffmpeg-without-x264",
+      runExec: async () => execResult({ stdout: " V..... h264_videotoolbox" }),
+    });
+    await expect(missingX264()).rejects.toThrow(
+      'ffmpeg at "ffmpeg-without-x264" does not include the libx264 encoder',
+    );
+  });
+});
+
 describe("H264Encoder validation", () => {
   const valid: H264EncoderOpts = {
     width: 576,
@@ -149,5 +272,112 @@ describe("H264Encoder validation", () => {
     expect(() => new H264Encoder({ ...valid, keyFrameInterval: -1 })).toThrow(
       "non-negative",
     );
+  });
+
+  test("reports transposed output dimensions for quarter-turn encoding", async () => {
+    const encoder = new H264Encoder({
+      ...valid,
+      width: 576,
+      height: 1280,
+      quarterTurn: 1,
+    });
+
+    expect({
+      width: encoder.encodedWidth,
+      height: encoder.encodedHeight,
+    }).toEqual({ width: 1280, height: 576 });
+
+    await encoder.close();
+  });
+
+  test("applies Android quarter-turn direction to encoded pixels", async () => {
+    const width = 4;
+    const height = 8;
+    const rgb = Buffer.alloc(width * height * 3);
+    const colors = [
+      [255, 0, 0],
+      [0, 255, 0],
+      [0, 0, 255],
+      [255, 255, 255],
+    ];
+    for (let y = 0; y < height; y++) {
+      const color = colors[Math.floor(y / 2)]!;
+      for (let x = 0; x < width; x++) {
+        const offset = (y * width + x) * 3;
+        rgb[offset] = color[0]!;
+        rgb[offset + 1] = color[1]!;
+        rgb[offset + 2] = color[2]!;
+      }
+    }
+
+    let config: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let keyFrame: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let resolveKeyFrame!: () => void;
+    const keyFrameReady = new Promise<void>((resolve) => {
+      resolveKeyFrame = resolve;
+    });
+    const encoder = new H264Encoder({
+      ...valid,
+      width,
+      height,
+      quarterTurn: 1,
+      onFrame(frame) {
+        if (frame.isConfig) config = frame.data;
+        else if (frame.isKey && keyFrame.length === 0) {
+          keyFrame = frame.data;
+          resolveKeyFrame();
+        }
+      },
+    });
+    encoder.write(rgb, 1n);
+    encoder.write(rgb, 2n);
+    await Promise.race([
+      keyFrameReady,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("timed out waiting for ffmpeg")), 2_000),
+      ),
+    ]);
+    await encoder.close();
+
+    const decoded = spawnSync(
+      resolveFfmpeg(),
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "h264",
+        "-i",
+        "pipe:0",
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+      ],
+      { input: Buffer.concat([config, keyFrame]) },
+    );
+    expect(decoded.status).toBe(0);
+
+    const topRow = [0, 2, 4, 6].map((x) => {
+      const offset = x * 3;
+      return [...decoded.stdout.subarray(offset, offset + 3)];
+    });
+    expect(topRow).toEqual([
+      expect.arrayContaining([expect.any(Number), 0, 0]),
+      expect.arrayContaining([0, expect.any(Number), 0]),
+      expect.arrayContaining([0, 0, expect.any(Number)]),
+      expect.arrayContaining([
+        expect.any(Number),
+        expect.any(Number),
+        expect.any(Number),
+      ]),
+    ]);
+    expect(topRow[0]![0]).toBeGreaterThan(200);
+    expect(topRow[1]![1]).toBeGreaterThan(200);
+    expect(topRow[2]![2]).toBeGreaterThan(200);
+    expect(Math.min(...topRow[3]!)).toBeGreaterThan(200);
   });
 });

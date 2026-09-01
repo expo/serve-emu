@@ -1,6 +1,5 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import {
   getUserRotation,
@@ -27,10 +26,10 @@ import {
   stopEmulator,
 } from "./emulator.ts";
 import { getNightMode, isNightMode, setNightMode } from "./ui-mode.ts";
+import { DeviceSessionState } from "./device-session-state.ts";
 import { parseGesture, type Gesture, type Screen } from "./input.ts";
 import { parseGeoFix, setEmulatorLocationAsync, type GeoFix } from "./location.ts";
-import { parseRoutePlaybackRequest, RoutePlayback } from "./route-playback.ts";
-import { SessionRecorder } from "./session-recorder.ts";
+import { parseRoutePlaybackRequest } from "./route-playback.ts";
 import type { StreamSocket } from "./stream-socket.ts";
 import {
   DEFAULT_STREAM_SETTINGS,
@@ -52,7 +51,7 @@ import { createWebRtcPublisher, type WebRtcPublisher } from "./webrtc-publisher.
 import { HttpBodyError, readBodyLimited, readJsonLimited } from "./request-body.ts";
 import { createMiddlewareUploader } from "./middleware-upload.ts";
 import { startEmuSession, type EmuSession } from "./stream-session.ts";
-import type { ScrcpySession } from "./scrcpy.ts";
+import { ScrcpyStreamError, type ScrcpySession } from "./scrcpy.ts";
 import {
   STREAM_MODES,
   type StreamMode,
@@ -90,6 +89,8 @@ export type AppOptions = {
   streamSettings?: StreamSettings;
   /** Screen capture and input source. Defaults to scrcpy. */
   streamMode?: StreamMode;
+  /** @internal Shared by router-managed source generations for one device. */
+  deviceState?: DeviceSessionState;
 } & BrowserOriginPolicy;
 
 type SessionStatus = "streaming" | "stopped" | "error";
@@ -195,6 +196,11 @@ function serveStaticFile(pathname: string): Response | null {
  */
 export type CreateAppDependencies = {
   startSession?: typeof startEmuSession;
+  setLocation?: (
+    serial: string,
+    fix: GeoFix,
+    signal: AbortSignal,
+  ) => Promise<void>;
 };
 
 async function createAppInternal(
@@ -233,13 +239,14 @@ async function createAppInternal(
   }
 
   const clients = new Set<Client>();
-  const logcatProcesses = new Set<ChildProcess>();
   const screen: Screen = { width: session.meta.width, height: session.meta.height };
   const streamSettings = opts.streamSettings ?? DEFAULT_STREAM_SETTINGS;
   const startedMs = Date.now();
   const startedAt = new Date(startedMs).toISOString();
   let status: SessionStatus = "streaming";
   let lastError: string | null = null;
+  let lastErrorCode: string | null = null;
+  let lastErrorMeta: Record<string, string | number> | null = null;
   let stoppedAt: string | null = null;
   let stopRequested = false;
   let frameCount = 0;
@@ -256,17 +263,31 @@ async function createAppInternal(
   let pendingVideoResetTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingVideoResetReason: string | null = null;
   let watchdog: ReturnType<typeof setInterval> | null = null;
-  let lastLocation: (GeoFix & { appliedAt: string }) | null = null;
   let nextClientId = 1;
   let webRtcPublisher: WebRtcPublisher | null = null;
   let removeFatalListener: (() => void) | null = null;
-  const sessionRecorder = new SessionRecorder();
-  const routePlayback = new RoutePlayback({
-    applyLocation: (fix) => setEmulatorLocationAsync(opts.serial, fix),
-    onLocation: (fix) => {
-      lastLocation = fix;
-    },
-  });
+  const deviceStateOwner = {};
+  const deviceState =
+    opts.deviceState ??
+    new DeviceSessionState({
+      serial: opts.serial,
+      generation: 0,
+      applyLocation:
+        dependencies.setLocation ??
+        ((serial, fix, signal) =>
+          setEmulatorLocationAsync(serial, fix, signal)),
+    });
+  try {
+    deviceState.acquire(deviceStateOwner);
+  } catch (error) {
+    await Promise.allSettled([
+      session.close(),
+      uploader.close(error),
+    ]);
+    throw error;
+  }
+  const sessionRecorder = deviceState.recorder;
+  const routePlayback = deviceState.route;
 
   const health = () => ({
     ok: status === "streaming",
@@ -286,9 +307,10 @@ async function createAppInternal(
     videoResetRequests,
     lastVideoResetAt,
     lastVideoResetReason,
-    location: lastLocation,
+    location: deviceState.lastLocation,
     route: routePlayback.snapshot(),
     session: sessionRecorder.snapshot(),
+    logcat: deviceState.logcat.snapshot(),
     uploads: uploader.snapshot(),
     stream: redactedStreamSettings(streamSettings),
     webrtc: webRtcPublisher?.snapshot() ?? null,
@@ -306,6 +328,8 @@ async function createAppInternal(
     stoppedAt,
     lastFrameAt: lastFrameMs > 0 ? new Date(lastFrameMs).toISOString() : null,
     lastError,
+    lastErrorCode,
+    lastErrorMeta,
   });
 
   const closeClients = (code: number, reason: string) => {
@@ -317,33 +341,31 @@ async function createAppInternal(
     clients.clear();
   };
 
-  const closeLogcatStreams = () => {
-    for (const proc of logcatProcesses) {
-      try {
-        proc.kill("SIGTERM");
-      } catch {}
-    }
-    logcatProcesses.clear();
-  };
-
-  const markTerminal = (nextStatus: Exclude<SessionStatus, "streaming">, reason: string) => {
+  const markTerminal = (
+    nextStatus: Exclude<SessionStatus, "streaming">,
+    reason: string,
+    detail?: {
+      code?: string;
+      meta?: Record<string, string | number> | null;
+    },
+  ) => {
     if (status !== "streaming") return;
     status = nextStatus;
     lastError = reason;
+    lastErrorCode = detail?.code ?? null;
+    lastErrorMeta = detail?.meta ?? null;
     stoppedAt = new Date().toISOString();
     if (watchdog) clearInterval(watchdog);
     if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
     pendingVideoResetTimer = null;
     pendingVideoResetReason = null;
-    sessionRecorder.stopReplay();
-    routePlayback.close();
+    void deviceState.release(deviceStateOwner, reason);
     webRtcPublisher?.close();
     void uploader.close(new Error(reason));
     removeFatalListener?.();
     removeFatalListener = null;
     void session.close();
     closeClients(nextStatus === "error" ? 1011 : 1000, reason);
-    closeLogcatStreams();
   };
 
   const sendJson = (socket: StreamSocket, value: unknown) => {
@@ -435,106 +457,41 @@ async function createAppInternal(
 
   const applyLocation = async (fix: GeoFix, source: string, record = true) => {
     routePlayback.stop();
-    await setEmulatorLocationAsync(opts.serial, fix);
-    lastLocation = { ...fix, appliedAt: new Date().toISOString() };
+    const location = await deviceState.applyLocation(fix);
     if (record) sessionRecorder.recordLocation(fix, source);
-    return lastLocation;
+    return location;
   };
 
-  const resolvePackagePids = (packageName: string): Set<string> => {
-    if (!/^[A-Za-z0-9_.:-]+$/.test(packageName)) return new Set();
-    const r = spawnSync("adb", ["-s", opts.serial, "shell", "pidof", packageName], {
-      encoding: "utf8",
-      timeout: 2_000,
+  const activateDeviceState = (): void => {
+    deviceState.activate(deviceStateOwner, {
+      dispatchGesture: async (gesture, signal) => {
+        if (signal.aborted) {
+          throw signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException("session replay cancelled", "AbortError");
+        }
+        await dispatchGesture(gesture, "session:replay", false);
+      },
     });
-    if (r.status !== 0) return new Set();
-    return new Set(r.stdout.trim().split(/\s+/).filter(Boolean));
   };
+  if (!deviceState.hasActiveInput) activateDeviceState();
 
   const logcatStream = (req: Request, url: URL) => {
     const packageName = (url.searchParams.get("package") ?? "").trim().slice(0, MAX_LOGCAT_QUERY_BYTES);
     const search = (url.searchParams.get("search") ?? "").trim().slice(0, MAX_LOGCAT_QUERY_BYTES).toLowerCase();
-    const proc = spawn("adb", ["-s", opts.serial, "logcat", "-v", "threadtime"]);
-    logcatProcesses.add(proc);
-    const encoder = new TextEncoder();
-    let pidSet = packageName ? resolvePackagePids(packageName) : new Set<string>();
-    let pidTimer: ReturnType<typeof setInterval> | null = null;
-    let buffer = "";
-
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        const send = (event: string, value: unknown) => {
-          try {
-            controller.enqueue(
-              encoder.encode(`event: ${event}\ndata: ${JSON.stringify(value)}\n\n`),
-            );
-          } catch {}
-        };
-        const matches = (line: string) => {
-          if (search && !line.toLowerCase().includes(search)) return false;
-          if (!packageName) return true;
-          const parts = line.trim().split(/\s+/, 5);
-          const pid = parts[2];
-          return (pid && pidSet.has(pid)) || line.includes(packageName);
-        };
-        const consume = (chunk: Buffer) => {
-          buffer += chunk.toString("utf8");
-          const lines = buffer.split(/\r?\n/);
-          buffer = lines.pop() ?? "";
-          for (const line of lines) {
-            if (line && matches(line)) send("log", { line, at: new Date().toISOString() });
-          }
-        };
-
-        send("ready", {
-          serial: opts.serial,
-          package: packageName || null,
-          pids: Array.from(pidSet),
-          search: search || null,
-        });
-        if (packageName) {
-          pidTimer = setInterval(() => {
-            pidSet = resolvePackagePids(packageName);
-          }, 5_000);
-        }
-        proc.stdout.on("data", consume);
-        proc.stderr.on("data", (chunk) => {
-          const text = chunk.toString("utf8").trim();
-          if (text) send("error", { line: text, at: new Date().toISOString() });
-        });
-        proc.once("exit", (code, signal) => {
-          logcatProcesses.delete(proc);
-          send("close", { code, signal });
-          try {
-            controller.close();
-          } catch {}
-          if (pidTimer) clearInterval(pidTimer);
-        });
-        proc.once("error", (err) => {
-          logcatProcesses.delete(proc);
-          send("error", { line: err.message, at: new Date().toISOString() });
-          try {
-            controller.close();
-          } catch {}
-          if (pidTimer) clearInterval(pidTimer);
-        });
-      },
-      cancel() {
-        if (pidTimer) clearInterval(pidTimer);
-        logcatProcesses.delete(proc);
-        try {
-          proc.kill("SIGTERM");
-        } catch {}
-      },
-    });
-
-    return new Response(stream, {
-      headers: {
-        ...corsHeadersForRequest(req, opts, "GET"),
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-      },
+    const response = deviceState.logcat.subscribe(
+      { packageName, search },
+      req.signal,
+    );
+    const headers = new Headers(response.headers);
+    for (const [name, value] of Object.entries(
+      corsHeadersForRequest(req, opts, "GET"),
+    )) {
+      headers.set(name, value);
+    }
+    return new Response(response.body, {
+      status: response.status,
+      headers,
     });
   };
 
@@ -638,7 +595,10 @@ async function createAppInternal(
   if (streamSettings.transport === "webrtc") {
     if (session.meta.codecId !== "h264") {
       await session.close();
-      routePlayback.close();
+      await deviceState.release(
+        deviceStateOwner,
+        "WebRTC codec validation failed",
+      );
       throw new Error(
         `WebRTC transport currently supports only H.264, but the selected stream source uses ${session.meta.codecId}.`,
       );
@@ -650,7 +610,10 @@ async function createAppInternal(
       });
     } catch (err) {
       await session.close();
-      routePlayback.close();
+      await deviceState.release(
+        deviceStateOwner,
+        "WebRTC publisher startup failed",
+      );
       throw err;
     }
   }
@@ -748,7 +711,16 @@ async function createAppInternal(
         }
       }
     } catch (err) {
-      if (!stopRequested) markTerminal("error", String(err));
+      if (!stopRequested) {
+        if (err instanceof ScrcpyStreamError) {
+          markTerminal("error", err.message, {
+            code: err.code,
+            meta: err.meta ?? null,
+          });
+        } else {
+          markTerminal("error", String(err));
+        }
+      }
     }
   })();
 
@@ -759,7 +731,10 @@ async function createAppInternal(
 
   removeFatalListener = session.onFatal((failure) => {
     if (!stopRequested && status === "streaming") {
-      markTerminal("error", failure.message);
+      markTerminal("error", failure.message, {
+        code: failure.code,
+        meta: failure.meta ?? null,
+      });
     }
   });
 
@@ -1041,17 +1016,12 @@ async function createAppInternal(
           typeof payload === "object" && payload !== null && !Array.isArray(payload)
             ? Number((payload as Record<string, unknown>).multiplier ?? 1)
             : 1;
-        const replay = sessionRecorder.replay(
-          {
-            dispatchGesture: (gesture) => dispatchGesture(gesture, "session:replay", false),
-            setLocation: async (fix) => {
-              await applyLocation(fix, "session:replay", false);
-            },
-          },
+        const replay = sessionRecorder.startReplay(
+          deviceState.replayHandlers,
           multiplier,
         );
-        void replay.catch(() => {});
-        return Response.json({ ok: true, session: sessionRecorder.snapshot() });
+        void replay.completion.catch(() => {});
+        return Response.json({ ok: true, session: replay.snapshot });
       } catch (err) {
         return Response.json(
           { ok: false, error: err instanceof Error ? err.message : String(err) },
@@ -1062,7 +1032,10 @@ async function createAppInternal(
 
     if (url.pathname === "/api/session/replay/stop") {
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-      return Response.json({ ok: true, session: sessionRecorder.stopReplay() });
+      return Response.json({
+        ok: true,
+        session: await sessionRecorder.cancelAndWait(),
+      });
     }
 
     if (url.pathname === "/api/apps/install") {
@@ -1118,14 +1091,14 @@ async function createAppInternal(
         return Response.json({
           serial: opts.serial,
           emulator: /^emulator-\d+$/.test(opts.serial),
-          location: lastLocation,
+          location: deviceState.lastLocation,
         });
       }
       if (req.method === "POST") {
         try {
           const fix = parseGeoFix(await readJsonBody(req));
-          lastLocation = await applyLocation(fix, "rest:location");
-          return Response.json({ ok: true, location: lastLocation });
+          const location = await applyLocation(fix, "rest:location");
+          return Response.json({ ok: true, location });
         } catch (err) {
           return Response.json(
             { ok: false, error: err instanceof Error ? err.message : String(err) },
@@ -1247,14 +1220,12 @@ async function createAppInternal(
     if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
     pendingVideoResetTimer = null;
     pendingVideoResetReason = null;
-    sessionRecorder.stopReplay();
-    routePlayback.close();
     removeFatalListener?.();
     removeFatalListener = null;
-    closeLogcatStreams();
     await Promise.all([
       uploader.close(new Error("server stopping")),
       session.close(),
+      deviceState.release(deviceStateOwner, "server stopping"),
     ]);
   };
 
@@ -1264,6 +1235,8 @@ async function createAppInternal(
     session: session.rawScrcpy ?? session,
     // Router and new integrations use the source-neutral interface explicitly.
     streamSession: session,
+    deviceState,
+    activateDeviceState,
     isStreaming: () => status === "streaming",
     health,
     handleRequest,
@@ -1291,6 +1264,16 @@ function streamSessionForApp(app: EmuApp): RouterStreamSession {
   return "mode" in session
     ? session
     : { mode: "scrcpy", meta: session.meta };
+}
+
+function deviceStateForApp(app: EmuApp): DeviceSessionState | undefined {
+  return (app as EmuApp & { deviceState?: DeviceSessionState }).deviceState;
+}
+
+function activateDeviceStateForApp(app: EmuApp): void {
+  (
+    app as EmuApp & { activateDeviceState?: () => void }
+  ).activateDeviceState?.();
 }
 
 export function createApp(
@@ -1410,6 +1393,14 @@ export function createRouter(
     }
   };
 
+  const assertReadyForPublication = (app: EmuApp): void => {
+    if (!app.isStreaming()) {
+      throw new Error(
+        `${streamSessionForApp(app).mode} stopped before publication`,
+      );
+    }
+  };
+
   // Resolve the serial a request targets: an explicit (connected) `?device=`,
   // else the configured default if still attached, else the first online
   // device. Throws only when *no* device is attached — multiple devices is
@@ -1451,6 +1442,7 @@ export function createRouter(
     streamMode =
       streamModeOverrides.get(serial) ?? defaults.streamMode ?? "scrcpy",
     parentSignal?: AbortSignal,
+    deviceState?: DeviceSessionState,
   ): Promise<EmuApp> => {
     const operation = beginOperation(serial, parentSignal);
     let created: EmuApp | null = null;
@@ -1460,6 +1452,7 @@ export function createRouter(
         ...defaults,
         serial,
         streamMode,
+        deviceState,
         signal: combineAbortSignals(defaults.signal, operation.signal),
       });
       throwIfAborted(operation.signal, `app startup for ${serial} was aborted`);
@@ -1513,6 +1506,14 @@ export function createRouter(
             ? "serve-emu router stopped while the device session was starting"
             : `device ${serial} stopped while its session was starting`,
         );
+      }
+      try {
+        assertReadyForPublication(created);
+        activateDeviceStateForApp(created);
+        assertReadyForPublication(created);
+      } catch (error) {
+        await initiateAppStop(created);
+        throw error;
       }
       sessionGenerations.set(
         serial,
@@ -1605,6 +1606,7 @@ export function createRouter(
       serial,
       streamMode,
       signal,
+      current ? deviceStateForApp(current) : undefined,
     );
     if (stopped || stoppingSerials.has(serial)) {
       try {
@@ -1618,6 +1620,15 @@ export function createRouter(
     }
 
     const previous = apps.get(serial);
+    try {
+      assertReadyForPublication(replacement);
+      activateDeviceStateForApp(replacement);
+      assertReadyForPublication(replacement);
+    } catch (error) {
+      if (previous?.isStreaming()) activateDeviceStateForApp(previous);
+      await initiateAppStop(replacement);
+      throw error;
+    }
     streamModeOverrides.set(serial, streamMode);
     failureAt.delete(serial);
     sessionGenerations.set(
@@ -1747,8 +1758,8 @@ export function createRouter(
       }
     }
 
-    // Source changes replace the device app itself, so this endpoint is owned
-    // by the router rather than whichever app generation is currently live.
+    // Source changes replace the stream app while retaining its device state,
+    // so this endpoint is owned by the router rather than one app generation.
     if (url.pathname === "/api/stream-mode") {
       if (req.method !== "GET" && req.method !== "PUT") {
         return new Response("method not allowed", {
