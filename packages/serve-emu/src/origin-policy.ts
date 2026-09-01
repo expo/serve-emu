@@ -3,7 +3,7 @@ export type BrowserOriginPolicy = {
 };
 
 export const WEBRTC_CORS_METHODS = "POST, OPTIONS";
-export const WEBRTC_CORS_HEADERS = "Content-Type";
+export const WEBRTC_CORS_HEADERS = "Authorization, Content-Type";
 
 function stripIpv6Brackets(hostname: string): string {
   return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;

@@ -72,3 +72,14 @@ export function parseWebRtcCloseRequest(value: unknown): WebRtcCloseRequest {
   }
   return { sessionId: requireSessionId(value.sessionId) };
 }
+
+export function parseWebRtcStatsSessionId(value: string | null): string {
+  if (value === null || value === "") {
+    throw new WebRtcSignalingError(
+      "WebRTC session ID is required",
+      400,
+      "missing_session_id",
+    );
+  }
+  return requireSessionId(value);
+}
