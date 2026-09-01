@@ -22,6 +22,10 @@ import {
   type WebRtcIceTransportPolicy,
 } from "./stream-settings.ts";
 import packageJson from "../package.json";
+import {
+  isStreamMode,
+  STREAM_MODES,
+} from "./shared/api-contracts.ts";
 
 const argv = Bun.argv.slice(2);
 const { values } = parseArgs({
@@ -37,6 +41,7 @@ const { values } = parseArgs({
     "max-size": { type: "string", default: String(SCRCPY_DEFAULTS.maxSize) },
     "key-frame-interval": { type: "string", default: String(SCRCPY_DEFAULTS.keyFrameInterval) },
     "repeat-frame-ms": { type: "string", default: String(SCRCPY_DEFAULTS.repeatFrameMs) },
+    "stream-mode": { type: "string" },
     transport: { type: "string", default: "websocket" },
     "stun-url": { type: "string" },
     "turn-url": { type: "string" },
@@ -168,10 +173,10 @@ async function checkForUpdate() {
 }
 
 if (values.help) {
-  console.log(`serve-emu — host an Android device over scrcpy + WebSocket/WebRTC
+  console.log(`serve-emu — host an Android device over WebSocket/WebRTC
 
 Usage:
-  serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms]
+  serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode <scrcpy|grpc-screenshot>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms]
   serve-emu --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
   serve-emu --avd <name> [--restart-avd]
   serve-emu --avd-list
@@ -193,9 +198,9 @@ Options:
       --max-fps <n>      Cap source frame rate (default: ${SCRCPY_DEFAULTS.maxFps})
       --bit-rate <bps>   H.264 bit rate (default: ${SCRCPY_DEFAULTS.bitRate})
       --max-size <px>    Cap longest screen edge in pixels; 0 = native. The
-                         emulator only has a software H.264 encoder, which
-                         sustains 60fps only below ~1 megapixel, so this
-                         defaults to ${SCRCPY_DEFAULTS.maxSize}.
+                         gRPC screenshot source uses host-side software H.264
+                         encoding; ${SCRCPY_DEFAULTS.maxSize} balances detail and steady frame
+                         delivery for either source.
       --key-frame-interval <sec>
                          Ask the encoder for regular keyframes; 0 disables this
                          codec option (default: ${SCRCPY_DEFAULTS.keyFrameInterval}). Late joiners get keyframes
@@ -205,7 +210,11 @@ Options:
                          Re-encode the previous frame after this many ms with no
                          screen change, so static screens keep producing frames
                          (16 ≈ steady 60fps at the cost of extra CPU/bandwidth;
-                         0 keeps the encoder default of one repeat per 100ms)
+                         0 keeps source defaults: scrcpy 100ms, gRPC 500ms)
+      --stream-mode <scrcpy|grpc-screenshot>
+                         Screen and input source (default: scrcpy). The gRPC
+                         screenshot source captures and encodes on the emulator
+                         host and is available only for Android Emulators.
       --transport <websocket|webrtc>
                          Browser video transport (default: websocket)
       --stun-url <url[,url...]>
@@ -260,6 +269,17 @@ async function main() {
   if (values.avd && values.serial) {
     throw new Error("Use either --avd to launch an emulator or --serial to attach to an existing device, not both.");
   }
+
+  const requestedStreamMode = stringOption("stream-mode");
+  if (
+    requestedStreamMode !== undefined &&
+    !isStreamMode(requestedStreamMode)
+  ) {
+    throw new Error(
+      `--stream-mode must be one of: ${STREAM_MODES.join(", ")}. Received "${requestedStreamMode}".`,
+    );
+  }
+  const streamMode = requestedStreamMode ?? "scrcpy";
 
   let emulatorLaunch: Awaited<ReturnType<typeof startEmulator>> | null = null;
   const serial = values.avd
@@ -343,6 +363,7 @@ async function main() {
     maxSize,
     keyFrameInterval,
     repeatFrameMs,
+    streamMode,
     streamSettings,
     maxApkUploadBytes,
     maxMediaUploadBytes,

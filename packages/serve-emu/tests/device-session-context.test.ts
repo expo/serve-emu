@@ -7,7 +7,8 @@ import {
   type DisposeDeviceSessionOpts,
   type ManagedDeviceSession,
 } from "../src/device-session-context.ts";
-import type { ScrcpySession } from "../src/scrcpy.ts";
+import { ControlInputQueue } from "../src/control-input-queue.ts";
+import type { EmuSession } from "../src/stream-session.ts";
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -29,12 +30,33 @@ function snapshot(capturedAt: string): AccessibilitySnapshot {
   return { ok: true, capturedAt, nodes: [] };
 }
 
-function fakeScrcpy(serial: string, onClose: () => void = () => {}): ScrcpySession {
+function fakeStream(serial: string, onClose: () => void = () => {}): EmuSession {
+  const controls = new ControlInputQueue({
+    writer: {
+      async write() {},
+    },
+  });
   return {
+    mode: "scrcpy",
     serial,
-    meta: { width: 1080, height: 1920 },
-    close: onClose,
-  } as unknown as ScrcpySession;
+    meta: {
+      deviceName: serial,
+      codecId: "h264",
+      width: 1080,
+      height: 1920,
+    },
+    controls,
+    async readFrame() {
+      return null;
+    },
+    onFatal() {
+      return () => {};
+    },
+    async close() {
+      controls.close();
+      onClose();
+    },
+  };
 }
 
 function activeSession(
@@ -45,7 +67,7 @@ function activeSession(
   return new ActiveDeviceSession({
     serial,
     generation,
-    scrcpy: fakeScrcpy(serial, onClose),
+    stream: fakeStream(serial, onClose),
     applyLocation: async () => {},
   });
 }
@@ -133,7 +155,7 @@ describe("ActiveDeviceSession disposal", () => {
     const context = new ActiveDeviceSession({
       serial: "device-a",
       generation: 7,
-      scrcpy: fakeScrcpy("device-a", () => {
+      stream: fakeStream("device-a", () => {
         scrcpyCloseCalls += 1;
         scrcpyClosed.resolve();
       }),
@@ -273,6 +295,34 @@ describe("DeviceSessionManager", () => {
     ).resolves.toBe(recovered);
     expect(manager.current).toBe(recovered);
     expect(initial.disposeCalls).toHaveLength(1);
+  });
+
+  test("atomically replaces a generation for the same device serial", async () => {
+    const initial = managedSession("device-a", 4);
+    const replacement = managedSession("device-a", 5);
+    const manager = new DeviceSessionManager(initial);
+    const prepareGate = deferred<TestManagedSession>();
+    const prepareStarted = deferred<void>();
+
+    const replacing = manager.replace(
+      async (current, generation) => {
+        expect(current).toBe(initial);
+        expect(generation).toBe(5);
+        prepareStarted.resolve();
+        return prepareGate.promise;
+      },
+      undefined,
+      "stream source switched",
+    );
+
+    await prepareStarted.promise;
+    expect(manager.current).toBe(initial);
+    prepareGate.resolve(replacement);
+    await expect(replacing).resolves.toBe(replacement);
+    expect(manager.current).toBe(replacement);
+    expect(initial.disposeCalls).toEqual([
+      { reason: "stream source switched", opts: { clientCode: 1012 } },
+    ]);
   });
 
   test("shutdown aborts an in-flight preparation and never publishes its candidate", async () => {

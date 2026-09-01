@@ -23,6 +23,8 @@ const BASE_URL = "http://127.0.0.1:3011";
 
 const EXPECTED_ROUTES = [
   ["GET", "/api"],
+  ["GET", "/api/stream-mode"],
+  ["PUT", "/api/stream-mode"],
   ["GET", "/api/devices"],
   ["GET", "/api/device-grid"],
   ["POST", "/api/devices/select"],
@@ -75,6 +77,7 @@ const METHOD_ORDER: readonly ApiMethod[] = [
 ];
 
 const VALID_JSON_BODIES: Readonly<Record<string, unknown>> = {
+  "PUT /api/stream-mode": { mode: "grpc-screenshot" },
   "POST /api/devices/select": { serial: "emulator-5554" },
   "POST /api/avds/start": { avd: "Pixel_8_API_35", select: true },
   "POST /api/avds/stop": { serial: "emulator-5554" },
@@ -150,6 +153,20 @@ function fakeDependencies(
       status: "streaming",
       clients: 0,
       stream: { transport: "websocket" },
+    }),
+    getStreamMode: () => ({
+      ok: true,
+      serial: "emulator-5554",
+      mode: "scrcpy",
+      availableModes: ["scrcpy", "grpc-screenshot"],
+      sessionGeneration: 0,
+    }),
+    setStreamMode: async (mode) => ({
+      ok: true,
+      serial: "emulator-5554",
+      mode,
+      availableModes: ["scrcpy", "grpc-screenshot"],
+      sessionGeneration: 1,
     }),
     listDevices: async () => ({
       ok: true,
@@ -354,14 +371,14 @@ const silentLogger: ApiLogger = {
 };
 
 describe("domain API route table", () => {
-  test("registers the exact 40 method/path pairs across 31 paths", () => {
+  test("registers the exact 42 method/path pairs across 32 paths", () => {
     const routes = createApiRoutes();
 
     expect(routes.map(({ method, path }) => [method, path])).toEqual(
       EXPECTED_ROUTES.map(([method, path]) => [method, path]),
     );
-    expect(routes).toHaveLength(40);
-    expect(new Set(routes.map((route) => route.path)).size).toBe(31);
+    expect(routes).toHaveLength(42);
+    expect(new Set(routes.map((route) => route.path)).size).toBe(32);
     const contractPairs = Object.entries(API_SUCCESS_PARSERS).flatMap(
       ([path, methods]) => Object.keys(methods).map((method) => `${method} ${path}`),
     );
@@ -391,12 +408,12 @@ describe("domain API route table", () => {
     );
   });
 
-  test("returns structured PATCH 405 with exact Allow for all 31 paths", async () => {
+  test("returns structured PATCH 405 with exact Allow for all 32 paths", async () => {
     const router = createApiRouter(createApiRoutes());
     const deps = fakeDependencies();
     const paths = [...new Set(EXPECTED_ROUTES.map((route) => route[1]))];
 
-    expect(paths).toHaveLength(31);
+    expect(paths).toHaveLength(32);
     for (const path of paths) {
       const response = await router.handle(
         new Request(`${BASE_URL}${path}`, { method: "PATCH" }),
@@ -414,6 +431,32 @@ describe("domain API route table", () => {
 });
 
 describe("domain API failures", () => {
+  test("rejects an unsupported stream mode before dependency work", async () => {
+    let invoked = false;
+    const router = createApiRouter(createApiRoutes());
+    const response = await router.handle(
+      new Request(`${BASE_URL}/api/stream-mode`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "screen-copy" }),
+      }),
+      fakeDependencies({
+        setStreamMode: async () => {
+          invoked = true;
+          throw new Error("must not run");
+        },
+      }),
+    );
+
+    await expectFailure(
+      response,
+      400,
+      "invalid_request",
+      "mode must be scrcpy or grpc-screenshot",
+    );
+    expect(invoked).toBe(false);
+  });
+
   test("maps invalid route input to 400", async () => {
     const router = createApiRouter(createApiRoutes());
     const response = await router.handle(

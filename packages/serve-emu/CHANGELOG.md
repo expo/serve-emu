@@ -10,6 +10,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
 
 ## Unreleased
 
+### Added
+
+- Add emulator-only gRPC screenshot streaming with host-side H.264 encoding,
+  a CLI source flag, a runtime HTTP API, and a browser UI source selector.
+
 ### Changed
 
 - Retain `serve-emu` as the package, CLI, workspace, and user-facing identity

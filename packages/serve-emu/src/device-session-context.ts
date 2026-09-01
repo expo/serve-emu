@@ -5,10 +5,10 @@ import type { Screen } from "./input.ts";
 import type { GeoFix } from "./location.ts";
 import { LogcatHub } from "./logcat.ts";
 import { RoutePlayback } from "./route-playback.ts";
-import type { ScrcpySession } from "./scrcpy.ts";
 import { SessionRecorder } from "./session-recorder.ts";
 import { disposeReplayBefore } from "./session-replay-lifecycle.ts";
 import type { SessionStatus } from "./session-status.ts";
+import type { EmuSession } from "./stream-session.ts";
 
 const FRAME_STAT_WINDOW = 240;
 
@@ -37,7 +37,7 @@ type Cleanup = () => void | Promise<void>;
 type ActiveDeviceSessionOpts<TClient extends SessionClient> = {
   serial: string;
   generation: number;
-  scrcpy: ScrcpySession;
+  stream: EmuSession;
   applyLocation: (serial: string, fix: GeoFix, signal: AbortSignal) => Promise<void>;
   closeClient?: (client: TClient, code: number, reason: string) => void;
   inputQueue?: ControlInputQueue;
@@ -61,7 +61,7 @@ export class ActiveDeviceSession<
 > {
   readonly serial: string;
   readonly generation: number;
-  readonly scrcpy: ScrcpySession;
+  readonly stream: EmuSession;
   readonly screen: Screen;
   readonly recorder = new SessionRecorder();
   readonly logcat: LogcatHub;
@@ -110,10 +110,10 @@ export class ActiveDeviceSession<
     this.serial = opts.serial;
     this.logcat = new LogcatHub(opts.serial);
     this.generation = opts.generation;
-    this.scrcpy = opts.scrcpy;
+    this.stream = opts.stream;
     this.screen = {
-      width: opts.scrcpy.meta.width,
-      height: opts.scrcpy.meta.height,
+      width: opts.stream.meta.width,
+      height: opts.stream.meta.height,
     };
     this.#now = opts.now ?? Date.now;
     this.startedMs = this.#now();
@@ -125,15 +125,7 @@ export class ActiveDeviceSession<
       });
     this.inputQueue =
       opts.inputQueue ??
-      (opts.scrcpy.controlSocket
-        ? new ControlInputQueue({ socket: opts.scrcpy.controlSocket })
-        : new ControlInputQueue({
-            writer: {
-              async write() {
-                throw new Error("scrcpy control socket is unavailable");
-              },
-            },
-          }));
+      opts.stream.controls;
     this.route = new RoutePlayback({
       applyLocation: async (fix, signal) => {
         this.assertUsable();
@@ -287,9 +279,7 @@ export class ActiveDeviceSession<
     void (async () => {
       for (const cleanup of cleanups) this.#startCleanup(cleanup);
       await replayDisposed;
-      try {
-        this.scrcpy.close();
-      } catch {}
+      await this.stream.close().catch(() => {});
       await Promise.allSettled(drains);
       await this.#drainCleanups();
       // A route start that was awaiting its initial location can otherwise
@@ -378,40 +368,41 @@ export class DeviceSessionManager<TContext extends ManagedDeviceSession> {
       if (this.#closing) throw new Error("device session manager is closed");
       const previous = this.#current;
       if (previous.serial === serial && !previous.signal.aborted) return previous;
+      return this.#replacePublished(
+        previous,
+        (generation, signal) => prepare(serial, generation, signal),
+        activate,
+        "device switched",
+      );
+    });
+  }
 
-      // Candidate startup happens while the old context remains published. A
-      // failed preparation therefore leaves the working device untouched.
-      const transition = new AbortController();
-      this.#transitionController = transition;
-      let next: TContext;
-      try {
-        next = await prepare(
-          serial,
-          previous.generation + 1,
-          transition.signal,
-        );
-      } finally {
-        if (this.#transitionController === transition) {
-          this.#transitionController = null;
-        }
-      }
-      if (this.#closing) {
-        await next.dispose("server stopped during device switch");
-        throw new Error("device session manager is closed");
-      }
-
-      // Publication is one synchronous assignment. From here on every health
-      // and request capture observes the complete next generation.
-      this.#current = next;
-      try {
-        activate?.(next);
-      } catch (err) {
-        this.#current = previous;
-        await next.dispose("device session activation failed");
-        throw err;
-      }
-      await previous.dispose("device switched", { clientCode: 1012 });
-      return next;
+  /**
+   * Replace the active generation even when it represents the same serial.
+   * Used for capability changes, such as swapping the screen/input source,
+   * that must retain the same atomic prepare → publish → dispose semantics as
+   * a device switch.
+   */
+  replace(
+    prepare: (
+      current: TContext,
+      generation: number,
+      signal: AbortSignal,
+    ) => Promise<TContext>,
+    activate?: (context: TContext) => void,
+    reason = "device session replaced",
+    shouldReplace: (current: TContext) => boolean = () => true,
+  ): Promise<TContext> {
+    return this.#enqueue(async () => {
+      if (this.#closing) throw new Error("device session manager is closed");
+      const previous = this.#current;
+      if (!shouldReplace(previous)) return previous;
+      return this.#replacePublished(
+        previous,
+        (generation, signal) => prepare(previous, generation, signal),
+        activate,
+        reason,
+      );
     });
   }
 
@@ -455,5 +446,45 @@ export class DeviceSessionManager<TContext extends ManagedDeviceSession> {
       () => {},
     );
     return result;
+  }
+
+  async #replacePublished(
+    previous: TContext,
+    prepare: (
+      generation: number,
+      signal: AbortSignal,
+    ) => Promise<TContext>,
+    activate: ((context: TContext) => void) | undefined,
+    reason: string,
+  ): Promise<TContext> {
+    // Candidate startup happens while the old context remains published. A
+    // failed preparation therefore leaves the working generation untouched.
+    const transition = new AbortController();
+    this.#transitionController = transition;
+    let next: TContext;
+    try {
+      next = await prepare(previous.generation + 1, transition.signal);
+    } finally {
+      if (this.#transitionController === transition) {
+        this.#transitionController = null;
+      }
+    }
+    if (this.#closing) {
+      await next.dispose("server stopped during device switch");
+      throw new Error("device session manager is closed");
+    }
+
+    // Publication is one synchronous assignment. From here on every health
+    // and request capture observes the complete next generation.
+    this.#current = next;
+    try {
+      activate?.(next);
+    } catch (err) {
+      this.#current = previous;
+      await next.dispose("device session activation failed");
+      throw err;
+    }
+    await previous.dispose(reason, { clientCode: 1012 });
+    return next;
   }
 }

@@ -6,6 +6,7 @@ import { LocationPanel } from "./location-panel";
 import { LogcatPanel } from "./logcat-panel";
 import { SessionPanel } from "./session-panel";
 import { ScreenshotPanel } from "./screenshot-panel";
+import { StreamModePanel } from "./stream-mode-panel";
 import { ToolSection } from "./tool-section";
 
 type Props = {
@@ -46,6 +47,13 @@ export const SideTools = memo(function SideTools({
 }: Props) {
   return (
     <>
+      <ToolSection
+        id="stream-source-tool"
+        title="Stream Source"
+        defaultExpanded
+      >
+        <StreamModePanel />
+      </ToolSection>
       <StaticTool id="network-tool" title="Network" panel={NetworkPanel} />
       <StaticTool id="theme-tool" title="Theme" panel={NightModePanel} />
       <StaticTool id="font-size-tool" title="Font Size" panel={FontScalePanel} />
