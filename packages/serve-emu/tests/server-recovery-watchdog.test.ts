@@ -198,14 +198,17 @@ class FakeWebRtcPublisher {
   };
   onKeyframeRequest: ((reason: string) => void) | null = null;
   readonly frames: VideoPacket[] = [];
+  sessionId: string | null = null;
 
-  async handleOffer(): Promise<{ type: string; sdp: string }> {
+  async handleOffer(offer: { sessionId: string }): Promise<{ type: string; sdp: string }> {
     this.activePeerCount = 1;
+    this.sessionId = offer.sessionId;
     return { type: "answer", sdp: "v=0\r\n" };
   }
 
   closeSession(): void {
     this.activePeerCount = 0;
+    this.sessionId = null;
   }
 
   sendFrame(frame: VideoPacket): FakeWebRtcFrameDelivery {
@@ -214,6 +217,32 @@ class FakeWebRtcPublisher {
   }
 
   resetVideoSource(): void {}
+
+  statsForSession(sessionId?: string | null) {
+    if (
+      this.sessionId === null ||
+      (sessionId != null && sessionId !== this.sessionId)
+    ) {
+      return [];
+    }
+    return [{
+      sessionId: this.sessionId,
+      state: "connected",
+      iceState: "connected",
+      connected: true,
+      submittedFrames: this.frames.length,
+      publisherDroppedFrames: 0,
+      payloadBytesSubmitted: this.frames.reduce(
+        (total, frame) => total + (frame.type === "frame" ? frame.data.length : 0),
+        0,
+      ),
+      localCandidateType: null,
+      remoteCandidateType: null,
+      localCandidateTransport: null,
+      remoteCandidateTransport: null,
+      path: "unknown" as const,
+    }];
+  }
 
   snapshot() {
     return {
@@ -226,6 +255,7 @@ class FakeWebRtcPublisher {
 
   close(): void {
     this.activePeerCount = 0;
+    this.sessionId = null;
   }
 
   requestKeyframe(reason: string): void {
@@ -437,6 +467,70 @@ async function pushFrame(
 }
 
 describe("server recovery watchdog", () => {
+  test("serves viewer-scoped WebRTC stats without creating an idle publisher", async () => {
+    const publisher = new FakeWebRtcPublisher();
+    publisher.delivery = { accepted: true, awaitingKeyFrame: false };
+    const harness = await createHarness({ webRtcPublisher: publisher });
+    const sessionId = "00000000-0000-4000-8000-000000000009";
+    try {
+      const missingSession = await harness.request("/webrtc/stats");
+      expect(missingSession.status).toBe(400);
+      expect(await missingSession.json()).toMatchObject({
+        ok: false,
+        error: "missing_session_id",
+      });
+
+      const idle = await harness.request(`/webrtc/stats?sessionId=${sessionId}`);
+      expect(idle.status).toBe(503);
+      expect(publisher.sessionId).toBeNull();
+
+      const offer = await harness.post("/webrtc/offer", {
+        type: "offer",
+        sdp: "v=0\r\n",
+        sessionId,
+        codec: "h264",
+      });
+      expect(offer.status).toBe(200);
+      await pushFrame(harness, "A", keyFrame(), 1);
+
+      const response = await harness.request(
+        `/webrtc/stats?sessionId=${sessionId}&device=A`,
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(await response.json()).toMatchObject({
+        source: {
+          codec: "h264",
+          frames: 1,
+          configuredBitrateBps: 8_000_000,
+        },
+        sessions: [{
+          sessionId,
+          submittedFrames: 1,
+          publisherDroppedFrames: 0,
+        }],
+        capture: { offeredFrames: 1, forwardedFrames: 1 },
+      });
+
+      const other = await harness.request(
+        "/webrtc/stats?sessionId=11111111-1111-4111-8111-111111111111",
+      );
+      expect(other.status).toBe(503);
+      expect(await other.json()).toEqual({
+        ok: false,
+        error: "webrtc_stats_unavailable",
+      });
+
+      const wrongDevice = await harness.request(
+        `/webrtc/stats?sessionId=${sessionId}&device=usb-1`,
+      );
+      expect(wrongDevice.status).toBe(503);
+      expect(await wrongDevice.json()).not.toHaveProperty("source");
+    } finally {
+      await harness.started.stop();
+    }
+  });
+
   test("keeps WebRTC recovery pending when the publisher cannot accept a source keyframe", async () => {
     const publisher = new FakeWebRtcPublisher();
     const harness = await createHarness({ webRtcPublisher: publisher });

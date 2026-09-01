@@ -149,6 +149,7 @@ import {
   STREAM_MODES,
   type StreamMode,
 } from "./shared/api-contracts.ts";
+import { buildWebRtcStatsReport, handleWebRtcStatsRequest } from "./webrtc-stats.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -264,6 +265,7 @@ type WebRtcPublisherLike = Pick<
   | "closeSession"
   | "sendFrame"
   | "resetVideoSource"
+  | "statsForSession"
   | "snapshot"
   | "close"
 >;
@@ -675,6 +677,41 @@ export async function startServer(
     lastErrorCode: context.lastErrorCode,
     lastErrorMeta: context.lastErrorMeta,
   };
+  };
+
+  const webRtcStats = (context: DeviceContext, sessionId: string) => {
+    const publisher = publishers.get(context);
+    if (
+      context.status !== "streaming" ||
+      streamSettings.transport !== "webrtc" ||
+      !publisher
+    ) {
+      return null;
+    }
+    const publisherSessions = publisher.statsForSession(sessionId);
+    const publisherSession = publisherSessions[0];
+    if (
+      publisherSessions.length !== 1 ||
+      publisherSession?.sessionId !== sessionId
+    ) {
+      return null;
+    }
+    const sourceFps = recoveries.get(context)?.snapshot(recoveryClock.now()).sourceFps ?? 0;
+    return buildWebRtcStatsReport(
+      {
+        codec: context.stream.meta.codecId,
+        width: context.screen.width,
+        height: context.screen.height,
+        frames: context.frameCount,
+        fps: sourceFps,
+        configuredBitrateBps: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
+      },
+      publisherSession,
+      {
+        offeredFrames: context.webRtcOfferedFrames,
+        forwardedFrames: context.webRtcForwardedFrames,
+      },
+    );
   };
 
   const deviceGrid = async (
@@ -1417,9 +1454,10 @@ export async function startServer(
           recoveries.get(context)?.recordFrame();
           context.frameStats.record(f.data.length, f.isKey);
           const config = f.isKey ? context.cachedConfig : null;
-          const webRtcDelivery = publishers
-            .get(context)
-            ?.sendFrame(f, config);
+          const publisher = publishers.get(context);
+          if (publisher) context.webRtcOfferedFrames++;
+          const webRtcDelivery = publisher?.sendFrame(f, config);
+          if (webRtcDelivery?.accepted) context.webRtcForwardedFrames++;
           if (
             f.isKey &&
             webRtcDelivery?.accepted &&
@@ -1736,6 +1774,15 @@ export async function startServer(
     async fetch(req, srv) {
       const requestContext = sessions.current;
       const url = new URL(req.url);
+      const handleStatsRequest = () =>
+        handleWebRtcStatsRequest(
+          req,
+          {},
+          (sessionId, device) =>
+            device === null || device === requestContext.serial
+              ? webRtcStats(requestContext, sessionId)
+              : null,
+        );
 
       // Bootstrap: exchange a valid one-time URL token for an HttpOnly cookie,
       // then redirect to a clean URL so the secret never lingers in the address
@@ -1760,6 +1807,10 @@ export async function startServer(
             },
           });
         }
+      }
+
+      if (url.pathname === "/webrtc/stats" && req.method === "OPTIONS") {
+        return handleStatsRequest();
       }
 
       if (!tokenValid(req, url)) {
@@ -1791,6 +1842,10 @@ export async function startServer(
             },
           );
         }
+      }
+
+      if (url.pathname === "/webrtc/stats") {
+        return handleStatsRequest();
       }
 
       if (url.pathname === "/api") {
