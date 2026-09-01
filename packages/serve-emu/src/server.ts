@@ -706,15 +706,19 @@ export async function startServer(
     const sourceFps = recoveries.get(context)?.snapshot(recoveryClock.now()).sourceFps ?? 0;
     return webRtcStatsCollectorFor(context).report(
       {
+        streamMode: context.stream.mode,
         codec: context.stream.meta.codecId,
         width: context.screen.width,
         height: context.screen.height,
         frames: context.frameCount,
         fps: sourceFps,
+        configuredFps: opts.maxFps ?? SCRCPY_DEFAULTS.maxFps,
         configuredBitrateBps: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
+        frameStats: context.frameStats.summary(),
       },
       publisher,
       sessionId,
+      context.stream.diagnostics?.().grpcCapture ?? null,
     );
   };
 

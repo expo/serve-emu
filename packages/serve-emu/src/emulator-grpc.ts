@@ -665,6 +665,11 @@ type PausableGrpcStream = {
   resume(): void;
 };
 
+export type GrpcMessagePacingEvent =
+  | "received"
+  | "emitted"
+  | "coalesced";
+
 const SYSTEM_PACING_CLOCK: GrpcMessagePacingClock = {
   now: () => performance.now(),
   setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
@@ -681,12 +686,13 @@ export class GrpcMessagePacer {
   readonly #stream: PausableGrpcStream;
   readonly #parser: GrpcMessageParser;
   readonly #messageIntervalMs: number;
-  readonly #onMessage: (message: Buffer) => void;
+  readonly #onMessage: (message: Buffer, receivedAtMs: number) => void;
+  readonly #onPacingEvent: ((event: GrpcMessagePacingEvent) => void) | undefined;
   readonly #onError: (error: Error) => void;
   readonly #clock: GrpcMessagePacingClock;
   readonly #signal: AbortSignal | undefined;
   readonly #onAbort = () => this.close();
-  #pendingMessage: Buffer | null = null;
+  #pendingMessage: { message: Buffer; receivedAtMs: number } | null = null;
   #timer: unknown = null;
   #nextMessageAt: number | null = null;
   #paused = false;
@@ -696,7 +702,8 @@ export class GrpcMessagePacer {
     stream: PausableGrpcStream;
     maxMessageBytes: number;
     messageIntervalMs: number;
-    onMessage: (message: Buffer) => void;
+    onMessage: (message: Buffer, receivedAtMs: number) => void;
+    onPacingEvent?: (event: GrpcMessagePacingEvent) => void;
     onError: (error: Error) => void;
     signal?: AbortSignal;
     clock?: GrpcMessagePacingClock;
@@ -714,6 +721,7 @@ export class GrpcMessagePacer {
     );
     this.#messageIntervalMs = options.messageIntervalMs;
     this.#onMessage = options.onMessage;
+    this.#onPacingEvent = options.onPacingEvent;
     this.#onError = options.onError;
     this.#clock = options.clock ?? SYSTEM_PACING_CLOCK;
     this.#signal = options.signal;
@@ -741,16 +749,19 @@ export class GrpcMessagePacer {
 
   #handleMessage(message: Buffer): void {
     if (this.#closed) return;
+    const received = { message, receivedAtMs: Date.now() };
+    this.#onPacingEvent?.("received");
     if (this.#paused) {
       // A data chunk may already contain several frames when pause() takes
       // effect. Keep only the newest raw protobuf and decode it next slot.
-      this.#pendingMessage = message;
+      if (this.#pendingMessage) this.#onPacingEvent?.("coalesced");
+      this.#pendingMessage = received;
       return;
     }
-    this.#emitMessage(message);
+    this.#emitMessage(received);
   }
 
-  #emitMessage(message: Buffer): void {
+  #emitMessage(received: { message: Buffer; receivedAtMs: number }): void {
     if (!this.#paused) {
       this.#paused = true;
       this.#stream.pause();
@@ -760,7 +771,8 @@ export class GrpcMessagePacer {
       (this.#nextMessageAt ?? now) + this.#messageIntervalMs,
       now + this.#messageIntervalMs,
     );
-    this.#onMessage(message);
+    this.#onPacingEvent?.("emitted");
+    this.#onMessage(received.message, received.receivedAtMs);
     this.#scheduleNextSlot();
   }
 
@@ -804,7 +816,8 @@ export class GrpcMessagePacer {
 }
 
 type RequestOptions = {
-  onMessage?: (message: Buffer) => void;
+  onMessage?: (message: Buffer, receivedAtMs: number) => void;
+  onPacingEvent?: (event: GrpcMessagePacingEvent) => void;
   signal?: AbortSignal;
   timeoutMs?: number;
   maxMessageBytes?: number;
@@ -939,8 +952,8 @@ export class EmulatorGrpcClient {
         }, options.inactivityTimeoutMs);
         inactivityTimer.unref?.();
       };
-      const onMessage = (body: Buffer) => {
-        if (options.onMessage) options.onMessage(body);
+      const onMessage = (body: Buffer, receivedAtMs = Date.now()) => {
+        if (options.onMessage) options.onMessage(body, receivedAtMs);
         else messages.push(body);
         resetInactivityTimer();
       };
@@ -977,6 +990,7 @@ export class EmulatorGrpcClient {
           maxMessageBytes,
           messageIntervalMs: options.messageIntervalMs,
           onMessage,
+          onPacingEvent: options.onPacingEvent,
           onError: cancelForFrameError,
           signal: options.signal,
         });
@@ -1039,9 +1053,16 @@ export class EmulatorGrpcClient {
 
   async streamScreenshot(
     format: ImageFormatRequest,
-    onImage: (image: EmuImage, source: GrpcScreenshotImageSource) => void,
+    onImage: (
+      image: EmuImage,
+      source: GrpcScreenshotImageSource,
+      receivedAtMs: number,
+    ) => void,
     signal: AbortSignal,
-    options: { maxFps?: number } = {},
+    options: {
+      maxFps?: number;
+      onPacingEvent?: (event: GrpcMessagePacingEvent) => void;
+    } = {},
   ): Promise<void> {
     let streamedImageGeneration = 0;
     const messageIntervalMs = options.maxFps === undefined
@@ -1065,12 +1086,13 @@ export class EmulatorGrpcClient {
           const generation = streamedImageGeneration;
           const image = await this.getScreenshot(format, signal);
           if (generation === streamedImageGeneration && !signal.aborted) {
-            onImage(image, "probe");
+            onImage(image, "probe", Date.now());
           }
         },
-        onMessage: (message) => {
+        onPacingEvent: options.onPacingEvent,
+        onMessage: (message, receivedAtMs) => {
           streamedImageGeneration++;
-          onImage(decodeEmulatorImage(message), "stream");
+          onImage(decodeEmulatorImage(message), "stream", receivedAtMs);
         },
       });
     } catch (error) {

@@ -26,6 +26,7 @@ import {
   isEmulatorSerial,
 } from "./device-capabilities.ts";
 import { loadDeviceGrid } from "./device-grid.ts";
+import { FrameStatWindow } from "./frame-stat-window.ts";
 import {
   listAvds,
   listRunningAvds,
@@ -101,8 +102,14 @@ export { fromBunSocket, fromWsSocket } from "./stream-socket.ts";
 export type { StreamSocket, WsWebSocketLike } from "./stream-socket.ts";
 export { pickDevice } from "./adb.ts";
 export type { ScrcpySession } from "./scrcpy.ts";
-export type { EmuSession } from "./stream-session.ts";
 export type {
+  EmuSession,
+  EmuSessionDiagnostics,
+  GrpcCaptureDiagnostics,
+  RollingTimingSummary,
+} from "./stream-session.ts";
+export type {
+  StreamEncoderSettings,
   StreamSettings,
   WebRtcIceServer,
   WebRtcIceTransportPolicy,
@@ -163,6 +170,7 @@ const MAX_JSON_BODY_BYTES = 8 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_WEBRTC_CLOSE_BODY_BYTES = 4 * 1024;
 const MAX_LOGCAT_QUERY_BYTES = 200;
+const FRAME_STAT_WINDOW = 240;
 // After a device's scrcpy start fails, wait this long before retrying so a
 // flapping device doesn't get hammered on every request.
 const SPAWN_RETRY_COOLDOWN_MS = 5_000;
@@ -175,7 +183,6 @@ const SYSTEM_APP_CLOCK: AppClock = {
 };
 
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
-
 function abortError(signal: AbortSignal, fallback: string): Error {
   return signal.reason instanceof Error
     ? signal.reason
@@ -333,6 +340,7 @@ async function createAppInternal(
   let captureRestartController: AbortController | null = null;
   let sessionGeneration = 1;
   let frameCount = 0;
+  const frameStats = new FrameStatWindow(FRAME_STAT_WINDOW);
   let configPacketCount = 0;
   let lastFrameMs = 0;
   let totalDroppedFrames = 0;
@@ -385,6 +393,7 @@ async function createAppInternal(
     videoClients: Array.from(clients).filter((client) => client.video).length,
     frames: frameCount,
     sourceFps,
+    frameStats: frameStats.summary(),
     configPackets: configPacketCount,
     droppedFrames: totalDroppedFrames,
     backpressureEvents: totalBackpressureEvents,
@@ -421,15 +430,19 @@ async function createAppInternal(
     if (streamSettings.transport !== "webrtc" || !webRtcPublisher) return null;
     return webRtcStatsCollector.report(
       {
+        streamMode: session.mode,
         codec: session.meta.codecId,
         width: screen.width,
         height: screen.height,
         frames: frameCount,
         fps: sourceFps,
+        configuredFps: streamEncoderSettings.h264Fps,
         configuredBitrateBps: streamEncoderSettings.h264Bitrate,
+        frameStats: frameStats.summary(),
       },
       webRtcPublisher,
       sessionId,
+      session.diagnostics?.().grpcCapture ?? null,
     );
   };
 
@@ -808,6 +821,7 @@ async function createAppInternal(
             continue;
           }
           frameCount++;
+          frameStats.record(f.data.length, f.isKey, clock.now());
           lastFrameMs = Date.now();
           const config = f.isKey ? cachedConfig : null;
           webRtcStatsCollector.recordDelivery(
@@ -881,6 +895,7 @@ async function createAppInternal(
     const generation = ++sessionGeneration;
     screen.width = nextSession.meta.width;
     screen.height = nextSession.meta.height;
+    frameStats.reset();
     cachedConfig = null;
     if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
     pendingVideoResetTimer = null;
@@ -1661,6 +1676,10 @@ async function createAppInternal(
     deviceState,
     activateDeviceState,
     isStreaming: () => status === "streaming",
+    /** Authoritative settings for the currently active capture generation. */
+    getStreamEncoderSettings: (): StreamEncoderSettings => ({
+      ...streamEncoderSettings,
+    }),
     health,
     webRtcStats,
     handleRequest,
@@ -1703,6 +1722,17 @@ function activateDeviceStateForApp(app: EmuApp): void {
   (
     app as EmuApp & { activateDeviceState?: () => void }
   ).activateDeviceState?.();
+}
+
+function streamEncoderSettingsForApp(
+  app: EmuApp,
+): StreamEncoderSettings | undefined {
+  const readSettings = (
+    app as EmuApp & {
+      getStreamEncoderSettings?: () => StreamEncoderSettings;
+    }
+  ).getStreamEncoderSettings;
+  return readSettings?.();
 }
 
 export function createApp(
@@ -1872,6 +1902,7 @@ export function createRouter(
       streamModeOverrides.get(serial) ?? defaults.streamMode ?? "scrcpy",
     parentSignal?: AbortSignal,
     deviceState?: DeviceSessionState,
+    encoderSettings?: StreamEncoderSettings,
   ): Promise<EmuApp> => {
     const operation = beginOperation(serial, parentSignal);
     let created: EmuApp | null = null;
@@ -1879,6 +1910,13 @@ export function createRouter(
       throwIfAborted(operation.signal, `app startup for ${serial} was aborted`);
       created = await createDeviceApp({
         ...defaults,
+        ...(encoderSettings
+          ? {
+              maxSize: encoderSettings.maxDimension,
+              bitRate: encoderSettings.h264Bitrate,
+              maxFps: encoderSettings.h264Fps,
+            }
+          : {}),
         serial,
         streamMode,
         deviceState,
@@ -2052,6 +2090,7 @@ export function createRouter(
         streamMode,
         signal,
         retainedDeviceState,
+        current ? streamEncoderSettingsForApp(current) : undefined,
       );
     } finally {
       await retainedDeviceState?.release(
@@ -2295,6 +2334,27 @@ export function createRouter(
         return Response.json(streamModeResponse(serial, app));
       } catch (err) {
         return streamModeUnavailableResponse(err);
+      }
+    }
+
+    // Settings updates restart the active capture just like source changes do.
+    // Put both mutations on the same per-device queue so a source replacement
+    // cannot snapshot stale settings while a PATCH is still in flight.
+    if (
+      url.pathname === "/api/stream-settings" &&
+      req.method === "PATCH"
+    ) {
+      try {
+        const serial = await resolveSerial(url.searchParams.get("device"));
+        return await enqueueStreamModeOperation(serial, async (signal) => {
+          const app = await getAppUnqueued(serial, signal);
+          return app.handleRequest(req);
+        });
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: errMsg(err) },
+          { status: 503 },
+        );
       }
     }
 

@@ -3,6 +3,9 @@ import type {
   WebRtcPublisher,
   WebRtcPublisherSessionStats,
 } from "./webrtc-publisher.ts";
+import type { FrameStatsSummary } from "./frame-stat-window.ts";
+import type { StreamMode } from "./shared/api-contracts.ts";
+import type { GrpcCaptureDiagnostics } from "./stream-session.ts";
 import {
   corsHeadersForRequest,
   isAllowedBrowserOrigin,
@@ -14,15 +17,21 @@ import {
 } from "./webrtc-signaling.ts";
 
 export type WebRtcSourceStats = {
+  /** Active capture implementation producing the encoded stream. */
+  streamMode: StreamMode;
   codec: string;
   width: number;
   height: number;
-  /** Encoded, non-configuration H.264 access units received from scrcpy. */
+  /** Encoded, non-configuration H.264 access units received from the active source. */
   frames: number;
   /** Encoded access units received during the most recent one-second source window. */
   fps: number;
+  /** Configured capture/encoder ceiling, which may exceed measured output FPS. */
+  configuredFps: number;
   /** Android encoder setting, not an adaptive WebRTC target bitrate. */
   configuredBitrateBps: number;
+  /** Rolling encoded-frame size and arrival-interval summary. */
+  frameStats: FrameStatsSummary | null;
 };
 
 export type WebRtcStatsReport = {
@@ -34,6 +43,8 @@ export type WebRtcStatsReport = {
     offeredFrames: number;
     /** Source frames accepted by at least one native media track. */
     forwardedFrames: number;
+    /** Source-specific gRPC capture diagnostics; null for scrcpy sessions. */
+    grpc: GrpcCaptureDiagnostics | null;
   };
 };
 
@@ -76,6 +87,7 @@ export class WebRtcStatsCollector {
     source: WebRtcSourceStats,
     publisher: Pick<WebRtcPublisher, "statsForSession">,
     sessionId: string,
+    grpcCapture: GrpcCaptureDiagnostics | null = null,
   ): WebRtcStatsReport | null {
     const publisherSession = publisher.statsForSession(sessionId);
     if (!publisherSession) return null;
@@ -86,6 +98,7 @@ export class WebRtcStatsCollector {
       capture: {
         offeredFrames: this.#offeredFrames,
         forwardedFrames: this.#forwardedFrames,
+        grpc: grpcCapture,
       },
     };
   }

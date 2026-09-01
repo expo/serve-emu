@@ -36,19 +36,28 @@ describe("serve-emu WebRTC stats report", () => {
         sessionId === SESSION_ID ? publisherSession : null,
     };
     const source = {
+      streamMode: "grpc-screenshot" as const,
       codec: "h264",
       width: 1080,
       height: 2400,
       frames: 1_200,
       fps: 29,
+      configuredFps: 60,
       configuredBitrateBps: 8_000_000,
+      frameStats: {
+        windowFrames: 240,
+        intervalMs: { p50: 16.7, p95: 20.1, max: 30 },
+        avgKeyFrameBytes: 90_000,
+        avgDeltaFrameBytes: 12_000,
+        keyFramesInWindow: 4,
+      },
     };
 
     expect(collector.report(source, publisher, SESSION_ID)).toEqual({
       sampledAt: 42,
       source,
       sessions: [publisherSession],
-      capture: { offeredFrames: 2, forwardedFrames: 1 },
+      capture: { offeredFrames: 2, forwardedFrames: 1, grpc: null },
     });
     expect(
       collector.report(
@@ -63,15 +72,19 @@ describe("serve-emu WebRTC stats report", () => {
 describe("GET /webrtc/stats", () => {
   const report = new WebRtcStatsCollector(() => 42).report(
     {
+      streamMode: "scrcpy",
       codec: "h264",
       width: 1080,
       height: 2400,
       frames: 1_200,
       fps: 29,
+      configuredFps: 60,
       configuredBitrateBps: 8_000_000,
+      frameStats: null,
     },
     { statsForSession: () => publisherSession },
     SESSION_ID,
+    null,
   )!;
 
   function request(

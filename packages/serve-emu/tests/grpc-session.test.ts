@@ -3,6 +3,7 @@ import {
   GrpcAccessUnitBoundaryCadence,
   GrpcEncoderLifecycle,
   GrpcFrameWritePacer,
+  GrpcCaptureDiagnosticsTracker,
   GrpcInputState,
   GrpcNativeTouchGeometryMonitor,
   GrpcVideoPacketQueue,
@@ -419,6 +420,66 @@ describe("gRPC screenshot session helpers", () => {
     expect(queue.shift()).toBeUndefined();
   });
 
+  test("reports cumulative gRPC capture loss, source timing, and encoder writes", () => {
+    const diagnostics = new GrpcCaptureDiagnosticsTracker(4);
+    for (const event of [
+      "received",
+      "emitted",
+      "received",
+      "coalesced",
+      "received",
+      "emitted",
+      "received",
+      "coalesced",
+      "received",
+      "emitted",
+    ] as const) {
+      diagnostics.recordGrpcMessage(event);
+    }
+
+    diagnostics.recordUsableImage(
+      { seq: 10, timestampUs: 1_000_000n },
+      1_002,
+    );
+    diagnostics.recordUsableImage(
+      { seq: 12, timestampUs: 1_020_000n },
+      1_025,
+    );
+    diagnostics.recordUsableImage(
+      { seq: 13, timestampUs: 1_050_000n },
+      1_057,
+    );
+    diagnostics.recordEncoderWrite(false, true);
+    diagnostics.recordEncoderWrite(false, false);
+    diagnostics.recordEncoderWrite(true, true);
+
+    expect(diagnostics.snapshot()).toEqual({
+      rawGrpcMessagesReceived: 5,
+      rawGrpcMessagesEmitted: 3,
+      rawGrpcMessagesCoalesced: 2,
+      usableImages: 3,
+      sequenceGaps: 1,
+      sourceTimestampIntervalMs: {
+        windowSamples: 2,
+        latest: 30,
+        p50: 30,
+        p95: 30,
+        max: 30,
+      },
+      productionToReceiveLatencyMs: {
+        windowSamples: 3,
+        latest: 7,
+        p50: 5,
+        p95: 7,
+        max: 7,
+      },
+      freshEncoderWriteAttempts: 2,
+      repeatEncoderWriteAttempts: 1,
+      acceptedEncoderWrites: 2,
+      encoderBackpressureRejections: 1,
+    });
+  });
+
   test("refreshes native touch size only after the display-size signal changes", async () => {
     let displaySizeOutput =
       "Physical size: 1440x2960\nOverride size: 1080x2220\n";
@@ -631,6 +692,7 @@ class FakeGrpcClient implements GrpcSessionClient {
   streamImage: ((
     image: EmuImage,
     source: GrpcScreenshotImageSource,
+    receivedAtMs: number,
   ) => void) | null = null;
   sessionError: ((error: Error) => void) | null = null;
 
@@ -645,11 +707,19 @@ class FakeGrpcClient implements GrpcSessionClient {
 
   streamScreenshot(
     _format: unknown,
-    onImage: (image: EmuImage, source: GrpcScreenshotImageSource) => void,
+    onImage: (
+      image: EmuImage,
+      source: GrpcScreenshotImageSource,
+      receivedAtMs: number,
+    ) => void,
     signal: AbortSignal,
+    _options?: {
+      maxFps?: number;
+      onPacingEvent?: (event: "received" | "emitted" | "coalesced") => void;
+    },
   ): Promise<void> {
     this.streamImage = onImage;
-    if (this.emitInitialStreamImage) onImage(this.probe, "stream");
+    if (this.emitInitialStreamImage) onImage(this.probe, "stream", Date.now());
     return new Promise((resolve) => {
       signal.addEventListener("abort", () => resolve(), { once: true });
     });
@@ -851,7 +921,7 @@ describe("startGrpcSession integration", () => {
       },
     );
 
-    client.streamImage!(integrationImage(2), "stream");
+    client.streamImage!(integrationImage(2), "stream", Date.now());
     await Promise.resolve();
 
     expect(encoders.map((encoder) => encoder.quarterTurn)).toEqual([0]);
@@ -870,7 +940,7 @@ describe("startGrpcSession integration", () => {
       },
     );
 
-    client.streamImage!(integrationImage(0, 6, 4), "stream");
+    client.streamImage!(integrationImage(0, 6, 4), "stream", Date.now());
     await waitFor(() => encoders.length === 2);
 
     expect(encoders.map(({ width, height }) => ({ width, height }))).toEqual([
