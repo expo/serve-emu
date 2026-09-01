@@ -443,6 +443,98 @@ describe("server request gates", () => {
     expect(crossOriginUpgrade.status).toBe(403);
     expect(harness.server.upgrades).toHaveLength(0);
   });
+
+  test("allows cross-loopback WebRTC stats preflight with authentication disabled", async () => {
+    const harness = await createHarness();
+    const allowed = await response(
+      harness.request("/webrtc/stats", {
+        method: "OPTIONS",
+        headers: {
+          origin: "http://localhost:5173",
+          "access-control-request-method": "GET",
+          "access-control-request-headers": "authorization",
+        },
+      }),
+    );
+
+    expect(allowed.status).toBe(204);
+    expect(allowed.headers.get("access-control-allow-origin")).toBe(
+      "http://localhost:5173",
+    );
+    expect(allowed.headers.get("access-control-allow-methods")).toBe(
+      "GET, OPTIONS",
+    );
+  });
+
+  test("routes WebRTC stats preflights through the shared origin policy before authentication", async () => {
+    const harness = await createHarness({ token: "test-secret" });
+    const allowed = await response(
+      harness.request("/webrtc/stats", {
+        method: "OPTIONS",
+        headers: {
+          origin: "http://localhost:5173",
+          "access-control-request-method": "GET",
+          "access-control-request-headers": "authorization",
+        },
+      }),
+    );
+
+    expect(allowed.status).toBe(204);
+    expect(allowed.headers.get("access-control-allow-origin")).toBe(
+      "http://localhost:5173",
+    );
+    expect(allowed.headers.get("access-control-allow-methods")).toBe(
+      "GET, OPTIONS",
+    );
+    expect(allowed.headers.get("access-control-allow-headers"))
+      .toContain("Authorization");
+
+    const forbidden = await response(
+      harness.request("/webrtc/stats", {
+        method: "OPTIONS",
+        headers: {
+          origin: "https://attacker.example",
+          "access-control-request-method": "GET",
+        },
+      }),
+    );
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toMatchObject({
+      ok: false,
+      error: "forbidden_origin",
+    });
+  });
+
+  test("keeps WebRTC stats GET behind bearer authentication", async () => {
+    const harness = await createHarness({ token: "test-secret" });
+    const tokenless = await response(
+      harness.request("/webrtc/stats", {
+        headers: { origin: "http://localhost:5173" },
+      }),
+    );
+    expect(tokenless.status).toBe(401);
+    expect(await tokenless.json()).toEqual({
+      ok: false,
+      error: "unauthorized",
+    });
+
+    const authenticated = await response(
+      harness.request("/webrtc/stats", {
+        headers: {
+          origin: "http://localhost:5173",
+          authorization: "Bearer test-secret",
+        },
+      }),
+    );
+    expect(authenticated.status).toBe(400);
+    expect(authenticated.headers.get("access-control-allow-origin")).toBe(
+      "http://localhost:5173",
+    );
+    expect(await authenticated.json()).toMatchObject({
+      ok: false,
+      error: "missing_session_id",
+    });
+  });
 });
 
 describe("server HTTP and WebSocket boundaries", () => {

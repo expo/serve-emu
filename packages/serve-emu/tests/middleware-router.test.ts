@@ -16,6 +16,9 @@ import type { EmuSession } from "../src/stream-session.ts";
 
 type JsonObject = Record<string, unknown>;
 
+const SESSION_ID = "00000000-0000-4000-8000-000000000000";
+const OTHER_SESSION_ID = "11111111-1111-4111-8111-111111111111";
+
 async function responseJson(response: Response): Promise<JsonObject> {
   return (await response.json()) as JsonObject;
 }
@@ -40,11 +43,43 @@ function fakeApp(
   serial: string,
   stopped: string[],
   mode: StreamMode = "scrcpy",
+  statsSessionId = SESSION_ID,
 ): EmuApp {
   return {
     session: { mode, meta: { deviceName: `Device ${serial}` } },
     isStreaming: () => true,
     health: () => ({ status: "streaming" }),
+    webRtcStats: (sessionId: string) =>
+      sessionId === statsSessionId
+        ? {
+            sampledAt: 42,
+            source: {
+              codec: "h264",
+              width: 1080,
+              height: 2400,
+              frames: 100,
+              fps: 30,
+              configuredBitrateBps: 8_000_000,
+            },
+            sessions: [
+              {
+                sessionId,
+                state: "connected",
+                iceState: "connected",
+                connected: true,
+                submittedFrames: 80,
+                publisherDroppedFrames: 10,
+                payloadBytesSubmitted: 1_024,
+                path: "direct",
+                localCandidateType: "host",
+                remoteCandidateType: "host",
+                localCandidateTransport: "udp",
+                remoteCandidateTransport: "udp",
+              },
+            ],
+            capture: { offeredFrames: 90, forwardedFrames: 80 },
+          }
+        : null,
     handleRequest: async (request: Request) =>
       Response.json({ serial, path: new URL(request.url).pathname }),
     attachWebSocket: () => {},
@@ -104,6 +139,119 @@ function routerDependencies(state: {
 }
 
 describe("createRouter DevicePanel compatibility", () => {
+  test("keeps WebRTC statistics observational and validates before device lookup", async () => {
+    let deviceReads = 0;
+    let appCreates = 0;
+    const router = createRouter(
+      { serial: "emulator-5554" },
+      {
+        listDevices: async () => {
+          deviceReads++;
+          return [{ serial: "emulator-5554", state: "device" }];
+        },
+        createApp: async ({ serial }) => {
+          appCreates++;
+          return fakeApp(serial, []);
+        },
+      },
+    );
+
+    const invalid = await router.handleRequest(
+      new Request("http://router.test/webrtc/stats?sessionId=invalid"),
+    );
+    expect(invalid.status).toBe(400);
+    expect(deviceReads).toBe(0);
+    expect(appCreates).toBe(0);
+
+    const missingSession = await router.handleRequest(
+      new Request("http://router.test/webrtc/stats?device=emulator-5554"),
+    );
+    expect(missingSession.status).toBe(400);
+
+    const invalidDevice = await router.handleRequest(
+      new Request(
+        `http://router.test/webrtc/stats?sessionId=${SESSION_ID}&device=${"x".repeat(257)}`,
+      ),
+    );
+    expect(invalidDevice.status).toBe(400);
+
+    const idle = await router.handleRequest(
+      new Request(
+        `http://router.test/webrtc/stats?device=emulator-5554&sessionId=${SESSION_ID}`,
+      ),
+    );
+    expect(idle.status).toBe(503);
+    expect(deviceReads).toBe(0);
+    expect(appCreates).toBe(0);
+
+    await router.getApp("emulator-5554");
+    const active = await router.handleRequest(
+      new Request(
+        `http://router.test/webrtc/stats?device=emulator-5554&sessionId=${SESSION_ID}`,
+      ),
+    );
+    expect(active.status).toBe(200);
+    expect((await responseJson(active)).sessions).toEqual([
+      expect.objectContaining({ sessionId: SESSION_ID }),
+    ]);
+
+    const unknownSession = await router.handleRequest(
+      new Request(
+        `http://router.test/webrtc/stats?device=emulator-5554&sessionId=${OTHER_SESSION_ID}`,
+      ),
+    );
+    expect(unknownSession.status).toBe(503);
+    expect(await responseJson(unknownSession)).toEqual({
+      ok: false,
+      error: "webrtc_stats_unavailable",
+    });
+    expect(deviceReads).toBe(0);
+    expect(appCreates).toBe(1);
+  });
+
+  test("requires an explicit device when multiple apps are streaming", async () => {
+    const router = createRouter(
+      {},
+      {
+        createApp: async ({ serial }) =>
+          fakeApp(
+            serial,
+            [],
+            "scrcpy",
+            serial === "emulator-5554" ? SESSION_ID : OTHER_SESSION_ID,
+          ),
+      },
+    );
+    await Promise.all([
+      router.getApp("emulator-5554"),
+      router.getApp("usb-1"),
+    ]);
+
+    const ambiguous = await router.handleRequest(
+      new Request(`http://router.test/webrtc/stats?sessionId=${SESSION_ID}`),
+    );
+    expect(ambiguous.status).toBe(400);
+    expect(await responseJson(ambiguous)).toMatchObject({
+      ok: false,
+      error: "ambiguous_device",
+    });
+
+    const selected = await router.handleRequest(
+      new Request(
+        `http://router.test/webrtc/stats?sessionId=${SESSION_ID}&device=emulator-5554`,
+      ),
+    );
+    expect(selected.status).toBe(200);
+
+    const wrongDevice = await router.handleRequest(
+      new Request(
+        `http://router.test/webrtc/stats?sessionId=${SESSION_ID}&device=usb-1`,
+      ),
+    );
+    expect(wrongDevice.status).toBe(503);
+    expect(await responseJson(wrongDevice)).not.toHaveProperty("source");
+  });
+
   test("discovers the grid and persists UI selection without a device query", async () => {
     const state = {
       devices: [
