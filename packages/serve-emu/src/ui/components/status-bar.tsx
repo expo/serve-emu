@@ -5,9 +5,10 @@ type Props = {
   deviceSize: DeviceSize | null;
   fps: number;
   stats?: StreamStats | null;
+  controlError?: string | null;
 };
 
-export function StatusBar({ status, deviceSize, fps, stats }: Props) {
+export function StatusBar({ status, deviceSize, fps, stats, controlError }: Props) {
   const frameRate = status === "streaming" && fps === 0 ? "idle" : `${fps} fps`;
   const latency = stats?.e2eMs != null ? ` • ${Math.round(stats.e2eMs)}ms` : "";
   const meta =
@@ -26,7 +27,12 @@ export function StatusBar({ status, deviceSize, fps, stats }: Props) {
   return (
     <header>
       <h1>serve-emu</h1>
-      <div className="meta" title={detail}>{meta}</div>
+      <div className="status-details">
+        {controlError ? (
+          <div className="control-error" role="alert">{controlError}</div>
+        ) : null}
+        <div className="meta" title={detail}>{meta}</div>
+      </div>
     </header>
   );
 }

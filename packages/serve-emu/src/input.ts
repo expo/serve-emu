@@ -157,7 +157,10 @@ export function parseGesture(value: unknown): Gesture {
       };
     case "text":
       if (typeof value.text !== "string") throw new Error("text must be a string");
-      return { type: "text", text: textBytes(value.text).toString("utf8") };
+      return {
+        type: "text" as const,
+        text: textBytes(value.text).toString("utf8"),
+      };
     case "back":
     case "home":
     case "recents":

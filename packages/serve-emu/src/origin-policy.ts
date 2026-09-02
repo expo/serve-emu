@@ -59,6 +59,28 @@ export function isAllowedBrowserOrigin(
   return isLoopbackHostname(originUrl.hostname) && isLoopbackHostname(target.hostname);
 }
 
+/**
+ * Require an exact origin match for browser requests that mutate state.
+ * Origin-less CLI/agent requests remain eligible for the surrounding auth
+ * policy, while explicitly configured browser origins are also accepted.
+ */
+export function isAllowedMutationOrigin(
+  req: Request,
+  policy: BrowserOriginPolicy = {},
+): boolean {
+  const origin = req.headers.get("origin");
+  if (!origin) return true;
+  const normalizedOrigin = normalizedHttpOrigin(origin);
+  if (!normalizedOrigin) return false;
+
+  const allowedOrigins = policy.allowedOrigins ?? [];
+  return (
+    allowedOrigins.includes("*") ||
+    allowedOrigins.includes(normalizedOrigin) ||
+    normalizedOrigin === new URL(req.url).origin
+  );
+}
+
 export function corsHeadersForRequest(
   req: Request,
   policy: BrowserOriginPolicy = {},

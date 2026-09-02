@@ -16,7 +16,13 @@ bunx serve-emu@latest
 
 Use `@latest` for one-off runs so Bun/npm fetches the newest published version instead of reusing a cached or locally installed copy.
 
-`serve-emu` starts the vendored scrcpy server on the device, opens an adb forward tunnel, and streams H.264 over WebSocket/WebCodecs or WebRTC. Browsers without WebCodecs can use the Media Source Extensions fallback. Input events are written directly to scrcpy's control socket instead of shelling out to `adb shell input`, keeping taps, swipes, text, and key events responsive enough for agents.
+By default, `serve-emu` starts the vendored scrcpy server on the device and
+streams H.264 through an adb tunnel. Android Emulators can instead use the
+built-in emulator gRPC screenshot and input APIs, with H.264 encoded by ffmpeg
+on the host. Both sources feed the same WebSocket/WebCodecs or WebRTC browser
+pipeline, with a Media Source Extensions fallback. Neither input path shells
+out to `adb shell input`, keeping taps, swipes, text, and key events responsive
+enough for agents.
 
 ## Status
 
@@ -25,6 +31,7 @@ Current package version: see [`packages/serve-emu/package.json`](packages/serve-
 Working:
 
 - Live H.264 video over WebSocket/WebCodecs or WebRTC, with an MSE fallback
+- Runtime switching between scrcpy and host-side gRPC screenshot capture on Android Emulators
 - Tap, swipe, text, keyevent, Back, Home, Recents, and Power input
 - Keyboard passthrough in the browser UI: editing/navigation keys, Ctrl/Cmd shortcuts (select all, copy, paste, cut, undo, redo), and IME composition for CJK text
 - Multi-client streaming, so multiple browser tabs can share one device
@@ -47,6 +54,7 @@ Planned:
 - `adb` on PATH from Android platform-tools
 - A booted device/emulator from `adb devices`, or an AVD name passed with `--avd`
 - A modern browser with H.264 WebRTC support or WebCodecs; MSE is used when WebCodecs is unavailable
+- `ffmpeg` with `libx264` when using `--stream-mode grpc-screenshot`
 
 Node.js 18+ can invoke the published package through `npx`, but local development and server runtime use Bun.
 
@@ -87,7 +95,7 @@ bun run packages/serve-emu/src/cli.ts
 ## CLI
 
 ```text
-serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms] [--max-apk-upload-bytes N] [--max-media-upload-bytes N]
+serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode scrcpy|grpc-screenshot] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms] [--max-apk-upload-bytes N] [--max-media-upload-bytes N]
 serve-emu --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
 serve-emu --avd <name> [--gpu <mode>] [--restart-avd]
 serve-emu --avd-list
@@ -101,11 +109,12 @@ serve-emu --running-avds
 | `--token` | none | Shared secret required on every request. Auto-generated for non-loopback binds if omitted |
 | `--unsafe-no-auth` | false | Allow a non-loopback bind with **no** authentication (dangerous) |
 | `-s, --serial` | auto | adb device serial; required when multiple devices are online |
+| `--stream-mode` | `scrcpy` | Screen and input source: `scrcpy`, or emulator-only host capture through `grpc-screenshot` |
 | `--max-fps` | `60` | Cap source frame rate |
 | `--bit-rate` | `8000000` | H.264 bit rate in bps |
-| `--max-size` | `1280` | Downscale the longest edge to N pixels; `0` keeps native size. The emulator's software H.264 encoder sustains 60fps only below ~1 megapixel, hence the 1280 default |
+| `--max-size` | `1280` | Downscale the longest edge to N pixels; `0` keeps native size. The default balances detail and throughput, especially for the host-side software encoder used by `grpc-screenshot` |
 | `--key-frame-interval` | `10` | Ask the encoder for regular keyframes; `0` disables this codec option. Late joiners get keyframes on demand, so a long interval avoids periodic keyframe bursts |
-| `--repeat-frame-ms` | `0` | Re-encode the previous frame after N ms without screen changes (`16` ≈ steady 60fps on static screens, at extra CPU/bandwidth cost); `0` keeps the encoder default of one repeat per 100ms |
+| `--repeat-frame-ms` | `0` | Re-encode the previous frame after N ms without screen changes (`16` ≈ steady 60fps on static screens, at extra CPU/bandwidth cost); `0` keeps the source default: 100ms for scrcpy and 500ms for `grpc-screenshot` |
 | `--transport` | `websocket` | Browser video transport: `websocket` or `webrtc` |
 | `--stun-url` | public STUN defaults | Comma-separated STUN URL(s) for WebRTC ICE |
 | `--turn-url` | none | Comma-separated TURN URL(s); requires both TURN credential flags |
@@ -183,6 +192,7 @@ Open `http://localhost:3300` after starting the CLI. The UI streams the device i
 
 - Pointer input, keyboard passthrough (typing, navigation keys, shortcuts, IME composition), hardware buttons, and screenshots
 - Device selection plus AVD start/stop
+- Stream-source switching between scrcpy and gRPC screenshot capture on emulators
 - Orientation, night mode, font scale, network, GPS location, and route playback
 - Logcat filtering, pause/copy controls, app management, file import, and session replay
 
@@ -210,6 +220,10 @@ curl "$BASE/health"
 curl "$BASE/api"
 curl "$BASE/api/devices"
 curl "$BASE/api/device-grid"
+curl "$BASE/api/stream-mode"
+curl -X PUT "$BASE/api/stream-mode" \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"grpc-screenshot"}'
 curl -X POST "$BASE/api/devices/select" \
   -H 'Content-Type: application/json' \
   -d '{"serial":"emulator-5554"}'
@@ -437,8 +451,8 @@ Use `/ws?frame-meta=1` to receive a 24-byte `SEMU` v2 frame metadata header befo
 With `--transport webrtc`, video is negotiated through authenticated,
 same-origin `POST /webrtc/offer` and released through `POST /webrtc/close`.
 The browser keeps `/ws?video=0` open as a control-only socket, so input still
-travels directly over scrcpy's binary control channel without duplicating video
-over WebSocket. `/api` exposes the active ICE configuration to the authenticated
+travels through the active low-latency source control path without duplicating
+video over WebSocket. `/api` exposes the active ICE configuration to the authenticated
 UI; `/health` redacts TURN credentials.
 
 See the [protocol reference](packages/serve-emu/docs/protocol.md) for the complete scrcpy v3/v4 framing, control packet, and `SEMU` v1/v2 wire formats.
@@ -459,7 +473,20 @@ See the [protocol reference](packages/serve-emu/docs/protocol.md) for the comple
 2. It opens `adb forward tcp:<localPort> localabstract:scrcpy_<scid>`.
 3. It spawns `app_process` with the scrcpy server class on the device, then connects video and control sockets through the tunnel.
 4. The Bun server reads scrcpy's framed H.264 stream and publishes each access unit over the selected WebSocket or WebRTC transport. Raw `/ws` clients receive Annex-B payloads unchanged; the built-in WebSocket UI opts into the 24-byte frame metadata header.
-5. The browser uses WebCodecs in a worker, falls back to MSE where necessary, or renders the WebRTC track into a `<video>`. Pointer events are normalized to unit coordinates and encoded as scrcpy control socket packets.
+5. The browser uses WebCodecs in a worker, falls back to MSE where necessary, or renders the WebRTC track into a `<video>`. Pointer events are normalized to unit coordinates and dispatched through the active source's ordered control channel.
+
+With `--stream-mode grpc-screenshot`, the emulator's gRPC endpoint provides raw
+RGB frames and accepts touch/key input on the host. `serve-emu` uses the bearer
+token advertised by the emulator's discovery file when one is present. If an
+explicitly selected emulator exposes an endpoint without a token, `serve-emu`
+prints a warning before using that local endpoint; only select this mode for an
+emulator you trust.
+
+`serve-emu`
+encodes those frames with ffmpeg/libx264 into the same Annex-B H.264 packet
+shape, so browser streaming, backpressure recovery, recording, and the REST and
+WebSocket control APIs remain unchanged. The UI can replace either source at
+runtime; the current stream stays live until the replacement is ready.
 
 ## Development
 

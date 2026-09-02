@@ -34,8 +34,6 @@ import {
 } from "./app-management.ts";
 import { getForegroundApp } from "./app-info.ts";
 import {
-  isAbnormalExit,
-  procExitDetail,
   terminalTransitionAllowed,
   type SessionStatus,
 } from "./session-status.ts";
@@ -45,11 +43,22 @@ import {
   writeFrameMetaHeader,
 } from "./shared/frame-meta.ts";
 import {
-  startScrcpy,
   type StartOpts as ScrcpyStartOpts,
   type ScrcpySession,
   ScrcpyStreamError,
 } from "./scrcpy.ts";
+import {
+  adaptScrcpySession,
+  startEmuSession,
+  type EmuSession,
+  type StartEmuSessionOptions,
+} from "./stream-session.ts";
+import {
+  streamModeConflictResponse,
+  streamModeMethodNotAllowedResponse,
+  streamModeRequestErrorResponse,
+  streamModeUnavailableResponse,
+} from "./stream-mode-api.ts";
 import {
   listAvds,
   listRunningAvds,
@@ -58,13 +67,16 @@ import {
 } from "./emulator.ts";
 import {
   parseGesture,
-  resetVideoPacket,
   type Gesture,
 } from "./input.ts";
 import {
   ControlInputError,
   ControlInputQueue,
 } from "./control-input-queue.ts";
+import {
+  availableStreamModesForSerial,
+  isEmulatorSerial,
+} from "./device-capabilities.ts";
 import {
   parseGeoFix,
   setEmulatorLocationAsync,
@@ -81,12 +93,12 @@ import {
   startSessionReplayResponse,
   stopSessionReplayResponse,
 } from "./session-replay-api.ts";
-import { createSessionReplayHandlers } from "./session-replay-session.ts";
 import {
   ActiveDeviceSession,
   DeviceSessionManager,
   SessionChangedError,
 } from "./device-session-context.ts";
+import type { DeviceSessionState } from "./device-session-state.ts";
 import { routePlaybackErrorResponse } from "./route-playback-api.ts";
 import { JsonResponseTracker } from "./json-response.ts";
 import { parseSessionPageQuery } from "./session-api.ts";
@@ -124,6 +136,12 @@ import {
   type WebRtcPublisher,
   type WebRtcPublisherOptions,
 } from "./webrtc-publisher.ts";
+import {
+  isStreamMode,
+  parseStreamModeRequest,
+  STREAM_MODES,
+  type StreamMode,
+} from "./shared/api-contracts.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -145,6 +163,8 @@ export type ServerOpts = {
   maxSize?: number;
   keyFrameInterval?: number;
   repeatFrameMs?: number;
+  /** Screen/input source. Defaults to scrcpy. */
+  streamMode?: StreamMode;
   maxApkUploadBytes?: number;
   maxMediaUploadBytes?: number;
   maxActiveUploads?: number;
@@ -254,6 +274,7 @@ const MAX_LOGCAT_QUERY_BYTES = 200;
 const MAX_WEBRTC_CLOSE_BODY_BYTES = 4 * 1024;
 
 export type ServerDependencies = {
+  openSession?: (options: StartEmuSessionOptions) => Promise<EmuSession>;
   openScrcpy?: (
     serial: string,
     signal?: AbortSignal,
@@ -307,17 +328,21 @@ export async function startServer(
   opts: ServerOpts,
   dependencies: ServerDependencies = {},
 ) {
-  const openScrcpy = dependencies.openScrcpy ??
-    ((serial: string, signal?: AbortSignal) =>
-      (dependencies.startScrcpy ?? startScrcpy)({
-        serial,
-        signal,
-        maxFps: opts.maxFps,
-        bitRate: opts.bitRate,
-        maxSize: opts.maxSize,
-        keyFrameInterval: opts.keyFrameInterval,
-        repeatFrameMs: opts.repeatFrameMs,
-      }));
+  const requestedDefaultStreamMode: unknown = opts.streamMode ?? "scrcpy";
+  if (!isStreamMode(requestedDefaultStreamMode)) {
+    throw new Error(
+      `streamMode must be one of: ${STREAM_MODES.join(", ")}`,
+    );
+  }
+  if (
+    requestedDefaultStreamMode === "grpc-screenshot" &&
+    !isEmulatorSerial(opts.serial)
+  ) {
+    throw new Error(
+      "grpc-screenshot is available only for Android Emulator devices",
+    );
+  }
+  const defaultStreamMode = requestedDefaultStreamMode;
   const serve = dependencies.serve ?? Bun.serve;
   const listDevices =
     dependencies.listDevices ?? dependencies.listAllDevices ?? listAllDevices;
@@ -337,6 +362,33 @@ export async function startServer(
     dependencies.createInputQueue ??
     ((session: ScrcpySession) =>
       new ControlInputQueue({ socket: session.controlSocket }));
+  const legacyOpenScrcpy = dependencies.openScrcpy ??
+    (dependencies.startScrcpy
+      ? ((serial: string, signal?: AbortSignal) =>
+          dependencies.startScrcpy!({
+            serial,
+            signal,
+            maxFps: opts.maxFps,
+            bitRate: opts.bitRate,
+            maxSize: opts.maxSize,
+            keyFrameInterval: opts.keyFrameInterval,
+            repeatFrameMs: opts.repeatFrameMs,
+          }))
+      : null);
+  const openSession =
+    dependencies.openSession ??
+    (async (options: StartEmuSessionOptions) => {
+      if (options.mode === "scrcpy" && legacyOpenScrcpy) {
+        const raw = await legacyOpenScrcpy(options.serial, options.signal);
+        try {
+          return adaptScrcpySession(raw, createInputQueue(raw));
+        } catch (error) {
+          await Promise.resolve(raw.close()).catch(() => {});
+          throw error;
+        }
+      }
+      return startEmuSession(options);
+    });
   const recoveryClock =
     dependencies.recoveryClock ?? SYSTEM_RECOVERY_WATCHDOG_CLOCK;
   const stageUpload =
@@ -403,6 +455,27 @@ export async function startServer(
   const host = opts.host ?? DEFAULT_HOST;
   const authToken = opts.token && opts.token.length > 0 ? opts.token : null;
   const streamSettings = opts.streamSettings ?? DEFAULT_STREAM_SETTINGS;
+  const preferredStreamModes = new Map<string, StreamMode>();
+
+  const modeForSerial = (serial: string): StreamMode =>
+    preferredStreamModes.get(serial) ??
+    (isEmulatorSerial(serial) ? defaultStreamMode : "scrcpy");
+
+  const openStream = (
+    serial: string,
+    mode: StreamMode,
+    signal?: AbortSignal,
+  ) =>
+    openSession({
+      serial,
+      mode,
+      signal,
+      maxFps: opts.maxFps,
+      bitRate: opts.bitRate,
+      maxSize: opts.maxSize,
+      keyFrameInterval: opts.keyFrameInterval,
+      repeatFrameMs: opts.repeatFrameMs,
+    });
 
   /** Token presented by the request, from bearer header, cookie, or query. */
   const presentedToken = (req: Request, url: URL): string | null => {
@@ -441,22 +514,23 @@ export async function startServer(
   const createContext = (
     serial: string,
     generation: number,
-    scrcpy: ScrcpySession,
+    stream: EmuSession,
+    deviceState?: DeviceSessionState,
   ): DeviceContext => {
     if (
       streamSettings.transport === "webrtc" &&
-      scrcpy.meta.codecId !== streamSettings.codec
+      stream.meta.codecId !== streamSettings.codec
     ) {
       throw new Error(
-        `WebRTC requires ${streamSettings.codec.toUpperCase()} video, but scrcpy negotiated ${scrcpy.meta.codecId}`,
+        `WebRTC requires ${streamSettings.codec.toUpperCase()} video, but ${stream.mode} negotiated ${stream.meta.codecId}`,
       );
     }
     const context = new ActiveDeviceSession<Client>({
       serial,
       generation,
-      scrcpy,
+      stream,
       applyLocation: setLocation,
-      inputQueue: createInputQueue(scrcpy),
+      deviceState,
     });
     context.registerCleanup(() =>
       uploads.cancelGeneration(
@@ -471,16 +545,16 @@ export async function startServer(
     return context;
   };
 
-  const initialScrcpy = await openScrcpy(opts.serial, opts.signal);
+  const initialMode = modeForSerial(opts.serial);
+  const initialStream = await openStream(opts.serial, initialMode, opts.signal);
   let initialContext: DeviceContext;
   try {
-    initialContext = createContext(opts.serial, 0, initialScrcpy);
+    initialContext = createContext(opts.serial, 0, initialStream);
   } catch (err) {
-    try {
-      initialScrcpy.close();
-    } catch {}
+    await initialStream.close().catch(() => {});
     throw err;
   }
+  preferredStreamModes.set(opts.serial, initialMode);
   const sessions = new DeviceSessionManager(initialContext);
   const recoveries = new WeakMap<
     DeviceContext,
@@ -500,7 +574,7 @@ export async function startServer(
   );
   let stopRequested = false;
   console.log(
-    `scrcpy ready: ${initialScrcpy.meta.deviceName} • ${initialScrcpy.meta.codecId} • ${initialScrcpy.meta.width}×${initialScrcpy.meta.height}`,
+    `${initialMode} ready: ${initialStream.meta.deviceName} • ${initialStream.meta.codecId} • ${initialStream.meta.width}×${initialStream.meta.height}`,
   );
 
   const health = (context = sessions.current) => {
@@ -520,8 +594,9 @@ export async function startServer(
     generation: context.generation,
     sessionGeneration: context.generation,
     serial: context.serial,
-    device: context.scrcpy.meta.deviceName,
-    codec: context.scrcpy.meta.codecId,
+    device: context.stream.meta.deviceName,
+    codec: context.stream.meta.codecId,
+    streamMode: context.stream.mode,
     size: { width: context.screen.width, height: context.screen.height },
     clients: context.clients.size,
     videoClients: Array.from(context.clients).filter((client) => client.video)
@@ -604,7 +679,7 @@ export async function startServer(
     );
     const rows: GridDevice[] = adbDevices.map((device) => {
       const running = runningBySerial.get(device.serial);
-      const isEmulator = /^emulator-\d+$/.test(device.serial);
+      const isEmulator = isEmulatorSerial(device.serial);
       return {
         id: device.serial,
         kind: isEmulator ? "emulator" : "physical",
@@ -1122,9 +1197,7 @@ export async function startServer(
     if (now - context.lastVideoResetMs < VIDEO_RESET_COOLDOWN_MS) {
       return { completion: Promise.resolve({ status: "coalesced" as const }) };
     }
-    const accepted = context.inputQueue.enqueuePacket(resetVideoPacket(), {
-      coalesceKey: "reset-video",
-    });
+    const accepted = context.inputQueue.enqueueVideoReset();
     context.lastVideoResetMs = now;
     context.videoResetRequests++;
     context.lastVideoResetAt = new Date(now).toISOString();
@@ -1216,10 +1289,7 @@ export async function startServer(
           return false;
         }
         try {
-          const accepted = context.inputQueue.enqueuePacket(
-            resetVideoPacket(),
-            { coalesceKey: "reset-video" },
-          );
+          const accepted = context.inputQueue.enqueueVideoReset();
           void accepted.completion.catch(() => {});
           context.lastVideoResetMs = now;
           context.videoResetRequests++;
@@ -1290,11 +1360,15 @@ export async function startServer(
     const pump = (async () => {
       try {
         while (!stopRequested && sessions.isCurrent(context)) {
-          const f = await context.scrcpy.readFrame();
+          const f = await context.stream.readFrame();
           if (!sessions.isCurrent(context)) break;
           if (!f) {
             if (!stopRequested)
-              markTerminal(context, "stopped", "scrcpy video stream ended");
+              markTerminal(
+                context,
+                "stopped",
+                `${context.stream.mode} video stream ended`,
+              );
             break;
           }
           if (f.type === "session") {
@@ -1377,24 +1451,7 @@ export async function startServer(
   };
 
   const attachSessionHandlers = (context: DeviceContext) => {
-    context.scrcpy.proc.once("exit", (code, signal) => {
-      // An abnormal exit (non-zero code or killed by signal) means scrcpy died
-      // unexpectedly — classify it as "error" even if the video socket already
-      // ended cleanly and marked the session "stopped" (markTerminal escalates).
-      // Normal exits and server-initiated teardowns (stopRequested / a bumped
-      // generation) are left alone.
-      if (
-        stopRequested ||
-        sessions.current !== context ||
-        (context.signal.aborted && !context.terminalTransitionStarted)
-      ) {
-        return;
-      }
-      if (!isAbnormalExit(code, signal)) return;
-      const { reason, ...detail } = procExitDetail(code, signal);
-      markTerminal(context, "error", reason, detail);
-    });
-    context.scrcpy.controlSocket.once("error", (err) => {
+    const unsubscribe = context.stream.onFatal((failure) => {
       if (
         !stopRequested &&
         sessions.current === context &&
@@ -1403,13 +1460,33 @@ export async function startServer(
         markTerminal(
           context,
           "error",
-          `scrcpy control socket error: ${err.message}`,
+          failure.message,
+          {
+            code: failure.code,
+            meta: failure.meta ?? null,
+          },
         );
       }
     });
+    context.registerCleanup(unsubscribe);
   };
 
   const activateContext = (context: DeviceContext) => {
+    context.deviceState.activate(context, {
+      dispatchGesture: (gesture, signal) => {
+        if (signal.aborted) {
+          throw signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException("session replay cancelled", "AbortError");
+        }
+        return enqueueGesture(
+          context,
+          gesture,
+          "session:replay",
+          false,
+        ).completion.then(() => {});
+      },
+    });
     const recovery = createRecovery(context);
     recoveries.set(context, recovery);
     context.registerCleanup(() => recovery.stop());
@@ -1417,6 +1494,54 @@ export async function startServer(
     attachSessionHandlers(context);
     recovery.start();
   };
+
+  const prepareContext = async (
+    serial: string,
+    generation: number,
+    mode: StreamMode,
+    signal: AbortSignal,
+    deviceState?: DeviceSessionState,
+  ): Promise<DeviceContext> => {
+    const stagingOwner = {};
+    let retainedDeviceState =
+      deviceState && !deviceState.disposed && !deviceState.signal.aborted
+        ? deviceState
+        : undefined;
+    if (retainedDeviceState) {
+      try {
+        retainedDeviceState.acquire(stagingOwner);
+      } catch {
+        retainedDeviceState = undefined;
+      }
+    }
+    try {
+      const stream = await openStream(serial, mode, signal);
+      try {
+        return createContext(
+          serial,
+          generation,
+          stream,
+          retainedDeviceState,
+        );
+      } catch (error) {
+        await stream.close().catch(() => {});
+        throw error;
+      }
+    } finally {
+      await retainedDeviceState?.release(
+        stagingOwner,
+        "stream source staging finished",
+      );
+    }
+  };
+
+  const streamModeResponse = (context: DeviceContext) => ({
+    ok: true as const,
+    serial: context.serial,
+    mode: context.stream.mode,
+    availableModes: availableStreamModesForSerial(context.serial),
+    sessionGeneration: context.generation,
+  });
 
   const switchSession = async (serial: string) => {
     const previous = sessions.current;
@@ -1445,26 +1570,67 @@ export async function startServer(
         if (device.state !== "device") {
           throw new Error(`${targetSerial} is ${device.state}, not ready.`);
         }
-        const scrcpy = await openScrcpy(targetSerial, signal);
-        try {
-          return createContext(targetSerial, generation, scrcpy);
-        } catch (err) {
-          try {
-            scrcpy.close();
-          } catch {}
-          throw err;
-        }
+        return prepareContext(
+          targetSerial,
+          generation,
+          modeForSerial(targetSerial),
+          signal,
+        );
       },
       activateContext,
     );
     console.log(
-      `scrcpy ready: ${context.scrcpy.meta.deviceName} • ${context.scrcpy.meta.codecId} • ${context.scrcpy.meta.width}×${context.scrcpy.meta.height}`,
+      `${context.stream.mode} ready: ${context.stream.meta.deviceName} • ${context.stream.meta.codecId} • ${context.stream.meta.width}×${context.stream.meta.height}`,
     );
     return {
       ok: true,
       serial: context.serial,
-      device: context.scrcpy.meta.deviceName,
+      device: context.stream.meta.deviceName,
     };
+  };
+
+  const switchStreamMode = async (
+    mode: StreamMode,
+    expected?: DeviceContext,
+  ) => {
+    const active = sessions.current;
+    if (expected && active.serial !== expected.serial) {
+      throw new SessionChangedError(expected.generation, active.generation);
+    }
+    const requestedSerial = active.serial;
+    if (!availableStreamModesForSerial(active.serial).includes(mode)) {
+      throw new Error(
+        "grpc-screenshot is available only for Android Emulator devices",
+      );
+    }
+    const context = await sessions.replace(
+      (current, generation, signal) =>
+        prepareContext(
+          current.serial,
+          generation,
+          mode,
+          signal,
+          current.signal.aborted ? undefined : current.deviceState,
+        ),
+      activateContext,
+      "stream source switched",
+      (current) => {
+        if (current.serial !== requestedSerial) {
+          throw new SessionChangedError(
+            active.generation,
+            current.generation,
+          );
+        }
+        return current.stream.mode !== mode;
+      },
+    );
+    preferredStreamModes.set(context.serial, mode);
+    if (context.generation !== active.generation) {
+      console.log(
+        `${context.stream.mode} ready: ${context.stream.meta.deviceName} • ${context.stream.meta.codecId} • ${context.stream.meta.width}×${context.stream.meta.height}`,
+      );
+    }
+    return streamModeResponse(context);
   };
 
   const stopCurrentSession = (context: DeviceContext, reason: string) =>
@@ -1548,8 +1714,9 @@ export async function startServer(
           {
             generation: requestContext.generation,
             serial: requestContext.serial,
-            device: requestContext.scrcpy.meta.deviceName,
-            codec: requestContext.scrcpy.meta.codecId,
+            device: requestContext.stream.meta.deviceName,
+            codec: requestContext.stream.meta.codecId,
+            streamMode: requestContext.stream.mode,
             size: {
               width: requestContext.screen.width,
               height: requestContext.screen.height,
@@ -1560,6 +1727,40 @@ export async function startServer(
           },
           { headers: { "Cache-Control": "no-store" } },
         );
+      }
+
+      if (url.pathname === "/api/stream-mode") {
+        if (req.method === "GET") {
+          return Response.json(streamModeResponse(requestContext), {
+            headers: { "Cache-Control": "no-store" },
+          });
+        }
+        if (req.method !== "PUT") {
+          return streamModeMethodNotAllowedResponse();
+        }
+        let mode: StreamMode;
+        try {
+          const payload = await readJsonBody(req, MAX_JSON_BODY_BYTES);
+          const { mode: requestedMode } = parseStreamModeRequest(payload);
+          if (
+            requestedMode === "grpc-screenshot" &&
+            !isEmulatorSerial(requestContext.serial)
+          ) {
+            throw new Error(
+              "grpc-screenshot is available only for Android Emulator devices",
+            );
+          }
+          mode = requestedMode;
+        } catch (error) {
+          return streamModeRequestErrorResponse(error);
+        }
+        try {
+          return Response.json(await switchStreamMode(mode, requestContext));
+        } catch (error) {
+          return error instanceof SessionChangedError
+            ? streamModeConflictResponse(error)
+            : streamModeUnavailableResponse(error);
+        }
       }
 
       if (url.pathname === "/webrtc/offer") {
@@ -1754,7 +1955,7 @@ export async function startServer(
               )?.serial ?? "";
           }
           if (!serial) throw new Error("serial or running avd is required");
-          if (!/^emulator-\d+$/.test(serial))
+          if (!isEmulatorSerial(serial))
             throw new Error(`${serial} is not an emulator`);
           if (serial === requestContext.serial) {
             await stopCurrentSession(requestContext, "current emulator stopped");
@@ -2103,37 +2304,15 @@ export async function startServer(
             ? errorResponse(err)
             : sessionReplayErrorResponse(err, 400);
         }
+        const replayDeviceState = requestContext.deviceState;
         const isCurrentReplaySession = () =>
           replayAdmissionEpoch === replayRecorder.replayAdmissionEpoch &&
-          replayRecorder === requestContext.recorder &&
-          sessions.isCurrent(requestContext);
-        const handlers = createSessionReplayHandlers({
-          generation: requestContext.generation,
-          getGeneration: () => sessions.current.generation,
-          dispatchGesture: (gesture) =>
-            enqueueGesture(
-              requestContext,
-              gesture,
-              "session:replay",
-              false,
-            ).completion.then(() => {}),
-          setLocation: async (fix, signal) => {
-            requestContext.route.stop();
-            await setLocation(requestContext.serial, fix, signal);
-            if (!isCurrentReplaySession()) {
-              throw new SessionReplayConflictError(
-                "device session changed during session replay",
-              );
-            }
-            requestContext.lastLocation = {
-              ...fix,
-              appliedAt: new Date().toISOString(),
-            };
-          },
-        });
+          replayRecorder === replayDeviceState.recorder &&
+          sessions.current.deviceState === replayDeviceState &&
+          !replayDeviceState.disposed;
         return startSessionReplayResponse(
           replayRecorder,
-          handlers,
+          replayDeviceState.replayHandlers,
           multiplier,
           isCurrentReplaySession,
         );
@@ -2143,8 +2322,9 @@ export async function startServer(
         if (req.method !== "POST")
           return new Response("method not allowed", { status: 405 });
         const stoppedRecorder = requestContext.recorder;
+        const stoppedDeviceState = requestContext.deviceState;
         const response = await stopSessionReplayResponse(stoppedRecorder);
-        if (!sessions.isCurrent(requestContext)) {
+        if (sessions.current.deviceState !== stoppedDeviceState) {
           return sessionReplayErrorResponse(
             new SessionReplayConflictError(
               "device session changed while stopping session replay",
@@ -2219,7 +2399,7 @@ export async function startServer(
           return Response.json({
             generation: requestContext.generation,
             serial: requestContext.serial,
-            emulator: /^emulator-\d+$/.test(requestContext.serial),
+            emulator: isEmulatorSerial(requestContext.serial),
             location: requestContext.lastLocation,
           });
         }
@@ -2482,13 +2662,17 @@ export async function startServer(
 
   return {
     server,
-    get session(): ScrcpySession | null {
+    get session(): ScrcpySession | EmuSession | null {
       const context = sessions.current;
-      return context.signal.aborted ? null : context.scrcpy;
+      return context.signal.aborted
+        ? null
+        : (context.stream.rawScrcpy ?? context.stream);
     },
-    getSession(): ScrcpySession | null {
+    getSession(): ScrcpySession | EmuSession | null {
       const context = sessions.current;
-      return context.signal.aborted ? null : context.scrcpy;
+      return context.signal.aborted
+        ? null
+        : (context.stream.rawScrcpy ?? context.stream);
     },
     stop,
   };

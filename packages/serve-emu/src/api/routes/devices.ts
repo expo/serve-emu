@@ -1,8 +1,12 @@
 import type { ApiDependencies } from "../dependencies.ts";
 import type { ContractApiRoute } from "./types.ts";
+import { readJsonBody } from "../body.ts";
+import { isEmulatorSerial } from "../../device-capabilities.ts";
+import { parseStreamModeRequest } from "../../shared/api-contracts.ts";
 import {
   downstream,
   invalid,
+  parseInput,
   readObject,
   requiredString,
 } from "./route-helpers.ts";
@@ -13,6 +17,22 @@ export function deviceRoutes(): ContractApiRoute<ApiDependencies>[] {
       method: "GET",
       path: "/api",
       handler: ({ deps }) => Response.json(deps.getInfo()),
+    },
+    {
+      method: "GET",
+      path: "/api/stream-mode",
+      handler: ({ deps }) => Response.json(deps.getStreamMode()),
+    },
+    {
+      method: "PUT",
+      path: "/api/stream-mode",
+      handler: async ({ request, deps }) => {
+        const payload = await readJsonBody(request);
+        const { mode } = parseInput(() => parseStreamModeRequest(payload));
+        return Response.json(
+          await downstream("switch stream mode", () => deps.setStreamMode(mode)),
+        );
+      },
     },
     {
       method: "GET",
@@ -62,7 +82,7 @@ export function deviceRoutes(): ContractApiRoute<ApiDependencies>[] {
           ? body.avd.trim()
           : undefined;
         if (!serial && !avd) invalid("serial or running avd is required");
-        if (serial && !/^emulator-\d+$/.test(serial)) {
+        if (serial && !isEmulatorSerial(serial)) {
           invalid(`${serial} is not an emulator`);
         }
         return Response.json(

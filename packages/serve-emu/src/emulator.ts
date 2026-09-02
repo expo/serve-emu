@@ -3,6 +3,10 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { listAllDevices, type Device } from "./adb.ts";
+import {
+  isEmulatorSerial,
+  parseEmulatorSerial,
+} from "./device-capabilities.ts";
 import { execText, type ExecResult } from "./exec.ts";
 
 export type EmulatorLaunch = {
@@ -181,8 +185,8 @@ async function usedEmulatorPorts(
 ): Promise<Set<number>> {
   const ports = new Set<number>();
   for (const device of await readDevices()) {
-    const match = device.serial.match(/^emulator-(\d+)$/);
-    if (match) ports.add(Number(match[1]));
+    const parsed = parseEmulatorSerial(device.serial);
+    if (parsed) ports.add(Number(parsed.consolePort));
   }
   return ports;
 }
@@ -248,7 +252,7 @@ export async function resolveRunningAvds(
   runExec: typeof execText = execText,
 ): Promise<RunningAvd[]> {
   const emulators = devices.filter((device) =>
-    /^emulator-\d+$/.test(device.serial),
+    isEmulatorSerial(device.serial),
   );
   const named = await Promise.all(
     emulators.map(async (device) => {

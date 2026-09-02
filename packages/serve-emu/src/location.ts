@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { isEmulatorSerial } from "./device-capabilities.ts";
 import { execText } from "./exec.ts";
 
 export type GeoFix = {
@@ -33,7 +34,7 @@ function decimal(value: number): string {
 }
 
 function geoFixArgs(serial: string, fix: GeoFix): string[] {
-  if (!/^emulator-\d+$/.test(serial)) {
+  if (!isEmulatorSerial(serial)) {
     throw new Error("location control is currently supported for Android Emulator serials only");
   }
 
