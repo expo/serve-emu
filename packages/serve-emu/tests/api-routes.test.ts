@@ -79,7 +79,10 @@ const METHOD_ORDER: readonly ApiMethod[] = [
 ];
 
 const VALID_JSON_BODIES: Readonly<Record<string, unknown>> = {
-  "PUT /api/stream-mode": { mode: "grpc-screenshot" },
+  "PUT /api/stream-mode": {
+    mode: "grpc-screenshot",
+    grpcImageMode: "mmap",
+  },
   "PATCH /api/stream-settings": { maxDimension: 720 },
   "POST /api/devices/select": { serial: "emulator-5554" },
   "POST /api/avds/start": { avd: "Pixel_8_API_35", select: true },
@@ -161,13 +164,17 @@ function fakeDependencies(
       ok: true,
       serial: "emulator-5554",
       mode: "scrcpy",
+      grpcImageMode: "png",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 0,
     }),
-    setStreamMode: async (mode) => ({
+    setStreamMode: async (request) => ({
       ok: true,
       serial: "emulator-5554",
-      mode,
+      mode: request.mode,
+      grpcImageMode: request.mode === "grpc-screenshot"
+        ? request.grpcImageMode ?? "png"
+        : "png",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 1,
     }),

@@ -745,6 +745,7 @@ describe("createRouter stream mode", () => {
       ok: true,
       serial: "emulator-5554",
       mode: "scrcpy",
+      grpcImageMode: "png",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 0,
     });
@@ -769,6 +770,7 @@ describe("createRouter stream mode", () => {
       ok: true,
       serial: "emulator-5554",
       mode: "grpc-screenshot",
+      grpcImageMode: "png",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 1,
     });
@@ -780,6 +782,75 @@ describe("createRouter stream mode", () => {
       "emulator-5554",
       "emulator-5554",
     ]);
+  });
+
+  test("atomically replaces gRPC capture when its explicit image mode changes", async () => {
+    const opened: Array<{ mode: StreamMode; grpcImageMode: string }> = [];
+    const router = createRouter(
+      { serial: "emulator-5554" },
+      {
+        listDevices: async () => [
+          { serial: "emulator-5554", state: "device" },
+        ],
+        createApp: (options) =>
+          createApp(options, {
+            startSession: async ({ mode, grpcImageMode }) => {
+              opened.push({ mode, grpcImageMode });
+              return liveStreamSession(mode);
+            },
+          }),
+      },
+    );
+
+    await router.handleRequest(
+      new Request("http://router.test/api/stream-mode"),
+    );
+    const mmap = await router.handleRequest(
+      put("/api/stream-mode", {
+        mode: "grpc-screenshot",
+        grpcImageMode: "mmap",
+      }),
+    );
+    expect(await responseJson(mmap)).toMatchObject({
+      mode: "grpc-screenshot",
+      grpcImageMode: "mmap",
+      sessionGeneration: 1,
+    });
+
+    const png = await router.handleRequest(
+      put("/api/stream-mode", {
+        mode: "grpc-screenshot",
+        grpcImageMode: "png",
+      }),
+    );
+    expect(await responseJson(png)).toMatchObject({
+      mode: "grpc-screenshot",
+      grpcImageMode: "png",
+      sessionGeneration: 2,
+    });
+    expect(opened).toEqual([
+      { mode: "scrcpy", grpcImageMode: "png" },
+      { mode: "grpc-screenshot", grpcImageMode: "mmap" },
+      { mode: "grpc-screenshot", grpcImageMode: "png" },
+    ]);
+
+    const invalid = await router.handleRequest(
+      put("/api/stream-mode", {
+        mode: "grpc-screenshot",
+        grpcImageMode: "auto",
+      }),
+    );
+    expect(invalid.status).toBe(400);
+    expect(await responseJson(invalid)).toEqual({
+      ok: false,
+      error: {
+        code: "invalid_request",
+        message: "stream mode request.grpcImageMode is invalid",
+      },
+    });
+    expect(opened).toHaveLength(3);
+
+    await router.stopAll();
   });
 
   test("preserves authoritative encoder settings across source replacements", async () => {

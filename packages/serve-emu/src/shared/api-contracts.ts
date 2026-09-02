@@ -1,4 +1,4 @@
-import { parseGesture, type Gesture } from "./control-contracts";
+import { parseGesture, type Gesture } from "./control-contracts.ts";
 import {
   MAX_H264_BITRATE,
   MAX_H264_FPS,
@@ -8,7 +8,7 @@ import {
   type StreamEncoderSettingsPatch,
   type StreamSettings,
   type WebRtcIceServer,
-} from "../stream-settings";
+} from "../stream-settings.ts";
 
 /** Stable error codes sent by every JSON API failure. */
 export const API_ERROR_CODES = [
@@ -77,16 +77,35 @@ export type DeviceSelectionResponse = ApiSuccess<{
 
 export const STREAM_MODES = ["scrcpy", "grpc-screenshot"] as const;
 export type StreamMode = (typeof STREAM_MODES)[number];
-export type StreamModeRequest = { mode: StreamMode };
 export function isStreamMode(value: unknown): value is StreamMode {
   return (
     typeof value === "string" &&
     STREAM_MODES.some((mode) => mode === value)
   );
 }
+
+/** Exact image delivery mode used by the emulator gRPC screenshot source. */
+export const GRPC_IMAGE_MODES = ["png", "mmap"] as const;
+export type GrpcImageMode = (typeof GRPC_IMAGE_MODES)[number];
+export const DEFAULT_GRPC_IMAGE_MODE: GrpcImageMode = "png";
+export function isGrpcImageMode(value: unknown): value is GrpcImageMode {
+  return (
+    typeof value === "string" &&
+    GRPC_IMAGE_MODES.some((mode) => mode === value)
+  );
+}
+
+export type StreamModeRequest =
+  | { mode: "scrcpy" }
+  | {
+      mode: "grpc-screenshot";
+      /** Optional for backwards compatibility; omitted means keep the configured mode. */
+      grpcImageMode?: GrpcImageMode;
+    };
 export type StreamModeResponse = ApiSuccess<{
   serial: string;
   mode: StreamMode;
+  grpcImageMode: GrpcImageMode;
   availableModes: StreamMode[];
   sessionGeneration: number;
 }>;
@@ -686,8 +705,25 @@ export function parseDeviceSelectionResponse(value: unknown): DeviceSelectionRes
 
 export function parseStreamModeRequest(value: unknown): StreamModeRequest {
   const root = record(value, "stream mode request");
+  const mode = oneOf(root.mode, STREAM_MODES, "stream mode request.mode");
+  if (mode === "scrcpy") {
+    if (root.grpcImageMode !== undefined) {
+      fail(
+        "stream mode request.grpcImageMode is available only with mode grpc-screenshot",
+      );
+    }
+    return { mode };
+  }
+  if (root.grpcImageMode === undefined) {
+    return { mode };
+  }
   return {
-    mode: oneOf(root.mode, STREAM_MODES, "stream mode request.mode"),
+    mode,
+    grpcImageMode: oneOf(
+      root.grpcImageMode,
+      GRPC_IMAGE_MODES,
+      "stream mode request.grpcImageMode",
+    ),
   };
 }
 
@@ -697,6 +733,11 @@ export function parseStreamModeResponse(value: unknown): StreamModeResponse {
   const serial = string(root.serial, "stream mode response.serial");
   if (!serial) fail("stream mode response.serial must not be empty");
   const mode = oneOf(root.mode, STREAM_MODES, "stream mode response.mode");
+  const grpcImageMode = oneOf(
+    root.grpcImageMode,
+    GRPC_IMAGE_MODES,
+    "stream mode response.grpcImageMode",
+  );
   if (!Array.isArray(root.availableModes)) {
     fail("stream mode response.availableModes must be an array");
   }
@@ -729,6 +770,7 @@ export function parseStreamModeResponse(value: unknown): StreamModeResponse {
     ok: true,
     serial,
     mode,
+    grpcImageMode,
     availableModes,
     sessionGeneration,
   };

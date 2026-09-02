@@ -63,7 +63,7 @@ Node.js 18+ can invoke the published package through `npx`, but local developmen
 The CLI remains the simplest entry point, and the fork also publishes a small
 typed integration surface:
 
-- `serve-emu` and `serve-emu/middleware`: `createApp`, `createRouter`, and socket adapters for embedding the device router in another Bun/Node server
+- `serve-emu` and `serve-emu/middleware`: `createApp`, `createRouter`, gRPC image-mode types/constants, and socket adapters for embedding the device router in another Bun/Node server
 - `serve-emu/stream-socket`: Bun and `ws` socket adapters
 - `serve-emu/stream-settings`: WebSocket/WebRTC settings, ICE types, defaults, and validation helpers
 
@@ -95,7 +95,7 @@ bun run packages/serve-emu/src/cli.ts
 ## CLI
 
 ```text
-serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode scrcpy|grpc-screenshot] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms] [--max-apk-upload-bytes N] [--max-media-upload-bytes N]
+serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode scrcpy|grpc-screenshot] [--grpc-image-mode png|mmap] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms] [--max-apk-upload-bytes N] [--max-media-upload-bytes N]
 serve-emu --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
 serve-emu --avd <name> [--gpu <mode>] [--restart-avd]
 serve-emu --avd-list
@@ -110,6 +110,7 @@ serve-emu --running-avds
 | `--unsafe-no-auth` | false | Allow a non-loopback bind with **no** authentication (dangerous) |
 | `-s, --serial` | auto | adb device serial; required when multiple devices are online |
 | `--stream-mode` | `scrcpy` | Screen and input source: `scrcpy`, or emulator-only host capture through `grpc-screenshot` |
+| `--grpc-image-mode` | `png` | gRPC screenshot image delivery: compressed in-band `png`, or raw pixels through shared-memory `mmap`. The selected mode is strict; capture errors do not fall back to the other mode |
 | `--max-fps` | `60` | Cap source frame rate |
 | `--bit-rate` | `8000000` | H.264 bit rate in bps |
 | `--max-size` | `1280` | Downscale the longest edge to N pixels; `0` keeps native size. The default balances detail and throughput, especially for the host-side software encoder used by `grpc-screenshot` |
@@ -132,7 +133,7 @@ serve-emu --running-avds
 | `--avd-list` | false | List available Android Virtual Device names |
 | `--running-avds` | false | List currently running emulator serials and AVD names |
 | `--emulator` | auto | Android Emulator binary path; defaults to PATH or Android SDK env vars |
-| `--emulator-port` | auto | Emulator console port for `--avd`; must be an even port from 5554 through 5682 |
+| `--emulator-port` | auto | Android Emulator console port for `--avd`; must be an even port from 5554 through 5682 |
 
 By default, `serve-emu` attaches to the only online device. If more than one device is online, pass `-s <serial>` or select another running device later through the HTTP API/UI.
 
@@ -192,7 +193,7 @@ Open `http://localhost:3300` after starting the CLI. The UI streams the device i
 
 - Pointer input, keyboard passthrough (typing, navigation keys, shortcuts, IME composition), hardware buttons, and screenshots
 - Device selection plus AVD start/stop
-- Stream-source switching between scrcpy and gRPC screenshot capture on emulators
+- Stream-source switching between scrcpy and gRPC screenshot capture on emulators, with an explicit PNG/MMAP image-mode selector for gRPC
 - Orientation, night mode, font scale, network, GPS location, and route playback
 - Logcat filtering, pause/copy controls, app management, file import, and session replay
 
@@ -223,11 +224,17 @@ curl "$BASE/api/device-grid"
 curl "$BASE/api/stream-mode"
 curl -X PUT "$BASE/api/stream-mode" \
   -H 'Content-Type: application/json' \
-  -d '{"mode":"grpc-screenshot"}'
+  -d '{"mode":"grpc-screenshot","grpcImageMode":"mmap"}'
 curl -X POST "$BASE/api/devices/select" \
   -H 'Content-Type: application/json' \
   -d '{"serial":"emulator-5554"}'
 ```
+
+`GET /api/stream-mode` reports `mode`, `grpcImageMode`, the available stream
+sources, and the active session generation. `PUT /api/stream-mode` accepts an
+optional `grpcImageMode` of `png` or `mmap` when `mode` is `grpc-screenshot`.
+Changing either value stages one replacement capture atomically; an MMAP error
+is returned to the caller and never retried as PNG.
 
 `/health` includes bounded subprocess executor activity, queue depth, lane
 counts, deadlines, overload rejections, and output-limit totals. Device-grid
@@ -522,18 +529,31 @@ See the [protocol reference](packages/serve-emu/docs/protocol.md) for the comple
 4. The Bun server reads scrcpy's framed H.264 stream and publishes each access unit over the selected WebSocket or WebRTC transport. Raw `/ws` clients receive Annex-B payloads unchanged; the built-in WebSocket UI opts into the 24-byte frame metadata header.
 5. The browser uses WebCodecs in a worker, falls back to MSE where necessary, or renders the WebRTC track into a `<video>`. Pointer events are normalized to unit coordinates and dispatched through the active source's ordered control channel.
 
-With `--stream-mode grpc-screenshot`, the emulator's gRPC endpoint provides raw
-RGB frames and accepts touch/key input on the host. `serve-emu` uses the bearer
-token advertised by the emulator's discovery file when one is present. If an
-explicitly selected emulator exposes an endpoint without a token, `serve-emu`
-prints a warning before using that local endpoint; only select this mode for an
-emulator you trust.
+With `--stream-mode grpc-screenshot`, the emulator's gRPC endpoint
+provides images and accepts touch/key input on the host. `--grpc-image-mode png`
+requests compressed images in the gRPC stream, while `--grpc-image-mode mmap`
+requests raw RGB pixels through the emulator's shared-memory side channel.
+`serve-emu` uses the bearer token advertised by the emulator's discovery file
+when one is present. If an explicitly selected emulator exposes an endpoint
+without a token, `serve-emu` prints a warning before using that local endpoint;
+only select this mode for an emulator you trust.
 
-`serve-emu`
-encodes those frames with ffmpeg/libx264 into the same Annex-B H.264 packet
-shape, so browser streaming, backpressure recovery, recording, and the REST and
-WebSocket control APIs remain unchanged. The UI can replace either source at
-runtime; the current stream stays live until the replacement is ready.
+`serve-emu` encodes either mode with ffmpeg/libx264 into the same Annex-B H.264
+packet shape, so browser streaming, backpressure recovery, recording, and the
+REST and WebSocket control APIs remain unchanged. The selected gRPC image mode
+never falls back automatically. The UI can replace either source or gRPC image
+mode at runtime; the current stream stays live until the replacement is ready.
+
+For MMAP, `--max-size 0` allocates the fixed shared region from the display's
+native size at session startup. Rotation remains native-size, but a foldable or
+resizable display that later grows beyond that startup extent requires a stream
+restart so a larger region can be allocated.
+
+MMAP support is experimental and depends on the Android Emulator build. Google
+tracks an Apple Silicon `streamScreenshot` MMAP fix as issue
+[#537802959](https://issuetracker.google.com/issues/537802959), included in
+Emulator 37.2.3 Canary. If an affected emulator crashes or stops producing
+frames, select PNG explicitly or upgrade to a build containing that fix.
 
 ## Development
 

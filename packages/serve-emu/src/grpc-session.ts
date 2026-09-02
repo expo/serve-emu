@@ -9,9 +9,12 @@ import {
   ensureEmulatorGrpcEndpoint,
   IMG_FORMAT_PNG,
   IMG_FORMAT_RGB888,
+  IMAGE_TRANSPORT_MMAP,
   type EmuImage,
   type GrpcEndpoint,
+  type GrpcImageDecodeEvent,
   type GrpcMessagePacingEvent,
+  type GrpcMessagePacingDetail,
   type GrpcScreenshotImageSource,
   type ImageFormatRequest,
   type KeyboardEventRequest,
@@ -26,12 +29,13 @@ import {
 } from "./h264-encoder.ts";
 import { H264StartupGate } from "./h264-readiness.ts";
 import {
-  normalizeTextForControl,
-  type Gesture,
-} from "./input.ts";
+  GrpcMmapScreenshotRegion,
+  rgb888MmapRegionBytes,
+  type StableMmapRead,
+} from "./grpc-mmap.ts";
+import { normalizeTextForControl, type Gesture } from "./input.ts";
 import {
   SCRCPY_DEFAULTS,
-  type StartOpts,
   type VideoFrame,
   type VideoPacket,
 } from "./scrcpy.ts";
@@ -39,9 +43,11 @@ import type {
   EmuSession,
   GrpcCaptureDiagnostics,
   RollingTimingSummary,
+  StartEmuSessionOptions,
   StreamFailure,
   StreamMeta,
 } from "./stream-session.ts";
+import type { GrpcImageMode } from "./shared/api-contracts.ts";
 
 export { H264StartupGate } from "./h264-readiness.ts";
 
@@ -65,33 +71,64 @@ const MAX_DISPLAY_SIZE_OUTPUT_BYTES = 4_096;
 const INPUT_RELEASE_TIMEOUT_MS = 500;
 const TOUCH_PRESSURE = 1;
 const CAPTURE_DIAGNOSTIC_WINDOW = 240;
+// A two-second gap is at least 120 missing slots at the normal 60 FPS target
+// and four times the idle-repeat period. Treat the next source frame as the
+// start of a new active burst so one static-screen pause cannot depress the
+// active capture rate for the next several minutes of a sample-count window.
+const CAPTURE_CADENCE_IDLE_RESET_MS = 2_000;
 
 class RollingTimingWindow {
   readonly #values: Float64Array;
+  readonly #weights: Float64Array;
   #index = 0;
   #count = 0;
 
   constructor(capacity: number) {
     if (!Number.isSafeInteger(capacity) || capacity <= 0) {
-      throw new RangeError("diagnostic window capacity must be a positive integer");
+      throw new RangeError(
+        "diagnostic window capacity must be a positive integer",
+      );
     }
     this.#values = new Float64Array(capacity);
+    this.#weights = new Float64Array(capacity);
   }
 
-  record(value: number): void {
-    if (!Number.isFinite(value)) return;
+  record(value: number, weight = 1): void {
+    if (!Number.isFinite(value) || !Number.isFinite(weight) || weight <= 0)
+      return;
     this.#values[this.#index] = value;
+    this.#weights[this.#index] = weight;
     this.#index = (this.#index + 1) % this.#values.length;
     if (this.#count < this.#values.length) this.#count++;
   }
 
+  reset(): void {
+    this.#index = 0;
+    this.#count = 0;
+  }
+
   summary(): RollingTimingSummary | null {
     if (this.#count === 0) return null;
-    const values = Array.from(this.#values.subarray(0, this.#count)).sort(
-      (left, right) => left - right,
+    const entries = Array.from({ length: this.#count }, (_, index) => ({
+      value: this.#values[index]!,
+      weight: this.#weights[index]!,
+    })).sort((left, right) => left.value - right.value);
+    const totalWeight = entries.reduce(
+      (total, entry) => total + entry.weight,
+      0,
     );
-    const at = (quantile: number) =>
-      values[Math.min(values.length - 1, Math.floor(values.length * quantile))]!;
+    // Use the same upper-median convention as the previous unweighted window,
+    // while treating a source interval weighted by N sequence steps as N
+    // produced-frame observations without allocating an expanded sample list.
+    const at = (quantile: number) => {
+      const targetWeight = totalWeight * quantile;
+      let cumulativeWeight = 0;
+      for (const entry of entries) {
+        cumulativeWeight += entry.weight;
+        if (cumulativeWeight > targetWeight) return entry.value;
+      }
+      return entries[entries.length - 1]!.value;
+    };
     const round1 = (value: number) => Math.round(value * 10) / 10;
     const latestIndex =
       (this.#index - 1 + this.#values.length) % this.#values.length;
@@ -100,36 +137,101 @@ class RollingTimingWindow {
       latest: round1(this.#values[latestIndex]!),
       p50: round1(at(0.5)),
       p95: round1(at(0.95)),
-      max: round1(values[values.length - 1]!),
+      max: round1(entries[entries.length - 1]!.value),
     };
+  }
+
+  ratePerSecond(): number | null {
+    if (this.#count === 0) return null;
+    let weightedTotal = 0;
+    let totalWeight = 0;
+    for (let index = 0; index < this.#count; index++) {
+      const weight = this.#weights[index]!;
+      weightedTotal += this.#values[index]! * weight;
+      totalWeight += weight;
+    }
+    if (
+      !Number.isFinite(weightedTotal) ||
+      weightedTotal <= 0 ||
+      totalWeight <= 0
+    )
+      return null;
+    return Math.round((1_000 / (weightedTotal / totalWeight)) * 10) / 10;
   }
 }
 
 /** Collects the capture counters exposed through an EmuSession diagnostics snapshot. */
 export class GrpcCaptureDiagnosticsTracker {
+  readonly #imageMode: GrpcImageMode;
   #rawGrpcMessagesReceived = 0;
   #rawGrpcMessagesEmitted = 0;
   #rawGrpcMessagesCoalesced = 0;
   #usableImages = 0;
+  #imagePayloadBytes = 0;
+  #transportBytes = 0;
+  #grpcMessageBytesReceived = 0;
+  #mmapFileBytesRead = 0;
+  #mmapReadRetries = 0;
+  #mmapTornFramesDropped = 0;
   #sequenceGaps = 0;
   #lastSequence: number | null = null;
   #lastSourceTimestampUs: bigint | null = null;
+  #lastRawMessageAtMs: number | null = null;
+  #lastUsableImageAtMs: number | null = null;
+  #lastFreshEncoderWriteAtMs: number | null = null;
   readonly #sourceTimestampIntervals: RollingTimingWindow;
+  readonly #rawMessageReceiveIntervals: RollingTimingWindow;
+  readonly #usableImageIntervals: RollingTimingWindow;
+  readonly #freshEncoderWriteIntervals: RollingTimingWindow;
   readonly #productionToReceiveLatency: RollingTimingWindow;
+  readonly #productionToUsableLatency: RollingTimingWindow;
+  readonly #protobufDecodeTime: RollingTimingWindow;
+  readonly #sharedReadCopyTime: RollingTimingWindow;
+  readonly #cadenceIdleResetMs: number;
   #freshEncoderWriteAttempts = 0;
   #repeatEncoderWriteAttempts = 0;
   #acceptedEncoderWrites = 0;
   #encoderBackpressureRejections = 0;
 
-  constructor(windowCapacity = CAPTURE_DIAGNOSTIC_WINDOW) {
+  constructor(
+    imageMode: GrpcImageMode,
+    windowCapacity = CAPTURE_DIAGNOSTIC_WINDOW,
+    cadenceIdleResetMs = CAPTURE_CADENCE_IDLE_RESET_MS,
+  ) {
+    if (!Number.isFinite(cadenceIdleResetMs) || cadenceIdleResetMs <= 0) {
+      throw new RangeError("cadence idle reset must be a positive number");
+    }
+    this.#imageMode = imageMode;
+    this.#cadenceIdleResetMs = cadenceIdleResetMs;
     this.#sourceTimestampIntervals = new RollingTimingWindow(windowCapacity);
+    this.#rawMessageReceiveIntervals = new RollingTimingWindow(windowCapacity);
+    this.#usableImageIntervals = new RollingTimingWindow(windowCapacity);
+    this.#freshEncoderWriteIntervals = new RollingTimingWindow(windowCapacity);
     this.#productionToReceiveLatency = new RollingTimingWindow(windowCapacity);
+    this.#productionToUsableLatency = new RollingTimingWindow(windowCapacity);
+    this.#protobufDecodeTime = new RollingTimingWindow(windowCapacity);
+    this.#sharedReadCopyTime = new RollingTimingWindow(windowCapacity);
   }
 
-  recordGrpcMessage(event: GrpcMessagePacingEvent): void {
+  recordGrpcMessage(
+    event: GrpcMessagePacingEvent,
+    detail?: GrpcMessagePacingDetail,
+    observedAtMs = performance.now(),
+  ): void {
     switch (event) {
       case "received":
         this.#rawGrpcMessagesReceived++;
+        this.#grpcMessageBytesReceived += detail?.messageBytes ?? 0;
+        if (
+          this.#lastRawMessageAtMs !== null &&
+          observedAtMs > this.#lastRawMessageAtMs
+        ) {
+          this.#recordCadenceInterval(
+            this.#rawMessageReceiveIntervals,
+            observedAtMs - this.#lastRawMessageAtMs,
+          );
+        }
+        this.#lastRawMessageAtMs = observedAtMs;
         return;
       case "emitted":
         this.#rawGrpcMessagesEmitted++;
@@ -141,11 +243,27 @@ export class GrpcCaptureDiagnosticsTracker {
   }
 
   recordUsableImage(
-    image: Pick<EmuImage, "seq" | "timestampUs">,
+    image: Pick<EmuImage, "seq" | "timestampUs" | "image">,
     receivedAtMs = Date.now(),
+    usableAtMs = receivedAtMs,
   ): void {
     this.#usableImages++;
+    this.#transportBytes += image.image.length;
+    if (
+      this.#lastUsableImageAtMs !== null &&
+      usableAtMs > this.#lastUsableImageAtMs
+    ) {
+      this.#recordCadenceInterval(
+        this.#usableImageIntervals,
+        usableAtMs - this.#lastUsableImageAtMs,
+      );
+    }
+    this.#lastUsableImageAtMs = usableAtMs;
+    let sequenceDelta = 1;
     if (Number.isSafeInteger(image.seq) && image.seq >= 0) {
+      if (this.#lastSequence !== null && image.seq > this.#lastSequence) {
+        sequenceDelta = image.seq - this.#lastSequence;
+      }
       if (this.#lastSequence !== null && image.seq > this.#lastSequence + 1) {
         this.#sequenceGaps += image.seq - this.#lastSequence - 1;
       }
@@ -156,8 +274,12 @@ export class GrpcCaptureDiagnosticsTracker {
       this.#lastSourceTimestampUs !== null &&
       image.timestampUs > this.#lastSourceTimestampUs
     ) {
-      this.#sourceTimestampIntervals.record(
-        Number(image.timestampUs - this.#lastSourceTimestampUs) / 1_000,
+      const elapsedMs =
+        Number(image.timestampUs - this.#lastSourceTimestampUs) / 1_000;
+      this.#recordCadenceInterval(
+        this.#sourceTimestampIntervals,
+        elapsedMs,
+        sequenceDelta,
       );
     }
     this.#lastSourceTimestampUs = image.timestampUs;
@@ -165,25 +287,85 @@ export class GrpcCaptureDiagnosticsTracker {
     this.#productionToReceiveLatency.record(
       Number(receivedAtUs - image.timestampUs) / 1_000,
     );
+    const usableAtUs = BigInt(Math.round(usableAtMs * 1_000));
+    this.#productionToUsableLatency.record(
+      Number(usableAtUs - image.timestampUs) / 1_000,
+    );
   }
 
-  recordEncoderWrite(repeat: boolean, accepted: boolean): void {
+  recordImageDecode(event: GrpcImageDecodeEvent): void {
+    this.#protobufDecodeTime.record(event.decodeMs);
+  }
+
+  recordMmapRead(read: StableMmapRead): void {
+    this.#mmapFileBytesRead += read.bytesRead;
+    this.#mmapReadRetries += Math.max(0, read.attempts - 1);
+    if (!read.image) this.#mmapTornFramesDropped++;
+    this.#sharedReadCopyTime.record(read.readMs);
+  }
+
+  recordEncoderWrite(
+    repeat: boolean,
+    accepted: boolean,
+    imagePayloadBytes: number,
+    observedAtMs = performance.now(),
+  ): void {
+    this.#imagePayloadBytes = imagePayloadBytes;
     if (repeat) this.#repeatEncoderWriteAttempts++;
     else this.#freshEncoderWriteAttempts++;
     if (accepted) this.#acceptedEncoderWrites++;
     else this.#encoderBackpressureRejections++;
+    if (!repeat && accepted) {
+      if (
+        this.#lastFreshEncoderWriteAtMs !== null &&
+        observedAtMs > this.#lastFreshEncoderWriteAtMs
+      ) {
+        this.#recordCadenceInterval(
+          this.#freshEncoderWriteIntervals,
+          observedAtMs - this.#lastFreshEncoderWriteAtMs,
+        );
+      }
+      this.#lastFreshEncoderWriteAtMs = observedAtMs;
+    }
+  }
+
+  #recordCadenceInterval(
+    window: RollingTimingWindow,
+    elapsedMs: number,
+    weight = 1,
+  ): void {
+    const intervalPerFrameMs = elapsedMs / weight;
+    if (intervalPerFrameMs > this.#cadenceIdleResetMs) {
+      window.reset();
+      return;
+    }
+    window.record(intervalPerFrameMs, weight);
   }
 
   snapshot(): GrpcCaptureDiagnostics {
     return {
+      imageMode: this.#imageMode,
       rawGrpcMessagesReceived: this.#rawGrpcMessagesReceived,
       rawGrpcMessagesEmitted: this.#rawGrpcMessagesEmitted,
       rawGrpcMessagesCoalesced: this.#rawGrpcMessagesCoalesced,
       usableImages: this.#usableImages,
+      sourceTimestampFps: this.#sourceTimestampIntervals.ratePerSecond(),
+      rawMessageReceiveFps: this.#rawMessageReceiveIntervals.ratePerSecond(),
+      usableImageFps: this.#usableImageIntervals.ratePerSecond(),
+      freshEncoderWriteFps: this.#freshEncoderWriteIntervals.ratePerSecond(),
       sequenceGaps: this.#sequenceGaps,
+      imagePayloadBytes: this.#imagePayloadBytes,
+      transportBytes: this.#transportBytes,
+      grpcMessageBytesReceived: this.#grpcMessageBytesReceived,
+      mmapFileBytesRead: this.#mmapFileBytesRead,
+      mmapReadRetries: this.#mmapReadRetries,
+      mmapTornFramesDropped: this.#mmapTornFramesDropped,
       sourceTimestampIntervalMs: this.#sourceTimestampIntervals.summary(),
-      productionToReceiveLatencyMs:
-        this.#productionToReceiveLatency.summary(),
+      rawMessageReceiveIntervalMs: this.#rawMessageReceiveIntervals.summary(),
+      productionToReceiveLatencyMs: this.#productionToReceiveLatency.summary(),
+      productionToUsableLatencyMs: this.#productionToUsableLatency.summary(),
+      protobufDecodeTimeMs: this.#protobufDecodeTime.summary(),
+      sharedReadCopyTimeMs: this.#sharedReadCopyTime.summary(),
       freshEncoderWriteAttempts: this.#freshEncoderWriteAttempts,
       repeatEncoderWriteAttempts: this.#repeatEncoderWriteAttempts,
       acceptedEncoderWrites: this.#acceptedEncoderWrites,
@@ -422,6 +604,192 @@ export function isUsableRgbFrame(image: EmuImage): boolean {
   );
 }
 
+export function readMmapImageNotification(
+  notification: EmuImage,
+  readFrame: (byteLength: number) => StableMmapRead,
+): { image: EmuImage | null; read: StableMmapRead | null } {
+  // AEMU uses a single metadata-only 0x0 image to signal that a display has
+  // become inactive. It is an idle marker, not a malformed MMAP frame.
+  if (
+    notification.width === 0 &&
+    notification.height === 0 &&
+    notification.image.length === 0
+  ) {
+    return { image: null, read: null };
+  }
+  if (
+    notification.format !== IMG_FORMAT_RGB888 ||
+    notification.width <= 0 ||
+    notification.height <= 0 ||
+    !Number.isSafeInteger(notification.width) ||
+    !Number.isSafeInteger(notification.height) ||
+    notification.image.length !== 0
+  ) {
+    throw new Error(
+      "emulator MMAP screenshot notification must contain RGB888 metadata and no in-band image bytes",
+    );
+  }
+  const read = readFrame(
+    rgb888MmapRegionBytes(notification.width, notification.height),
+  );
+  if (!read.image) return { image: null, read };
+  const image = { ...notification, image: read.image };
+  if (!isUsableRgbFrame(image)) {
+    throw new Error(
+      "emulator MMAP screenshot produced an invalid RGB888 frame",
+    );
+  }
+  return { image, read };
+}
+
+const PNG_SIGNATURE = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+]);
+
+export function isUsablePngFrame(image: EmuImage): boolean {
+  return (
+    image.format === IMG_FORMAT_PNG &&
+    image.width > 0 &&
+    image.height > 0 &&
+    Number.isSafeInteger(image.width) &&
+    Number.isSafeInteger(image.height) &&
+    image.image.length >= PNG_SIGNATURE.length &&
+    image.image.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
+  );
+}
+
+/** MMAP metadata must bypass the raw-message pacer so it can be decoded promptly. */
+export function grpcPredecodeMaxFps(
+  imageMode: GrpcImageMode,
+  maxFps: number,
+): number | undefined {
+  return imageMode === "mmap" ? undefined : maxFps;
+}
+
+export type GrpcMmapNotificationSchedulerClock = {
+  now(): number;
+  queueMicrotask(callback: () => void): void;
+};
+
+type PendingMmapNotification = {
+  image: EmuImage;
+  receivedAtMs: number;
+};
+
+const DEFAULT_MMAP_NOTIFICATION_CLOCK: GrpcMmapNotificationSchedulerClock = {
+  now: () => performance.now(),
+  queueMicrotask: (callback) => queueMicrotask(callback),
+};
+
+/**
+ * Rate-limit expensive MMAP snapshots after protobuf metadata is decoded.
+ *
+ * The shared region contains only its newest generation, so delaying protobuf
+ * decode would pair stale metadata with newer pixels. Instead, one synchronous
+ * decode turn is coalesced in a microtask and retains only its newest decoded
+ * metadata. The callback must copy the shared region before returning.
+ * Notifications received while the pacing slot is closed are dropped instead
+ * of retained for a trailing snapshot: the emulator owns and continuously
+ * reuses the shared region, so delayed metadata cannot safely be associated
+ * with the pixels that will be present later.
+ */
+export class GrpcMmapNotificationScheduler {
+  readonly #frameIntervalMs: number;
+  readonly #consume: (image: EmuImage, receivedAtMs: number) => void;
+  readonly #onPacingEvent: (
+    event: Extract<GrpcMessagePacingEvent, "emitted" | "coalesced">,
+  ) => void;
+  readonly #onError: (error: unknown) => void;
+  readonly #clock: GrpcMmapNotificationSchedulerClock;
+  readonly #signal: AbortSignal | undefined;
+  #nextEmitAtMs: number | null = null;
+  #pending: PendingMmapNotification | null = null;
+  #microtaskQueued = false;
+  #closed = false;
+
+  constructor(options: {
+    maxFps: number;
+    consume: (image: EmuImage, receivedAtMs: number) => void;
+    onPacingEvent?: (
+      event: Extract<GrpcMessagePacingEvent, "emitted" | "coalesced">,
+    ) => void;
+    onError?: (error: unknown) => void;
+    signal?: AbortSignal;
+    clock?: GrpcMmapNotificationSchedulerClock;
+  }) {
+    if (!Number.isFinite(options.maxFps) || options.maxFps <= 0) {
+      throw new RangeError("MMAP notification maxFps must be positive");
+    }
+    this.#frameIntervalMs = 1_000 / options.maxFps;
+    this.#consume = options.consume;
+    this.#onPacingEvent = options.onPacingEvent ?? (() => {});
+    this.#onError = options.onError ?? (() => {});
+    this.#clock = options.clock ?? DEFAULT_MMAP_NOTIFICATION_CLOCK;
+    this.#signal = options.signal;
+    if (this.#signal?.aborted) this.#closed = true;
+    else this.#signal?.addEventListener("abort", this.#onAbort, { once: true });
+  }
+
+  push(image: EmuImage, receivedAtMs: number): void {
+    if (this.#closed) return;
+    const now = this.#clock.now();
+    if (this.#nextEmitAtMs !== null && now < this.#nextEmitAtMs) {
+      this.#onPacingEvent("coalesced");
+      return;
+    }
+    // Defer only to the end of this decode turn: one HTTP/2 data chunk can
+    // contain a backlog of notifications, and the shared region already
+    // contains the newest generation. A microtask remains prompt for the
+    // first frame while allowing that synchronous backlog to coalesce.
+    if (this.#pending) this.#onPacingEvent("coalesced");
+    this.#pending = { image, receivedAtMs };
+    this.#queuePromptFlush();
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#pending = null;
+    this.#microtaskQueued = false;
+    this.#signal?.removeEventListener("abort", this.#onAbort);
+  }
+
+  readonly #onAbort = () => this.close();
+
+  #queuePromptFlush(): void {
+    if (this.#microtaskQueued) return;
+    this.#microtaskQueued = true;
+    this.#clock.queueMicrotask(() => {
+      this.#microtaskQueued = false;
+      if (this.#closed || !this.#pending) return;
+      const now = this.#clock.now();
+      if (this.#nextEmitAtMs !== null && now < this.#nextEmitAtMs) {
+        this.#pending = null;
+        this.#onPacingEvent("coalesced");
+        return;
+      }
+      const pending = this.#pending;
+      this.#pending = null;
+      this.#emit(pending, now);
+    });
+  }
+
+  #emit(notification: PendingMmapNotification, now: number): void {
+    if (this.#closed) return;
+    this.#nextEmitAtMs = now + this.#frameIntervalMs;
+    try {
+      this.#onPacingEvent("emitted");
+      // Intentionally synchronous: this is the ownership boundary where the
+      // reused MMAP pixels become a client-owned snapshot.
+      this.#consume(notification.image, notification.receivedAtMs);
+    } catch (error) {
+      this.close();
+      this.#onError(error);
+      return;
+    }
+  }
+}
+
 export type GrpcDisplayGeometry = {
   encodedSize: { width: number; height: number };
   touchSize: { width: number; height: number };
@@ -514,7 +882,7 @@ export class GrpcAccessUnitBoundaryCadence {
             observedInterval === null &&
             this.#slowIntervalCandidate !== null &&
             Math.max(interval, this.#slowIntervalCandidate) /
-                Math.min(interval, this.#slowIntervalCandidate) <=
+              Math.min(interval, this.#slowIntervalCandidate) <=
               ACCESS_UNIT_SLOW_CADENCE_SIMILARITY
           ) {
             this.#pushInterval(this.#slowIntervalCandidate);
@@ -586,7 +954,8 @@ export class GrpcInputState {
   sendTouch(points: TouchPoint[], signal: AbortSignal): Promise<void> {
     return this.#enqueue(async () => {
       for (const point of points) {
-        if (point.pressure > 0) this.#activeTouches.set(point.identifier, point);
+        if (point.pressure > 0)
+          this.#activeTouches.set(point.identifier, point);
       }
       await this.#client.sendTouch(points, signal);
       for (const point of points) {
@@ -706,7 +1075,7 @@ export class GrpcNativeTouchGeometryMonitor {
   readonly #readDisplaySizeSignal: (signal: AbortSignal) => Promise<string>;
   readonly #readNativeImage: (
     signal: AbortSignal,
-  ) => Promise<{ width: number; height: number }>;
+  ) => Promise<{ width: number; height: number; rotation?: number }>;
   readonly #onNativeSize: (size: { width: number; height: number }) => void;
   #displaySizeSignal: string | null;
   #pollTask: Promise<void> | null = null;
@@ -718,7 +1087,7 @@ export class GrpcNativeTouchGeometryMonitor {
     readDisplaySizeSignal: (signal: AbortSignal) => Promise<string>;
     readNativeImage: (
       signal: AbortSignal,
-    ) => Promise<{ width: number; height: number }>;
+    ) => Promise<{ width: number; height: number; rotation?: number }>;
     onNativeSize: (size: { width: number; height: number }) => void;
   }) {
     this.#displaySizeSignal = options.initialDisplaySizeSignal;
@@ -802,7 +1171,11 @@ export type GrpcSessionClient = {
     signal: AbortSignal,
     options?: {
       maxFps?: number;
-      onPacingEvent?: (event: GrpcMessagePacingEvent) => void;
+      onPacingEvent?: (
+        event: GrpcMessagePacingEvent,
+        detail: GrpcMessagePacingDetail,
+      ) => void;
+      onDecode?: (event: GrpcImageDecodeEvent) => void;
     },
   ): Promise<void>;
   sendTouch(points: TouchPoint[], signal?: AbortSignal): Promise<void>;
@@ -898,11 +1271,7 @@ export class GrpcVideoPacketQueue {
     if (packet.type === "frame" && packet.isConfig) {
       this.#latestConfig = packet;
     }
-    if (
-      packet.type === "frame" &&
-      packet.isKey &&
-      this.#latestConfig
-    ) {
+    if (packet.type === "frame" && packet.isKey && this.#latestConfig) {
       this.#configByKeyFrame.set(packet, this.#latestConfig);
     }
 
@@ -931,11 +1300,7 @@ export class GrpcVideoPacketQueue {
 
     const session = lastSessionPacket(this.#packets, keyIndex);
     const suffix = this.#packets.slice(keyIndex);
-    const retained = [
-      ...(session ? [session] : []),
-      keyFrameConfig,
-      ...suffix,
-    ];
+    const retained = [...(session ? [session] : []), keyFrameConfig, ...suffix];
     const retainedBytes = retained.reduce(
       (total, queued) => total + queuedPacketBytes(queued),
       0,
@@ -1003,7 +1368,9 @@ type ClosableEncoder = {
 
 /** Serializes encoder replacement and folds a burst into one fresh process. */
 export class GrpcEncoderLifecycle<T extends ClosableEncoder> {
-  readonly #create: (restart: GrpcEncoderRestart) => T | null | Promise<T | null>;
+  readonly #create: (
+    restart: GrpcEncoderRestart,
+  ) => T | null | Promise<T | null>;
   #current: T | null = null;
   #pending: GrpcEncoderRestart | null = null;
   #drainTask: Promise<T | null> | null = null;
@@ -1083,16 +1450,12 @@ export class GrpcEncoderLifecycle<T extends ClosableEncoder> {
 const defaultReadDisplaySizeSignal: NonNullable<
   GrpcSessionDependencies["readDisplaySizeSignal"]
 > = async (serial, signal) => {
-  const result = await execText(
-    "adb",
-    ["-s", serial, "shell", "wm", "size"],
-    {
-      timeout: 5_000,
-      maxBuffer: MAX_DISPLAY_SIZE_OUTPUT_BYTES + 1,
-      signal,
-      lane: "background",
-    },
-  );
+  const result = await execText("adb", ["-s", serial, "shell", "wm", "size"], {
+    timeout: 5_000,
+    maxBuffer: MAX_DISPLAY_SIZE_OUTPUT_BYTES + 1,
+    signal,
+    lane: "background",
+  });
   if (result.status !== 0 || result.error) {
     throw commandFailure("could not read emulator display size", result);
   }
@@ -1144,10 +1507,11 @@ function nonNegativeInteger(
  * packet contract as scrcpy.
  */
 export async function startGrpcSession(
-  options: StartOpts,
+  options: StartEmuSessionOptions,
   dependencies: GrpcSessionDependencies = {},
 ): Promise<EmuSession> {
   const serial = options.serial;
+  const imageMode = options.grpcImageMode;
   const runtime: GrpcSessionRuntime = {
     ...DEFAULT_GRPC_SESSION_RUNTIME,
     ...dependencies.runtime,
@@ -1188,7 +1552,7 @@ export async function startGrpcSession(
   const accessUnitBoundaryCadence = new GrpcAccessUnitBoundaryCadence(
     frameIntervalMs,
   );
-  const captureDiagnostics = new GrpcCaptureDiagnosticsTracker();
+  const captureDiagnostics = new GrpcCaptureDiagnosticsTracker(imageMode);
 
   if (!isEmulatorSerial(serial)) {
     throw new Error(
@@ -1220,6 +1584,9 @@ export async function startGrpcSession(
   let closed = false;
   let closeTask: Promise<void> | null = null;
   let encoderLifecycle: GrpcEncoderLifecycle<GrpcSessionEncoder> | null = null;
+  let encoderHasOutput = false;
+  let mmapRegion: GrpcMmapScreenshotRegion | null = null;
+  let mmapNotificationScheduler: GrpcMmapNotificationScheduler | null = null;
   let latest: EmuImage | null = null;
   let lastWriteAt = 0;
   let writeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1284,32 +1651,45 @@ export async function startGrpcSession(
     const now = performance.now();
     const accepted = encoder.write(latest.image, nowUs());
     frameWritePacer.recordWrite(now, repeat, accepted);
-    captureDiagnostics.recordEncoderWrite(repeat, accepted);
+    captureDiagnostics.recordEncoderWrite(
+      repeat,
+      accepted,
+      latest.image.length,
+      now,
+    );
     if (accepted) lastWriteAt = Date.now();
     if (repeat) {
       if (flushTimer) clearTimeout(flushTimer);
       flushTimer = null;
-      if (!accepted) {
-        flushTimer = setTimeout(() => {
-          flushTimer = null;
-          writeFrame(true);
-        }, Math.min(ENCODER_WRITE_RETRY_DELAY_MS, frameIntervalMs));
+      if (!accepted || (imageMode === "png" && !encoderHasOutput)) {
+        flushTimer = setTimeout(
+          () => {
+            flushTimer = null;
+            writeFrame(true);
+          },
+          accepted
+            ? accessUnitBoundaryCadence.boundaryDelayMs()
+            : Math.min(ENCODER_WRITE_RETRY_DELAY_MS, frameIntervalMs),
+        );
         flushTimer.unref?.();
       }
       return;
     }
-    if (!repeat && accepted) {
+    if (accepted) {
       if (flushTimer) clearTimeout(flushTimer);
       flushTimer = setTimeout(() => {
         flushTimer = null;
         writeFrame(true);
       }, accessUnitBoundaryCadence.boundaryDelayMs());
       flushTimer.unref?.();
-    } else if (!repeat && !writeTimer) {
-      writeTimer = setTimeout(() => {
-        writeTimer = null;
-        scheduleWrite();
-      }, Math.min(ENCODER_WRITE_RETRY_DELAY_MS, frameIntervalMs));
+    } else if (!writeTimer) {
+      writeTimer = setTimeout(
+        () => {
+          writeTimer = null;
+          scheduleWrite();
+        },
+        Math.min(ENCODER_WRITE_RETRY_DELAY_MS, frameIntervalMs),
+      );
       writeTimer.unref?.();
     }
   };
@@ -1344,6 +1724,7 @@ export async function startGrpcSession(
       return null;
     }
     frameWritePacer.reset(performance.now());
+    encoderHasOutput = false;
     if (sessionMeta) {
       sessionMeta.width = size.width;
       sessionMeta.height = size.height;
@@ -1355,7 +1736,11 @@ export async function startGrpcSession(
       fps: maxFps,
       bitRate,
       keyFrameInterval,
-      onFrame: (frame: VideoFrame) => pushPacket(frame),
+      inputFormat: imageMode === "png" ? "png" : "rgb24",
+      onFrame: (frame: VideoFrame) => {
+        if (!frame.isConfig) encoderHasOutput = true;
+        pushPacket(frame);
+      },
       onExit: (message) => emitFatal({ message, code: "encoder-exit" }),
     });
     if (restart.announceSize) {
@@ -1385,7 +1770,7 @@ export async function startGrpcSession(
       emitFatal({
         message: `could not recover the H.264 packet queue: ${error instanceof Error ? error.message : String(error)}`,
         code: "encoder-exit",
-      })
+      }),
     );
   };
 
@@ -1393,13 +1778,15 @@ export async function startGrpcSession(
     if (!nativeTouchGeometryMonitor || closed || lifetime.signal.aborted) {
       return Promise.resolve();
     }
-    return nativeTouchGeometryMonitor.poll(lifetime.signal, force).catch((error) => {
-      if (!closed && !lifetime.signal.aborted) {
-        console.warn(
-          `serve-emu could not refresh native touch geometry: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    });
+    return nativeTouchGeometryMonitor
+      .poll(lifetime.signal, force)
+      .catch((error) => {
+        if (!closed && !lifetime.signal.aborted) {
+          console.warn(
+            `serve-emu could not refresh native touch geometry: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      });
   };
 
   const scheduleDisplaySizePoll = () => {
@@ -1419,12 +1806,26 @@ export async function startGrpcSession(
   };
 
   const onImage = (
-    image: EmuImage,
+    notification: EmuImage,
     source: GrpcScreenshotImageSource = "stream",
     receivedAtMs = Date.now(),
   ) => {
-    if (closed || !isUsableRgbFrame(image)) return;
-    captureDiagnostics.recordUsableImage(image, receivedAtMs);
+    if (closed) return;
+    let image = notification;
+    if (imageMode === "mmap") {
+      const result = readMmapImageNotification(notification, (byteLength) => {
+        if (!mmapRegion) {
+          throw new Error("emulator MMAP screenshot region is unavailable");
+        }
+        return mmapRegion.readFrame(byteLength);
+      });
+      if (result.read) captureDiagnostics.recordMmapRead(result.read);
+      if (!result.image) return;
+      image = result.image;
+    } else if (!isUsablePngFrame(notification)) {
+      return;
+    }
+    captureDiagnostics.recordUsableImage(image, receivedAtMs, Date.now());
     if (source === "stream") {
       accessUnitBoundaryCadence.recordFreshImage(performance.now());
     }
@@ -1432,8 +1833,7 @@ export async function startGrpcSession(
     const geometryChanged =
       encoder !== null &&
       encoder !== undefined &&
-      (image.width !== encoder.width ||
-        image.height !== encoder.height);
+      (image.width !== encoder.width || image.height !== encoder.height);
     const imageIsLandscape = image.width > image.height;
     const nativeIsLandscape = nativeTouchSize.width > nativeTouchSize.height;
     if (imageIsLandscape !== nativeIsLandscape) {
@@ -1455,7 +1855,7 @@ export async function startGrpcSession(
         emitFatal({
           message: `could not restart H.264 encoder: ${error instanceof Error ? error.message : String(error)}`,
           code: "encoder-exit",
-        })
+        }),
       );
       return;
     }
@@ -1494,11 +1894,7 @@ export async function startGrpcSession(
       signal,
     );
   };
-  const tapTouch = async (
-    x: number,
-    y: number,
-    signal: AbortSignal,
-  ) => {
+  const tapTouch = async (x: number, y: number, signal: AbortSignal) => {
     await touch(x, y, TOUCH_PRESSURE, 0, signal);
     await runtime.sleep(20, signal);
     await touch(x, y, 0, 0, signal);
@@ -1627,6 +2023,8 @@ export async function startGrpcSession(
     closed = true;
     options.signal?.removeEventListener("abort", abortFromParent);
     lifetime.abort(new Error("gRPC screenshot session closed"));
+    mmapNotificationScheduler?.close();
+    mmapNotificationScheduler = null;
     clearWriteTimers();
     if (idleTimer) clearInterval(idleTimer);
     idleTimer = null;
@@ -1638,8 +2036,16 @@ export async function startGrpcSession(
     listeners.clear();
     packetQueue.clear();
     wakeReaders();
-    void Promise.allSettled([inputRelease, encoderClose]).then(() => {
+    void Promise.allSettled([inputRelease, encoderClose]).then(async () => {
       client.close();
+      try {
+        await mmapRegion?.close();
+      } catch (error) {
+        console.warn(
+          `serve-emu could not remove the gRPC screenshot mmap region: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      mmapRegion = null;
       finishClose();
     });
     return closeTask;
@@ -1700,16 +2106,58 @@ export async function startGrpcSession(
     };
     nativeTouchGeometryMonitor = new GrpcNativeTouchGeometryMonitor({
       initialDisplaySizeSignal,
-      readDisplaySizeSignal: (signal) =>
-        readDisplaySizeSignal(serial, signal),
+      readDisplaySizeSignal: (signal) => readDisplaySizeSignal(serial, signal),
       readNativeImage: (signal) =>
         client.getScreenshot({ format: IMG_FORMAT_PNG }, signal),
       onNativeSize: (size) => {
         nativeTouchSize = size;
       },
     });
+    let streamFormat: ImageFormatRequest;
+    if (imageMode === "mmap") {
+      const captureExtent =
+        maxSize > 0 ? maxSize : Math.max(probe.width, probe.height);
+      // A reusable MMAP file must be sized before streamScreenshot starts, so
+      // native-size mode resolves zero once from the startup probe. The square
+      // extent handles rotation, but a later display growth beyond this native
+      // startup cap requires restarting the capture session; it never falls
+      // back to PNG or silently reads past the client-owned region.
+      mmapRegion = GrpcMmapScreenshotRegion.create(
+        rgb888MmapRegionBytes(captureExtent, captureExtent),
+      );
+      streamFormat = {
+        format: IMG_FORMAT_RGB888,
+        width: captureExtent,
+        height: captureExtent,
+        transport: {
+          channel: IMAGE_TRANSPORT_MMAP,
+          handle: mmapRegion.handle,
+        },
+      };
+    } else {
+      streamFormat = {
+        format: IMG_FORMAT_PNG,
+        width: maxSize,
+        height: maxSize,
+      };
+    }
     const existingFailure = getFatalFailure();
     if (existingFailure) throw new Error(existingFailure.message);
+
+    if (imageMode === "mmap") {
+      mmapNotificationScheduler = new GrpcMmapNotificationScheduler({
+        maxFps,
+        signal: lifetime.signal,
+        consume: (image, receivedAtMs) =>
+          onImage(image, "stream", receivedAtMs),
+        onPacingEvent: (event) => captureDiagnostics.recordGrpcMessage(event),
+        onError: (error) =>
+          emitFatal({
+            message: `emulator MMAP screenshot failed: ${error instanceof Error ? error.message : String(error)}`,
+            code: "grpc-stream-error",
+          }),
+      });
+    }
 
     let firstFrameTimer: ReturnType<typeof setTimeout> | null = null;
     let firstFrameAbort: (() => void) | null = null;
@@ -1731,7 +2179,9 @@ export async function startGrpcSession(
           undefined,
           abortReason(lifetime.signal, "first emulator frame aborted"),
         );
-      lifetime.signal.addEventListener("abort", firstFrameAbort, { once: true });
+      lifetime.signal.addEventListener("abort", firstFrameAbort, {
+        once: true,
+      });
       firstFrameTimer = setTimeout(
         () =>
           finish(
@@ -1744,17 +2194,25 @@ export async function startGrpcSession(
     });
     void client
       .streamScreenshot(
-        {
-          format: IMG_FORMAT_RGB888,
-          width: maxSize,
-          height: maxSize,
+        streamFormat,
+        (image, source, receivedAtMs) => {
+          if (mmapNotificationScheduler && source === "stream") {
+            mmapNotificationScheduler.push(image, receivedAtMs);
+          } else {
+            onImage(image, source, receivedAtMs);
+          }
         },
-        onImage,
         lifetime.signal,
         {
-          maxFps,
-          onPacingEvent: (event) =>
-            captureDiagnostics.recordGrpcMessage(event),
+          maxFps: grpcPredecodeMaxFps(imageMode, maxFps),
+          onPacingEvent: (event, detail) => {
+            // The MMAP stream decodes every lightweight notification, then the
+            // post-decode scheduler records selected/coalesced snapshots. PNG
+            // keeps the existing raw-message pacer accounting.
+            if (imageMode === "mmap" && event !== "received") return;
+            captureDiagnostics.recordGrpcMessage(event, detail);
+          },
+          onDecode: (event) => captureDiagnostics.recordImageDecode(event),
         },
       )
       .then(
@@ -1779,15 +2237,18 @@ export async function startGrpcSession(
     latest = first;
     await restartEncoder(false, false);
     await startupGate.wait(lifetime.signal, FIRST_FRAME_TIMEOUT_MS);
-    idleTimer = setInterval(() => {
-      if (
-        !closed &&
-        encoderLifecycle?.current &&
-        Date.now() - lastWriteAt >= repeatFrameMs
-      ) {
-        writeFrame(true);
-      }
-    }, Math.max(16, Math.min(250, repeatFrameMs / 2)));
+    idleTimer = setInterval(
+      () => {
+        if (
+          !closed &&
+          encoderLifecycle?.current &&
+          Date.now() - lastWriteAt >= repeatFrameMs
+        ) {
+          writeFrame(true);
+        }
+      },
+      Math.max(16, Math.min(250, repeatFrameMs / 2)),
+    );
     scheduleDisplaySizePoll();
 
     const size = currentGeometry(first)!.encodedSize;

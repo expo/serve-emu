@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   createFfmpegAvailabilityProbe,
   FfmpegStderrTail,
+  ffmpegInputArgs,
   H264Encoder,
   H264OutputParser,
   resolveFfmpeg,
@@ -40,13 +41,13 @@ function execResult(
 }
 
 function hasFfmpegWithLibx264(): boolean {
-  const result = spawnSync(
-    resolveFfmpeg(),
-    ["-hide_banner", "-encoders"],
-    { encoding: "utf8" },
+  const result = spawnSync(resolveFfmpeg(), ["-hide_banner", "-encoders"], {
+    encoding: "utf8",
+  });
+  return (
+    result.status === 0 &&
+    /\blibx264\b/.test(`${result.stdout ?? ""}\n${result.stderr ?? ""}`)
   );
-  return result.status === 0 &&
-    /\blibx264\b/.test(`${result.stdout ?? ""}\n${result.stderr ?? ""}`);
 }
 
 const realFfmpegTest = hasFfmpegWithLibx264() ? test : test.skip;
@@ -69,7 +70,10 @@ function pushInUnevenChunks(parser: H264OutputParser, stream: Buffer): void {
   let offset = 0;
   let index = 0;
   while (offset < stream.length) {
-    const end = Math.min(stream.length, offset + widths[index % widths.length]!);
+    const end = Math.min(
+      stream.length,
+      offset + widths[index % widths.length]!,
+    );
     parser.push(stream.subarray(offset, end));
     offset = end;
     index++;
@@ -79,7 +83,10 @@ function pushInUnevenChunks(parser: H264OutputParser, stream: Buffer): void {
 describe("H264OutputParser", () => {
   test("emits current VideoFrame objects across split and mixed Annex-B start codes", () => {
     const frames: VideoFrame[] = [];
-    const parser = new H264OutputParser({ fps: 60, onFrame: (frame) => frames.push(frame) });
+    const parser = new H264OutputParser({
+      fps: 60,
+      onFrame: (frame) => frames.push(frame),
+    });
     parser.enqueuePts(10_000n);
     parser.enqueuePts(20_000n);
 
@@ -114,7 +121,9 @@ describe("H264OutputParser", () => {
       isKey: false,
     });
     expect(frames[0]!.data.subarray(0, 4)).toEqual(Buffer.from([0, 0, 0, 1]));
-    expect(frames[1]!.data.subarray(0, 5)).toEqual(Buffer.from([0, 0, 0, 1, 0x65]));
+    expect(frames[1]!.data.subarray(0, 5)).toEqual(
+      Buffer.from([0, 0, 0, 1, 0x65]),
+    );
   });
 
   test("does not duplicate a NAL when a chunk ends inside its four-byte start code", () => {
@@ -125,11 +134,7 @@ describe("H264OutputParser", () => {
     });
     parser.enqueuePts(1n);
 
-    const stream = Buffer.concat([
-      aud(),
-      nal(0x65, [0x01, 0x02]),
-      aud(),
-    ]);
+    const stream = Buffer.concat([aud(), nal(0x65, [0x01, 0x02]), aud()]);
     // Nine bytes lands immediately after the IDR start code, forcing the
     // overlap scan to encounter its embedded three-byte start code.
     parser.push(stream.subarray(0, 9));
@@ -142,7 +147,10 @@ describe("H264OutputParser", () => {
 
   test("holds the final access unit until the following AUD and de-duplicates config", () => {
     const frames: VideoFrame[] = [];
-    const parser = new H264OutputParser({ fps: 30, onFrame: (frame) => frames.push(frame) });
+    const parser = new H264OutputParser({
+      fps: 30,
+      onFrame: (frame) => frames.push(frame),
+    });
     parser.enqueuePts(1n);
     parser.enqueuePts(2n);
 
@@ -151,26 +159,31 @@ describe("H264OutputParser", () => {
       nal(0x68, [0xce, 0x06]),
       nal(0x65, [0x01]),
     ];
-    parser.push(Buffer.concat([aud(), ...configAndIdr, aud(), ...configAndIdr]));
+    parser.push(
+      Buffer.concat([aud(), ...configAndIdr, aud(), ...configAndIdr]),
+    );
     expect(frames).toHaveLength(2);
     expect(frames.map((frame) => frame.isConfig)).toEqual([true, false]);
 
     parser.push(aud());
     expect(frames).toHaveLength(3);
     expect(frames.filter((frame) => frame.isConfig)).toHaveLength(1);
-    expect(frames.at(-1)).toMatchObject({ pts: 2n, isKey: true, type: "frame" });
+    expect(frames.at(-1)).toMatchObject({
+      pts: 2n,
+      isKey: true,
+      type: "frame",
+    });
   });
 
   test("uses the configured frame duration when ffmpeg produces an unmatched access unit", () => {
     const frames: VideoFrame[] = [];
-    const parser = new H264OutputParser({ fps: 60, onFrame: (frame) => frames.push(frame) });
-    parser.push(Buffer.concat([
-      aud(),
-      nal(0x41, [1]),
-      aud(),
-      nal(0x41, [2]),
-      aud(),
-    ]));
+    const parser = new H264OutputParser({
+      fps: 60,
+      onFrame: (frame) => frames.push(frame),
+    });
+    parser.push(
+      Buffer.concat([aud(), nal(0x41, [1]), aud(), nal(0x41, [2]), aud()]),
+    );
 
     expect(frames.map((frame) => frame.pts)).toEqual([16_667n, 33_334n]);
   });
@@ -335,104 +348,218 @@ describe("H264Encoder validation", () => {
     expect(videoFilter(3)).toBe(`${crop},transpose=clock`);
   });
 
-  realFfmpegTest("applies Android quarter-turn direction to encoded pixels", async () => {
-    // Keep both encoded dimensions at least one H.264 macroblock so this
-    // real-ffmpeg test behaves consistently across libx264 builds.
-    const width = 16;
-    const height = 32;
-    const rgb = Buffer.alloc(width * height * 3);
-    const colors = [
-      [255, 0, 0],
-      [0, 255, 0],
-      [0, 0, 255],
-      [255, 255, 255],
-    ];
-    for (let y = 0; y < height; y++) {
-      const color = colors[Math.floor(y / (height / colors.length))]!;
-      for (let x = 0; x < width; x++) {
-        const offset = (y * width + x) * 3;
-        rgb[offset] = color[0]!;
-        rgb[offset + 1] = color[1]!;
-        rgb[offset + 2] = color[2]!;
-      }
-    }
+  test("selects fixed rawvideo or framed PNG input without changing output timing", () => {
+    expect(ffmpegInputArgs("rgb24", 360, 640, 30)).toEqual([
+      "-f",
+      "rawvideo",
+      "-pix_fmt",
+      "rgb24",
+      "-video_size",
+      "360x640",
+      "-framerate",
+      "30",
+      "-i",
+      "pipe:0",
+    ]);
+    expect(ffmpegInputArgs("png", 360, 640, 30)).toEqual([
+      "-probesize",
+      "32",
+      "-analyzeduration",
+      "0",
+      "-max_probe_packets",
+      "1",
+      "-f",
+      "image2pipe",
+      "-framerate",
+      "30",
+      "-c:v",
+      "png",
+      "-i",
+      "pipe:0",
+    ]);
+  });
 
-    let config: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-    let keyFrame: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-    let resolveKeyFrame!: () => void;
-    let rejectKeyFrame!: (reason?: unknown) => void;
-    const keyFrameReady = new Promise<void>((resolve, reject) => {
-      resolveKeyFrame = resolve;
-      rejectKeyFrame = reject;
-    });
+  test("validates PNG frame boundaries before writing to ffmpeg", async () => {
     const encoder = new H264Encoder({
       ...valid,
-      width,
-      height,
-      quarterTurn: 1,
-      onFrame(frame) {
-        if (frame.isConfig) config = frame.data;
-        else if (frame.isKey && keyFrame.length === 0) {
-          keyFrame = frame.data;
-          resolveKeyFrame();
-        }
-      },
-      onExit(reason) {
-        rejectKeyFrame(new Error(reason));
-      },
+      inputFormat: "png",
     });
-    encoder.write(rgb, 1n);
-    encoder.write(rgb, 2n);
-    await Promise.race([
-      keyFrameReady,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("timed out waiting for ffmpeg")), 2_000),
-      ),
-    ]);
-    await encoder.close();
-
-    const decoded = spawnSync(
-      resolveFfmpeg(),
-      [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "h264",
-        "-i",
-        "pipe:0",
-        "-frames:v",
-        "1",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "pipe:1",
-      ],
-      { input: Buffer.concat([config, keyFrame]) },
+    expect(() => encoder.write(Buffer.from("not a png"), 1n)).toThrow(
+      "complete PNG Buffer",
     );
-    expect(decoded.status).toBe(0);
-
-    const topRow = colors.map((_, index) => {
-      const x = index * (height / colors.length);
-      const offset = x * 3;
-      return [...decoded.stdout.subarray(offset, offset + 3)];
-    });
-    expect(topRow).toEqual([
-      expect.arrayContaining([expect.any(Number), 0, 0]),
-      expect.arrayContaining([0, expect.any(Number), 0]),
-      expect.arrayContaining([0, 0, expect.any(Number)]),
-      expect.arrayContaining([
-        expect.any(Number),
-        expect.any(Number),
-        expect.any(Number),
-      ]),
-    ]);
-    expect(topRow[0]![0]).toBeGreaterThan(200);
-    expect(topRow[1]![1]).toBeGreaterThan(200);
-    expect(topRow[2]![2]).toBeGreaterThan(200);
-    expect(Math.min(...topRow[3]!)).toBeGreaterThan(200);
+    await encoder.close();
   });
+
+  realFfmpegTest(
+    "accepts concatenated PNG images through image2pipe",
+    async () => {
+      const generated = spawnSync(
+        resolveFfmpeg(),
+        [
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-f",
+          "lavfi",
+          "-i",
+          "testsrc2=size=128x128",
+          "-frames:v",
+          "1",
+          "-c:v",
+          "png",
+          "-f",
+          "image2pipe",
+          "pipe:1",
+        ],
+        { encoding: null },
+      );
+      expect(generated.status).toBe(0);
+      const png = Buffer.from(generated.stdout);
+      const frames: VideoFrame[] = [];
+      let resolveKeyFrame!: () => void;
+      let rejectKeyFrame!: (error: Error) => void;
+      const keyFrame = new Promise<void>((resolve, reject) => {
+        resolveKeyFrame = resolve;
+        rejectKeyFrame = reject;
+      });
+      const encoder = new H264Encoder({
+        ...valid,
+        width: 128,
+        height: 128,
+        inputFormat: "png",
+        onFrame(frame) {
+          frames.push(frame);
+          if (frame.isKey) resolveKeyFrame();
+        },
+        onExit(reason) {
+          rejectKeyFrame(new Error(reason));
+        },
+      });
+
+      // Keep enough framed input in the pipe for libavformat's initial stream
+      // probe; real emulator PNGs are substantially larger than this fixture.
+      for (let index = 0; index < 20; index++) {
+        expect(encoder.write(png, BigInt(index + 1))).toBe(true);
+      }
+      await Promise.race([
+        keyFrame,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("timed out waiting for ffmpeg")),
+            2_000,
+          ),
+        ),
+      ]);
+      await encoder.close();
+      expect(frames.some((frame) => frame.isConfig)).toBe(true);
+      expect(frames.some((frame) => frame.isKey)).toBe(true);
+    },
+  );
+
+  realFfmpegTest(
+    "applies Android quarter-turn direction to encoded pixels",
+    async () => {
+      // Keep both encoded dimensions at least one H.264 macroblock so this
+      // real-ffmpeg test behaves consistently across libx264 builds.
+      const width = 16;
+      const height = 32;
+      const rgb = Buffer.alloc(width * height * 3);
+      const colors = [
+        [255, 0, 0],
+        [0, 255, 0],
+        [0, 0, 255],
+        [255, 255, 255],
+      ];
+      for (let y = 0; y < height; y++) {
+        const color = colors[Math.floor(y / (height / colors.length))]!;
+        for (let x = 0; x < width; x++) {
+          const offset = (y * width + x) * 3;
+          rgb[offset] = color[0]!;
+          rgb[offset + 1] = color[1]!;
+          rgb[offset + 2] = color[2]!;
+        }
+      }
+
+      let config: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+      let keyFrame: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+      let resolveKeyFrame!: () => void;
+      let rejectKeyFrame!: (reason?: unknown) => void;
+      const keyFrameReady = new Promise<void>((resolve, reject) => {
+        resolveKeyFrame = resolve;
+        rejectKeyFrame = reject;
+      });
+      const encoder = new H264Encoder({
+        ...valid,
+        width,
+        height,
+        quarterTurn: 1,
+        onFrame(frame) {
+          if (frame.isConfig) config = frame.data;
+          else if (frame.isKey && keyFrame.length === 0) {
+            keyFrame = frame.data;
+            resolveKeyFrame();
+          }
+        },
+        onExit(reason) {
+          rejectKeyFrame(new Error(reason));
+        },
+      });
+      encoder.write(rgb, 1n);
+      encoder.write(rgb, 2n);
+      await Promise.race([
+        keyFrameReady,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("timed out waiting for ffmpeg")),
+            2_000,
+          ),
+        ),
+      ]);
+      await encoder.close();
+
+      const decoded = spawnSync(
+        resolveFfmpeg(),
+        [
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-f",
+          "h264",
+          "-i",
+          "pipe:0",
+          "-frames:v",
+          "1",
+          "-f",
+          "rawvideo",
+          "-pix_fmt",
+          "rgb24",
+          "pipe:1",
+        ],
+        { input: Buffer.concat([config, keyFrame]) },
+      );
+      expect(decoded.status).toBe(0);
+
+      const topRow = colors.map((_, index) => {
+        const x = index * (height / colors.length);
+        const offset = x * 3;
+        return [...decoded.stdout.subarray(offset, offset + 3)];
+      });
+      expect(topRow).toEqual([
+        expect.arrayContaining([expect.any(Number), 0, 0]),
+        expect.arrayContaining([0, expect.any(Number), 0]),
+        expect.arrayContaining([0, 0, expect.any(Number)]),
+        expect.arrayContaining([
+          expect.any(Number),
+          expect.any(Number),
+          expect.any(Number),
+        ]),
+      ]);
+      expect(topRow[0]![0]).toBeGreaterThan(200);
+      expect(topRow[1]![1]).toBeGreaterThan(200);
+      expect(topRow[2]![2]).toBeGreaterThan(200);
+      expect(Math.min(...topRow[3]!)).toBeGreaterThan(200);
+    },
+  );
 });
 
 describe("ffmpeg diagnostics", () => {

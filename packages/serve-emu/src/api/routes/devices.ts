@@ -32,9 +32,11 @@ export function deviceRoutes(): ContractApiRoute<ApiDependencies>[] {
       path: "/api/stream-mode",
       handler: async ({ request, deps }) => {
         const payload = await readJsonBody(request);
-        const { mode } = parseInput(() => parseStreamModeRequest(payload));
+        const streamMode = parseInput(() => parseStreamModeRequest(payload));
         return Response.json(
-          await downstream("switch stream mode", () => deps.setStreamMode(mode)),
+          await downstream("switch stream mode", () =>
+            deps.setStreamMode(streamMode)
+          ),
         );
       },
     },
