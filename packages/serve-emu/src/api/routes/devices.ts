@@ -2,7 +2,10 @@ import type { ApiDependencies } from "../dependencies.ts";
 import type { ContractApiRoute } from "./types.ts";
 import { readJsonBody } from "../body.ts";
 import { isEmulatorSerial } from "../../device-capabilities.ts";
-import { parseStreamModeRequest } from "../../shared/api-contracts.ts";
+import {
+  parseFontScale,
+  parseStreamModeRequest,
+} from "../../shared/api-contracts.ts";
 import { parseStreamEncoderSettingsPatch } from "../../stream-settings.ts";
 import {
   downstream,
@@ -178,10 +181,7 @@ export function deviceRoutes(): ContractApiRoute<ApiDependencies>[] {
       path: "/api/font-scale",
       handler: async ({ request, deps }) => {
         const body = await readObject(request, "font scale payload");
-        const scale = Number(body.scale);
-        if (!Number.isFinite(scale) || scale < 0.7 || scale > 2) {
-          invalid("scale must be a number between 0.7 and 2.0");
-        }
+        const scale = parseInput(() => parseFontScale(body.scale));
         return Response.json({
           ok: true,
           fontScale: await downstream("set font scale", () =>

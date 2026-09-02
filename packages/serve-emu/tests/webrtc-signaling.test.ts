@@ -3,6 +3,7 @@ import {
   WebRtcSignalingError,
   parseWebRtcCloseRequest,
   parseWebRtcOffer,
+  parseWebRtcStatsSessionId,
 } from "../src/webrtc-signaling.ts";
 
 const SESSION_ID = "00000000-0000-4000-8000-000000000000";
@@ -52,6 +53,17 @@ describe("WebRTC signaling validation", () => {
       }),
     ).toThrow("Invalid WebRTC session ID");
     expect(parseWebRtcCloseRequest({ sessionId: SESSION_ID })).toEqual({ sessionId: SESSION_ID });
+  });
+
+  test("requires a valid stats session ID", () => {
+    expect(() => parseWebRtcStatsSessionId(null)).toThrow(
+      "WebRTC session ID is required",
+    );
+    expect(() => parseWebRtcStatsSessionId("")).toThrow(
+      "WebRTC session ID is required",
+    );
+    expect(parseWebRtcStatsSessionId(SESSION_ID)).toBe(SESSION_ID);
+    expect(() => parseWebRtcStatsSessionId("not-a-uuid")).toThrow(WebRtcSignalingError);
   });
 
   test("bounds the offer SDP size", () => {

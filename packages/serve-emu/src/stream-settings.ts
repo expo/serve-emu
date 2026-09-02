@@ -62,7 +62,7 @@ export function parseStreamEncoderSettingsPatch(
     (key) =>
       !STREAM_ENCODER_SETTING_KEYS.has(key as keyof StreamEncoderSettings),
   );
-  if (unknownKey) {
+  if (unknownKey !== undefined) {
     throw new InvalidStreamSettingsError(
       `unknown stream setting: ${unknownKey}`,
     );

@@ -293,6 +293,7 @@ describe("stream settings HTTP API", () => {
         { h264Bitrate: 99_999 },
         { h264Fps: 24.5 },
         { resolution: 720 },
+        { "": 1 },
       ]) {
         const response = await app.handleRequest(
           streamSettingsPatch(patch),
@@ -647,7 +648,7 @@ describe("stream settings HTTP API", () => {
 
     replacement.resolve(fakeSession({ width: 405, height: 720 }));
     expect((await patch).status).toBe(200);
-    app.stop();
+    await app.stop();
   });
 
   test("input already in flight is not acknowledged or recorded after capture changes", async () => {
@@ -708,7 +709,12 @@ describe("stream settings HTTP API", () => {
       streamSettingsPatch({ maxDimension: 720 }),
     );
     await replacementStarted.promise;
-    app.stop();
+    let stopSettled = false;
+    const stopping = app.stop().then(() => {
+      stopSettled = true;
+    });
+    await Promise.resolve();
+    expect(stopSettled).toBe(false);
     let closed = 0;
     const lateCapture = fakeSession({ width: 405, height: 720 });
     lateCapture.close = async () => {
@@ -717,6 +723,7 @@ describe("stream settings HTTP API", () => {
     replacement.resolve(lateCapture);
 
     const response = await patch;
+    await stopping;
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({
       ok: false,
@@ -744,6 +751,107 @@ describe("stream settings HTTP API", () => {
       error: "stream_settings_unavailable",
       message: "session is stopped",
     });
+  });
+
+  test("PATCH rejects a foreign browser origin without restarting capture", async () => {
+    let starts = 0;
+    const app = await createApp(
+      { serial: "emulator-test" },
+      {
+        startScrcpy: async () => {
+          starts++;
+          return fakeSession();
+        },
+      },
+    );
+
+    try {
+      const response = await app.handleRequest(
+        new Request("http://localhost/api/stream-settings", {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            Origin: "https://evil.example",
+          },
+          body: JSON.stringify({ maxDimension: 720 }),
+        }),
+      );
+
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({
+        ok: false,
+        error: "forbidden_origin",
+      });
+      expect(starts).toBe(1);
+    } finally {
+      await app.stop();
+    }
+  });
+
+  test("device control handlers preserve request body transport errors", async () => {
+    const app = await createApp(
+      { serial: "emulator-test" },
+      { startScrcpy: async () => fakeSession() },
+    );
+
+    try {
+      const oversized = await app.handleRequest(
+        new Request("http://localhost/api/font-scale", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scale: "x".repeat(9_000) }),
+        }),
+      );
+      expect(oversized.status).toBe(413);
+      expect(await oversized.json()).toEqual({
+        ok: false,
+        error: "payload-too-large",
+      });
+
+      const controller = new AbortController();
+      controller.abort(new Error("test abort"));
+      const aborted = await app.handleRequest(
+        new Request("http://localhost/api/network", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: true }),
+          signal: controller.signal,
+        }),
+      );
+      expect(aborted.status).toBe(499);
+      expect(await aborted.json()).toEqual({
+        ok: false,
+        error: "request-aborted",
+      });
+    } finally {
+      await app.stop();
+    }
+  });
+
+  test("font scale rejects values that require numeric coercion", async () => {
+    const app = await createApp(
+      { serial: "emulator-test" },
+      { startScrcpy: async () => fakeSession() },
+    );
+
+    try {
+      for (const scale of [true, "1.5", [1.2]]) {
+        const response = await app.handleRequest(
+          new Request("http://localhost/api/font-scale", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ scale }),
+          }),
+        );
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({
+          ok: false,
+          error: "scale must be a number between 0.7 and 2.0",
+        });
+      }
+    } finally {
+      await app.stop();
+    }
   });
 
   test("stopping during rollback closes a late rollback capture", async () => {

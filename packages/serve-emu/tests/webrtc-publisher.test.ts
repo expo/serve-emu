@@ -62,6 +62,26 @@ class FakePeerConnection {
   private iceStateCallback: ((state: string) => void) | null = null;
   private readonly answerDelayMs: number;
   readonly track = new FakeTrack();
+  selectedCandidatePair: {
+    local: {
+      address: string;
+      port: number;
+      type: string;
+      transportType: string;
+      candidate: string;
+      mid: string;
+      priority: number;
+    };
+    remote: {
+      address: string;
+      port: number;
+      type: string;
+      transportType: string;
+      candidate: string;
+      mid: string;
+      priority: number;
+    };
+  } | null = null;
 
   constructor(_label: string, config: { answerDelayMs?: number } = {}) {
     this.answerDelayMs = config.answerDelayMs ?? 0;
@@ -92,6 +112,9 @@ class FakePeerConnection {
   }
   localDescription(): { type: string; sdp: string } {
     return { type: "answer", sdp: ANSWER_SDP };
+  }
+  getSelectedCandidatePair() {
+    return this.selectedCandidatePair;
   }
   close(): void {}
   emitState(state: string): void {
@@ -488,6 +511,91 @@ describe("WebRTC publisher signaling", () => {
         null,
       ),
     ).toEqual({ accepted: true, awaitingKeyFrame: true });
+    publisher.close();
+  });
+
+  test("reports accepted H.264 payload and selected ICE path inputs for one session", async () => {
+    const connections: FakePeerConnection[] = [];
+    const ndc = {
+      ...fakeNodeDataChannel(),
+      PeerConnection: class extends FakePeerConnection {
+        constructor(label: string) {
+          super(label);
+          connections.push(this);
+        }
+      },
+    } as unknown as typeof nodeDataChannel;
+    const publisher = new WebRtcPublisher(ndc, {
+      settings: {
+        transport: "webrtc",
+        codec: "h264",
+        iceServers: [],
+        iceTransportPolicy: "all",
+      },
+      onKeyframeRequest() {},
+    });
+    const sessionId = "00000000-0000-4000-8000-000000000000";
+    await publisher.handleOffer({ type: "offer", sdp: OFFER_SDP, sessionId });
+    const connection = connections[0]!;
+    connection.emitState("connected");
+    connection.emitIceState("completed");
+    connection.selectedCandidatePair = {
+      local: {
+        address: "192.0.2.1",
+        port: 5000,
+        type: "host",
+        transportType: "udp",
+        candidate: "candidate:local",
+        mid: "video0",
+        priority: 1,
+      },
+      remote: {
+        address: "198.51.100.1",
+        port: 6000,
+        type: "relay",
+        transportType: "tcp",
+        candidate: "candidate:remote",
+        mid: "video0",
+        priority: 2,
+      },
+    };
+    connection.track.sendResults.push(true, true, false);
+    const frame = (data: number[], isKey: boolean) => ({
+      type: "frame" as const,
+      data: Buffer.from(data),
+      pts: 0n,
+      isConfig: false,
+      isKey,
+    });
+
+    publisher.sendFrame(frame([1, 2, 3], true), Buffer.from([9, 9]));
+    publisher.sendFrame(frame([4, 5], false), null);
+    publisher.sendFrame(frame([6], false), null);
+
+    expect(publisher.statsForSession(sessionId)).toEqual({
+      sessionId,
+      state: "connected",
+      iceState: "completed",
+      connected: true,
+      submittedFrames: 2,
+      publisherDroppedFrames: 1,
+      payloadBytesSubmitted: 7,
+      localCandidateType: "host",
+      remoteCandidateType: "relay",
+      localCandidateTransport: "udp",
+      remoteCandidateTransport: "tcp",
+      path: "relay",
+    });
+    expect(
+      publisher.statsForSession("11111111-1111-4111-8111-111111111111"),
+    ).toBeNull();
+
+    connection.selectedCandidatePair.local.type = "unknown";
+    connection.selectedCandidatePair.remote.type = "host";
+    expect(publisher.statsForSession(sessionId)?.path).toBe("unknown");
+
+    connection.selectedCandidatePair.local.type = "srflx";
+    expect(publisher.statsForSession(sessionId)?.path).toBe("direct");
     publisher.close();
   });
 

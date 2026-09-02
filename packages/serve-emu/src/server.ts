@@ -145,10 +145,15 @@ import {
 } from "./webrtc-publisher.ts";
 import {
   isStreamMode,
+  parseFontScale,
   parseStreamModeRequest,
   STREAM_MODES,
   type StreamMode,
 } from "./shared/api-contracts.ts";
+import {
+  handleWebRtcStatsRequest,
+  WebRtcStatsCollector,
+} from "./webrtc-stats.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -264,6 +269,7 @@ type WebRtcPublisherLike = Pick<
   | "closeSession"
   | "sendFrame"
   | "resetVideoSource"
+  | "statsForSession"
   | "snapshot"
   | "close"
 >;
@@ -575,6 +581,17 @@ export async function startServer(
     SessionRecoveryWatchdog<RecoveryClientState>
   >();
   const publishers = new WeakMap<DeviceContext, WebRtcPublisherLike>();
+  const webRtcStatsCollectors = new WeakMap<
+    DeviceContext,
+    WebRtcStatsCollector
+  >();
+  const webRtcStatsCollectorFor = (context: DeviceContext) => {
+    const existing = webRtcStatsCollectors.get(context);
+    if (existing) return existing;
+    const created = new WebRtcStatsCollector(() => recoveryClock.now());
+    webRtcStatsCollectors.set(context, created);
+    return created;
+  };
   const publisherTasks = new WeakMap<
     DeviceContext,
     Promise<WebRtcPublisherLike>
@@ -675,6 +692,30 @@ export async function startServer(
     lastErrorCode: context.lastErrorCode,
     lastErrorMeta: context.lastErrorMeta,
   };
+  };
+
+  const webRtcStats = (context: DeviceContext, sessionId: string) => {
+    const publisher = publishers.get(context);
+    if (
+      context.status !== "streaming" ||
+      streamSettings.transport !== "webrtc" ||
+      !publisher
+    ) {
+      return null;
+    }
+    const sourceFps = recoveries.get(context)?.snapshot(recoveryClock.now()).sourceFps ?? 0;
+    return webRtcStatsCollectorFor(context).report(
+      {
+        codec: context.stream.meta.codecId,
+        width: context.screen.width,
+        height: context.screen.height,
+        frames: context.frameCount,
+        fps: sourceFps,
+        configuredBitrateBps: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
+      },
+      publisher,
+      sessionId,
+    );
   };
 
   const deviceGrid = async (
@@ -1417,9 +1458,9 @@ export async function startServer(
           recoveries.get(context)?.recordFrame();
           context.frameStats.record(f.data.length, f.isKey);
           const config = f.isKey ? context.cachedConfig : null;
-          const webRtcDelivery = publishers
-            .get(context)
-            ?.sendFrame(f, config);
+          const publisher = publishers.get(context);
+          const webRtcDelivery = publisher?.sendFrame(f, config);
+          webRtcStatsCollectorFor(context).recordDelivery(webRtcDelivery);
           if (
             f.isKey &&
             webRtcDelivery?.accepted &&
@@ -1736,6 +1777,15 @@ export async function startServer(
     async fetch(req, srv) {
       const requestContext = sessions.current;
       const url = new URL(req.url);
+      const handleStatsRequest = () =>
+        handleWebRtcStatsRequest(
+          req,
+          {},
+          (sessionId, device) =>
+            device === null || device === requestContext.serial
+              ? webRtcStats(requestContext, sessionId)
+              : null,
+        );
 
       // Bootstrap: exchange a valid one-time URL token for an HttpOnly cookie,
       // then redirect to a clean URL so the secret never lingers in the address
@@ -1760,6 +1810,10 @@ export async function startServer(
             },
           });
         }
+      }
+
+      if (url.pathname === "/webrtc/stats" && req.method === "OPTIONS") {
+        return handleStatsRequest();
       }
 
       if (!tokenValid(req, url)) {
@@ -1791,6 +1845,10 @@ export async function startServer(
             },
           );
         }
+      }
+
+      if (url.pathname === "/webrtc/stats") {
+        return handleStatsRequest();
       }
 
       if (url.pathname === "/api") {
@@ -2259,10 +2317,9 @@ export async function startServer(
             ) {
               throw new Error("font scale payload must be an object");
             }
-            const scale = Number((payload as Record<string, unknown>).scale);
-            if (!Number.isFinite(scale) || scale < 0.7 || scale > 2) {
-              throw new Error("scale must be a number between 0.7 and 2.0");
-            }
+            const scale = parseFontScale(
+              (payload as Record<string, unknown>).scale,
+            );
             return Response.json({
               ok: true,
               fontScale: await runForContext(requestContext, (context) =>

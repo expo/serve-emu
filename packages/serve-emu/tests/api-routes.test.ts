@@ -504,6 +504,34 @@ describe("domain API failures", () => {
     );
   });
 
+  test("rejects non-numeric font scales before dependency work", async () => {
+    const router = createApiRouter(createApiRoutes());
+    for (const scale of [true, "1.5", [1.2]]) {
+      let invoked = false;
+      const response = await router.handle(
+        new Request(`${BASE_URL}/api/font-scale`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scale }),
+        }),
+        fakeDependencies({
+          setFontScale: async () => {
+            invoked = true;
+            throw new Error("must not run");
+          },
+        }),
+      );
+
+      await expectFailure(
+        response,
+        400,
+        "invalid_request",
+        "scale must be a number between 0.7 and 2.0",
+      );
+      expect(invoked).toBe(false);
+    }
+  });
+
   test("preserves domain conflicts as 409", async () => {
     const router = createApiRouter(createApiRoutes());
     const response = await router.handle(

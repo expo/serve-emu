@@ -30,6 +30,24 @@ export type WebRtcFrameDelivery = {
   awaitingKeyFrame: boolean;
 };
 
+export type WebRtcPublisherSessionStats = {
+  sessionId: string;
+  state: string;
+  iceState: string;
+  connected: boolean;
+  /** H.264 frames accepted by the native media track. */
+  submittedFrames: number;
+  /** Frames rejected while waiting for a keyframe or by native backpressure. */
+  publisherDroppedFrames: number;
+  /** H.264 payload bytes accepted by the native media track; excludes RTP transport overhead. */
+  payloadBytesSubmitted: number;
+  localCandidateType: string | null;
+  remoteCandidateType: string | null;
+  localCandidateTransport: string | null;
+  remoteCandidateTransport: string | null;
+  path: "direct" | "relay" | "unknown";
+};
+
 type H264Media = { payloadType: number; mid: string };
 
 const requireModule = createRequire(import.meta.url);
@@ -44,6 +62,17 @@ let nativeRepairPromise: Promise<void> | null = null;
 
 function randomSsrc(): number {
   return Math.floor(1 + Math.random() * 0x7ffffffe);
+}
+
+function icePathForCandidateTypes(
+  local: string | null,
+  remote: string | null,
+): WebRtcPublisherSessionStats["path"] {
+  if (local === null || remote === null) return "unknown";
+  const types = [local.toLowerCase(), remote.toLowerCase()];
+  if (types.includes("relay")) return "relay";
+  const directTypes = new Set(["host", "srflx", "prflx"]);
+  return types.every((type) => directTypes.has(type)) ? "direct" : "unknown";
 }
 
 function sdpEol(sdp: string): "\r\n" | "\n" {
@@ -375,6 +404,10 @@ export class WebRtcPublisher {
     for (const peer of this.peers.values()) peer.resetVideoSource();
   }
 
+  statsForSession(sessionId: string): WebRtcPublisherSessionStats | null {
+    return this.peers.get(sessionId)?.statsSnapshot() ?? null;
+  }
+
   snapshot() {
     return {
       peers: this.peers.size,
@@ -418,6 +451,7 @@ class WebRtcPeer {
   private awaitingKeyFrame = true;
   private sentFrames = 0;
   private droppedFrames = 0;
+  private payloadBytesSent = 0;
   private lastFrameMs = 0;
   private lastState = "new";
   private lastIceState = "new";
@@ -583,6 +617,7 @@ class WebRtcPeer {
     try {
       if (track.sendMessageBinary(payload)) {
         this.sentFrames++;
+        this.payloadBytesSent += payload.byteLength;
         this.lastFrameMs = Date.now();
         return true;
       } else {
@@ -631,6 +666,30 @@ class WebRtcPeer {
       awaitingKeyFrame: this.awaitingKeyFrame,
       lastFrameAt: this.lastFrameMs > 0 ? new Date(this.lastFrameMs).toISOString() : null,
       lastError: this.lastError,
+    };
+  }
+
+  statsSnapshot(): WebRtcPublisherSessionStats {
+    let selectedPair: ReturnType<PeerConnection["getSelectedCandidatePair"]> = null;
+    try {
+      selectedPair = this.pc.getSelectedCandidatePair();
+    } catch {}
+    const localCandidateType = selectedPair?.local.type ?? null;
+    const remoteCandidateType = selectedPair?.remote.type ?? null;
+    const path = icePathForCandidateTypes(localCandidateType, remoteCandidateType);
+    return {
+      sessionId: this.sessionId,
+      state: this.lastState,
+      iceState: this.lastIceState,
+      connected: this.connected,
+      submittedFrames: this.sentFrames,
+      publisherDroppedFrames: this.droppedFrames,
+      payloadBytesSubmitted: this.payloadBytesSent,
+      localCandidateType,
+      remoteCandidateType,
+      localCandidateTransport: selectedPair?.local.transportType ?? null,
+      remoteCandidateTransport: selectedPair?.remote.transportType ?? null,
+      path,
     };
   }
 

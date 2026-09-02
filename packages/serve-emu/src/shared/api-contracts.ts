@@ -117,6 +117,18 @@ export type NightModeResponse = ApiSuccess<{ nightMode: NightModeStatus }>;
 export type FontScaleStatus = { scale: number; raw: string };
 export type FontScaleResponse = ApiSuccess<{ fontScale: FontScaleStatus }>;
 
+export function parseFontScale(value: unknown): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value < 0.7 ||
+    value > 2
+  ) {
+    throw new Error("scale must be a number between 0.7 and 2.0");
+  }
+  return value;
+}
+
 export type NetworkRadioStatus = "enabled" | "disabled" | "unknown";
 export type NetworkStatus = {
   enabled: boolean | null;
