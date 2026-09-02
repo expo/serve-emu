@@ -179,3 +179,40 @@ test("normalizes middleware source FPS by the actual elapsed time", async () => 
     app.stop();
   }
 });
+
+test("serves viewer-scoped WebRTC statistics from createApp.handleRequest", async () => {
+  const clock = new ManualAppClock();
+  const { session, drained } = fakeScrcpySession(1);
+  const app = await createApp(
+    {
+      serial: session.serial,
+      streamSettings: {
+        transport: "webrtc",
+        codec: "h264",
+        iceServers: [],
+        iceTransportPolicy: "all",
+      },
+    },
+    {
+      startSession: async () => adaptScrcpySession(session),
+      createWebRtcPublisher: async () => fakeWebRtcPublisher(),
+      clock,
+    },
+  );
+
+  try {
+    await drained;
+    const response = await app.handleRequest(
+      new Request(
+        `http://middleware.test/webrtc/stats?sessionId=${SESSION_ID}`,
+      ),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      sessions: [expect.objectContaining({ sessionId: SESSION_ID })],
+    });
+  } finally {
+    await app.stop();
+  }
+});

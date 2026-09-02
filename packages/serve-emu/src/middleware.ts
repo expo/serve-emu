@@ -44,8 +44,8 @@ import {
   isJsonRequest,
   parseStreamEncoderSettingsPatch,
   redactedStreamSettings,
-  streamEncoderSettingsEqual,
   StreamSettingsUnavailableError,
+  streamEncoderSettingsEqual,
   type StreamEncoderSettings,
   type StreamEncoderSettingsPatch,
   type StreamSettings,
@@ -86,6 +86,7 @@ import {
   type ScrcpySession,
 } from "./scrcpy.ts";
 import {
+  parseFontScale,
   parseStreamModeRequest,
   type StreamMode,
   type StreamModeResponse,
@@ -196,6 +197,11 @@ function combineAbortSignals(
 
 const middlewareFailure = (error: string, status: number): Response =>
   Response.json({ ok: false, error }, { status });
+
+const middlewareRequestFailure = (error: unknown): Response =>
+  error instanceof HttpBodyError
+    ? middlewareFailure(error.code, error.status)
+    : middlewareFailure(errMsg(error), 400);
 
 const STATIC_CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -858,7 +864,6 @@ async function createAppInternal(
   const activateCapture = async (
     nextSession: EmuSession,
     settings: StreamEncoderSettings,
-    notifyClients: boolean,
   ): Promise<void> => {
     try {
       validateCapture(nextSession);
@@ -881,19 +886,17 @@ async function createAppInternal(
     pendingVideoResetTimer = null;
     pendingVideoResetReason = null;
     lastVideoResetMs = 0;
-    if (notifyClients) {
-      for (const client of clients) {
-        if (!client.video) continue;
-        client.awaitingKeyFrame = true;
-        sendJson(client.socket, {
-          type: "video-session",
-          size: { width: screen.width, height: screen.height },
-        });
-      }
-      webRtcPublisher?.resetVideoSource();
+    for (const client of clients) {
+      if (!client.video) continue;
+      client.awaitingKeyFrame = true;
+      sendJson(client.socket, {
+        type: "video-session",
+        size: { width: screen.width, height: screen.height },
+      });
     }
+    webRtcPublisher?.resetVideoSource();
     startCaptureReader(nextSession, generation);
-    if (notifyClients) requestVideoReset("stream settings changed");
+    requestVideoReset("stream settings changed");
   };
 
   const startCapture = (
@@ -910,6 +913,15 @@ async function createAppInternal(
       keyFrameInterval: opts.keyFrameInterval,
       mode,
     });
+
+  const replaceCapture = async (
+    settings: StreamEncoderSettings,
+    mode: StreamMode,
+    signal: AbortSignal,
+  ): Promise<void> => {
+    const candidate = await startCapture(settings, mode, signal);
+    await activateCapture(candidate, settings);
+  };
 
   let streamSettingsUpdate: Promise<void> = Promise.resolve();
   const updateStreamEncoderSettings = (
@@ -941,36 +953,26 @@ async function createAppInternal(
       ++sessionGeneration;
       removeFatalListener?.();
       removeFatalListener = null;
-      let replacement: EmuSession | null = null;
       try {
         await previousSession.close();
-        replacement = await startCapture(
+        await replaceCapture(
           nextSettings,
           previousMode,
           restartController.signal,
         );
-        const candidate = replacement;
-        replacement = null;
-        await activateCapture(candidate, nextSettings, true);
         return { ...streamEncoderSettings };
       } catch (updateError) {
-        if (replacement) await replacement.close().catch(() => {});
         if (stopRequested || status !== "streaming") {
           throw new StreamSettingsUnavailableError(`session is ${status}`);
         }
 
-        let rollback: EmuSession | null = null;
         try {
-          rollback = await startCapture(
+          await replaceCapture(
             previousSettings,
             previousMode,
             restartController.signal,
           );
-          const candidate = rollback;
-          rollback = null;
-          await activateCapture(candidate, previousSettings, true);
         } catch (rollbackError) {
-          if (rollback) await rollback.close().catch(() => {});
           if (stopRequested || status !== "streaming") {
             throw new StreamSettingsUnavailableError(`session is ${status}`);
           }
@@ -1021,6 +1023,14 @@ async function createAppInternal(
   const handleRequest = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
 
+    if (url.pathname === "/webrtc/stats") {
+      return handleWebRtcStatsRequest(req, opts, (sessionId, device) =>
+        device === null || device === opts.serial
+          ? webRtcStats(sessionId)
+          : null,
+      );
+    }
+
     if (url.pathname === "/api/stream-settings") {
       if (req.method === "GET") {
         await streamSettingsUpdate;
@@ -1033,6 +1043,9 @@ async function createAppInternal(
           { ok: false, error: "method_not_allowed" },
           { status: 405, headers: { Allow: "GET, PATCH" } },
         );
+      }
+      if (!isAllowedMutationOrigin(req, opts)) {
+        return middlewareFailure("forbidden_origin", 403);
       }
       if (!isJsonRequest(req)) {
         return Response.json(
@@ -1120,7 +1133,7 @@ async function createAppInternal(
         try {
           return Response.json({ ok: true, network: await getNetworkStatus(opts.serial) });
         } catch (err) {
-          return middlewareFailure(errMsg(err), 400);
+          return middlewareRequestFailure(err);
         }
       }
       if (req.method === "POST") {
@@ -1139,7 +1152,7 @@ async function createAppInternal(
             network: await setNetworkEnabled(opts.serial, enabled),
           });
         } catch (err) {
-          return middlewareFailure(errMsg(err), 400);
+          return middlewareRequestFailure(err);
         }
       }
       return middlewareFailure("method_not_allowed", 405);
@@ -1150,7 +1163,7 @@ async function createAppInternal(
         try {
           return Response.json({ ok: true, fontScale: await getFontScale(opts.serial) });
         } catch (err) {
-          return middlewareFailure(errMsg(err), 400);
+          return middlewareRequestFailure(err);
         }
       }
       if (req.method === "POST") {
@@ -1162,16 +1175,15 @@ async function createAppInternal(
           if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
             throw new Error("font scale payload must be an object");
           }
-          const scale = Number((payload as Record<string, unknown>).scale);
-          if (!Number.isFinite(scale) || scale < 0.7 || scale > 2) {
-            throw new Error("scale must be a number between 0.7 and 2.0");
-          }
+          const scale = parseFontScale(
+            (payload as Record<string, unknown>).scale,
+          );
           return Response.json({
             ok: true,
             fontScale: await setFontScale(opts.serial, scale),
           });
         } catch (err) {
-          return middlewareFailure(errMsg(err), 400);
+          return middlewareRequestFailure(err);
         }
       }
       return middlewareFailure("method_not_allowed", 405);
@@ -1604,8 +1616,9 @@ async function createAppInternal(
     });
   };
 
-  const stop = async (): Promise<void> => {
-    if (stopRequested) return;
+  let stopTask: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopTask) return stopTask;
     stopRequested = true;
     captureRestarting = false;
     captureRestartController?.abort(new Error("server stopping"));
@@ -1622,11 +1635,19 @@ async function createAppInternal(
     pendingVideoResetReason = null;
     removeFatalListener?.();
     removeFatalListener = null;
-    await Promise.all([
+    stopTask = Promise.allSettled([
+      streamSettingsUpdate,
       uploader.close(new Error("server stopping")),
       session.close(),
       deviceState.release(deviceStateOwner, "server stopping"),
-    ]);
+    ]).then((results) => {
+      const failure = results.slice(1).find(
+        (result): result is PromiseRejectedResult =>
+          result.status === "rejected",
+      );
+      if (failure) throw failure.reason;
+    });
+    return stopTask;
   };
 
   return {
@@ -1648,6 +1669,11 @@ async function createAppInternal(
   };
 }
 
+/**
+ * A live app handle. `session` and `streamSession` always resolve to the active
+ * capture generation; integrations must not retain a value read before a
+ * successful `/api/stream-settings` update.
+ */
 export type EmuApp = Awaited<ReturnType<typeof createAppInternal>>;
 export type ScrcpyEmuApp = Omit<EmuApp, "session"> & {
   session: ScrcpySession;
@@ -2172,6 +2198,10 @@ export function createRouter(
     if (requested !== null) {
       const app = apps.get(requested);
       return app?.isStreaming() ? app : null;
+    }
+    if (selectedSerial !== null) {
+      const selected = apps.get(selectedSerial);
+      if (selected?.isStreaming()) return selected;
     }
     const streamingApps = Array.from(apps.values()).filter((app) =>
       app.isStreaming(),

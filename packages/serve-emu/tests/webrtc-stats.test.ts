@@ -28,6 +28,7 @@ describe("serve-emu WebRTC stats report", () => {
   test("owns capture accounting and viewer-scoped report assembly", () => {
     const collector = new WebRtcStatsCollector(() => 42);
     collector.recordDelivery(undefined);
+    collector.recordDelivery({ accepted: false, awaitingKeyFrame: false });
     collector.recordDelivery({ accepted: true, awaitingKeyFrame: false });
     collector.recordDelivery({ accepted: false, awaitingKeyFrame: true });
     const publisher = {

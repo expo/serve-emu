@@ -30,7 +30,7 @@ export type WebRtcStatsReport = {
   source: WebRtcSourceStats;
   sessions: WebRtcPublisherSessionStats[];
   capture: {
-    /** Source frames submitted to the WebRTC publisher. */
+    /** Source frames offered while at least one viewer could receive them. */
     offeredFrames: number;
     /** Source frames accepted by at least one native media track. */
     forwardedFrames: number;
@@ -57,7 +57,7 @@ export class WebRtcStatsRequestError extends Error {
 
 /**
  * Own capture accounting and viewer-scoped report assembly for one source.
- * A missing delivery means no publisher was offered the source frame.
+ * A missing or zero-peer delivery means no viewer was offered the source frame.
  */
 export class WebRtcStatsCollector {
   #offeredFrames = 0;
@@ -66,7 +66,7 @@ export class WebRtcStatsCollector {
   constructor(private readonly now: () => number = Date.now) {}
 
   recordDelivery(delivery: WebRtcFrameDelivery | null | undefined): void {
-    if (!delivery) return;
+    if (!delivery || (!delivery.accepted && !delivery.awaitingKeyFrame)) return;
     this.#offeredFrames++;
     if (delivery.accepted) this.#forwardedFrames++;
   }

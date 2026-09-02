@@ -145,6 +145,7 @@ import {
 } from "./webrtc-publisher.ts";
 import {
   isStreamMode,
+  parseFontScale,
   parseStreamModeRequest,
   STREAM_MODES,
   type StreamMode,
@@ -2316,10 +2317,9 @@ export async function startServer(
             ) {
               throw new Error("font scale payload must be an object");
             }
-            const scale = Number((payload as Record<string, unknown>).scale);
-            if (!Number.isFinite(scale) || scale < 0.7 || scale > 2) {
-              throw new Error("scale must be a number between 0.7 and 2.0");
-            }
+            const scale = parseFontScale(
+              (payload as Record<string, unknown>).scale,
+            );
             return Response.json({
               ok: true,
               fontScale: await runForContext(requestContext, (context) =>

@@ -252,6 +252,34 @@ describe("createRouter DevicePanel compatibility", () => {
     expect(await responseJson(wrongDevice)).not.toHaveProperty("source");
   });
 
+  test("uses the selected streaming device when statistics omit device", async () => {
+    const router = createRouter(
+      { serial: "emulator-5554" },
+      {
+        createApp: async ({ serial }) =>
+          fakeApp(
+            serial,
+            [],
+            "scrcpy",
+            serial === "emulator-5554" ? SESSION_ID : OTHER_SESSION_ID,
+          ),
+      },
+    );
+    await Promise.all([
+      router.getApp("emulator-5554"),
+      router.getApp("usb-1"),
+    ]);
+
+    const response = await router.handleRequest(
+      new Request(`http://router.test/webrtc/stats?sessionId=${SESSION_ID}`),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await responseJson(response)).toMatchObject({
+      sessions: [expect.objectContaining({ sessionId: SESSION_ID })],
+    });
+  });
+
   test("discovers the grid and persists UI selection without a device query", async () => {
     const state = {
       devices: [
