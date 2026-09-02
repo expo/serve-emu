@@ -73,7 +73,6 @@ describe("DeviceSessionState source ownership", () => {
     const appliedLocations: string[] = [];
     const state = new DeviceSessionState({
       serial: "emulator-5554",
-      generation: 4,
       recorder,
       logcat: logcat.hub,
       applyLocation: async (_serial, fix) => {

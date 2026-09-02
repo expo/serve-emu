@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { describe, expect, test } from "bun:test";
 import {
   createFfmpegAvailabilityProbe,
+  FfmpegStderrTail,
   H264Encoder,
   H264OutputParser,
   resolveFfmpeg,
@@ -114,6 +115,29 @@ describe("H264OutputParser", () => {
     });
     expect(frames[0]!.data.subarray(0, 4)).toEqual(Buffer.from([0, 0, 0, 1]));
     expect(frames[1]!.data.subarray(0, 5)).toEqual(Buffer.from([0, 0, 0, 1, 0x65]));
+  });
+
+  test("does not duplicate a NAL when a chunk ends inside its four-byte start code", () => {
+    const frames: VideoFrame[] = [];
+    const parser = new H264OutputParser({
+      fps: 60,
+      onFrame: (frame) => frames.push(frame),
+    });
+    parser.enqueuePts(1n);
+
+    const stream = Buffer.concat([
+      aud(),
+      nal(0x65, [0x01, 0x02]),
+      aud(),
+    ]);
+    // Nine bytes lands immediately after the IDR start code, forcing the
+    // overlap scan to encounter its embedded three-byte start code.
+    parser.push(stream.subarray(0, 9));
+    parser.push(stream.subarray(9));
+
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toMatchObject({ isKey: true, pts: 1n });
+    expect(frames[0]!.data).toEqual(nal(0x65, [0x01, 0x02]));
   });
 
   test("holds the final access unit until the following AUD and de-duplicates config", () => {
@@ -408,5 +432,17 @@ describe("H264Encoder validation", () => {
     expect(topRow[1]![1]).toBeGreaterThan(200);
     expect(topRow[2]![2]).toBeGreaterThan(200);
     expect(Math.min(...topRow[3]!)).toBeGreaterThan(200);
+  });
+});
+
+describe("ffmpeg diagnostics", () => {
+  test("retains a bounded stderr tail for exit failures", () => {
+    const stderr = new FfmpegStderrTail();
+    stderr.append(Buffer.from(`discarded:${"x".repeat(20_000)}`));
+    stderr.append(Buffer.from(":actionable failure\n"));
+
+    expect(Buffer.byteLength(stderr.text())).toBeLessThanOrEqual(16 * 1024);
+    expect(stderr.text()).not.toContain("discarded:");
+    expect(stderr.text()).toEndWith(":actionable failure");
   });
 });

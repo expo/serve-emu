@@ -1,11 +1,18 @@
+import http2 from "node:http2";
+import type { ServerHttp2Stream } from "node:http2";
 import { describe, expect, test } from "bun:test";
 import {
   decodeEmulatorImage,
+  EmulatorGrpcClient,
   encodeKeyboardEvent,
+  encodeTouchEvent,
+  ensureEmulatorGrpcEndpoint,
+  findEmulatorGrpcEndpoint,
   GrpcMessagePacer,
   GrpcMessageParser,
   parseEmulatorGrpcPort,
 } from "../src/emulator-grpc.ts";
+import type { ExecResult } from "../src/exec.ts";
 
 function grpcFrame(message: Buffer): Buffer {
   const frame = Buffer.allocUnsafe(5 + message.length);
@@ -171,6 +178,225 @@ describe("emulator gRPC discovery", () => {
     expect(parseEmulatorGrpcPort("OK")).toBeNull();
     expect(parseEmulatorGrpcPort("port 70000")).toBeNull();
   });
+
+  test("selects the newest live discovery file for the requested emulator", () => {
+    const files = new Map([
+      ["/run/pid_10.ini", "port.serial=5554\ngrpc.port=8554\ngrpc.token=older"],
+      ["/run/pid_11_info.ini", "port.serial=5554\ngrpc.port=8555\ngrpc.token=newer\navd.name=Pixel_9"],
+      ["/run/pid_12.ini", "port.serial=5556\ngrpc.port=8556"],
+    ]);
+    const endpoint = findEmulatorGrpcEndpoint("emulator-5554", {
+      discoveryDirs: () => ["/run"],
+      readDirectory: () => ["pid_10.ini", "pid_11_info.ini", "pid_12.ini"],
+      processIsAlive: () => true,
+      readText: (path) => files.get(path)!,
+      modifiedMs: (path) => path.includes("11") ? 20 : 10,
+    });
+
+    expect(endpoint).toEqual({
+      port: 8555,
+      token: "newer",
+      avdName: "Pixel_9",
+    });
+  });
+
+  test("retries activation and preserves the discovered bearer token", async () => {
+    let attempts = 0;
+    let active = false;
+    const warnings: string[] = [];
+    const success = (): ExecResult<string> => ({
+      status: 0,
+      signal: null,
+      stdout: 'OK: { "port": "8554" }',
+      stderr: "",
+      timedOut: false,
+      error: null,
+    });
+    const endpoint = await ensureEmulatorGrpcEndpoint(
+      "emulator-5554",
+      undefined,
+      {
+        discoveryDirs: () => ["/run"],
+        readDirectory: () => active ? ["pid_11.ini"] : [],
+        processIsAlive: () => true,
+        readText: () =>
+          "port.serial=5554\ngrpc.port=8554\ngrpc.token=secret\navd.name=Pixel_9",
+        modifiedMs: () => 1,
+        portIsReachable: async (port) => active && port === 8554,
+        pickAvailablePort: async () => 8554,
+        runAdb: async () => {
+          attempts++;
+          if (attempts === 1) {
+            return { ...success(), status: 1, stdout: "KO: busy" };
+          }
+          active = true;
+          return success();
+        },
+        wait: async () => {},
+        warn: (message) => warnings.push(message),
+      },
+    );
+
+    expect(attempts).toBe(2);
+    expect(endpoint).toEqual({
+      port: 8554,
+      token: "secret",
+      avdName: "Pixel_9",
+    });
+    expect(warnings).toEqual([]);
+  });
+
+  test("warns when an explicitly selected endpoint has no bearer token", async () => {
+    const warnings: string[] = [];
+    await ensureEmulatorGrpcEndpoint("emulator-5554", undefined, {
+      discoveryDirs: () => ["/run"],
+      readDirectory: () => ["pid_11.ini"],
+      processIsAlive: () => true,
+      readText: () => "port.serial=5554\ngrpc.port=8554",
+      modifiedMs: () => 1,
+      portIsReachable: async () => true,
+      warn: (message) => warnings.push(message),
+    });
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("has no bearer token");
+    expect(warnings[0]).toContain("explicitly selected");
+  });
+});
+
+describe("EmulatorGrpcClient HTTP/2 integration", () => {
+  test("sends the discovered bearer token and decodes a screenshot", async () => {
+    const imageBody = Buffer.from([
+      0x0a, 0x06, 0x08, 0x02, 0x18, 0x02, 0x20, 0x01,
+      0x22, 0x06, 1, 2, 3, 4, 5, 6,
+      0x28, 0x01, 0x30, 0x01,
+    ]);
+    let authorization: string | undefined;
+    const server = http2.createServer();
+    server.on("stream", (stream: ServerHttp2Stream, headers) => {
+      authorization = headers.authorization as string | undefined;
+      stream.respond({
+        ":status": 200,
+        "content-type": "application/grpc",
+        "grpc-status": "0",
+      });
+      stream.end(grpcFrame(imageBody));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test port");
+    const client = new EmulatorGrpcClient({
+      port: address.port,
+      token: "discovered-token",
+      avdName: "Pixel_9",
+    });
+
+    try {
+      const image = await client.getScreenshot({ format: 2 });
+      expect(authorization).toBe("Bearer discovered-token");
+      expect(image).toMatchObject({ width: 2, height: 1, format: 2, seq: 1 });
+      expect(image.image).toEqual(Buffer.from([1, 2, 3, 4, 5, 6]));
+    } finally {
+      client.close();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => error ? reject(error) : resolve())
+      );
+    }
+  });
+
+  test("fails a screenshot stream that stalls after a decoded image", async () => {
+    const imageBody = Buffer.from([
+      0x0a, 0x06, 0x08, 0x02, 0x18, 0x02, 0x20, 0x01,
+      0x22, 0x06, 1, 2, 3, 4, 5, 6,
+    ]);
+    const server = http2.createServer();
+    server.on("stream", (stream: ServerHttp2Stream) => {
+      stream.respond({
+        ":status": 200,
+        "content-type": "application/grpc",
+      });
+      stream.write(grpcFrame(imageBody));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test port");
+    const client = new EmulatorGrpcClient(
+      { port: address.port, token: null, avdName: null },
+      { unaryTimeoutMs: 25, streamInactivityTimeoutMs: 25 },
+    );
+    const images: unknown[] = [];
+
+    try {
+      await expect(
+        client.streamScreenshot(
+          { format: 2 },
+          (image) => images.push(image),
+          new AbortController().signal,
+          { maxFps: 60 },
+        ),
+      ).rejects.toThrow(
+        "no decoded message received for 25ms; health probe failed",
+      );
+      expect(images).toHaveLength(1);
+    } finally {
+      client.close();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => error ? reject(error) : resolve())
+      );
+    }
+  });
+
+  test("keeps a quiet static screenshot stream healthy with unary probes", async () => {
+    const imageBody = Buffer.from([
+      0x0a, 0x06, 0x08, 0x02, 0x18, 0x02, 0x20, 0x01,
+      0x22, 0x06, 1, 2, 3, 4, 5, 6,
+    ]);
+    const server = http2.createServer();
+    server.on("stream", (stream: ServerHttp2Stream, headers) => {
+      stream.respond({
+        ":status": 200,
+        "content-type": "application/grpc",
+        ...(headers[":path"]?.toString().endsWith("/getScreenshot")
+          ? { "grpc-status": "0" }
+          : {}),
+      });
+      if (headers[":path"]?.toString().endsWith("/getScreenshot")) {
+        stream.end(grpcFrame(imageBody));
+      } else {
+        stream.write(grpcFrame(imageBody));
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test port");
+    const client = new EmulatorGrpcClient(
+      { port: address.port, token: null, avdName: null },
+      { unaryTimeoutMs: 100, streamInactivityTimeoutMs: 25 },
+    );
+    const controller = new AbortController();
+    const images: unknown[] = [];
+    const sources: string[] = [];
+
+    try {
+      await client.streamScreenshot(
+        { format: 2 },
+        (image, source) => {
+          images.push(image);
+          sources.push(source);
+          if (images.length === 2) controller.abort();
+        },
+        controller.signal,
+        { maxFps: 60 },
+      );
+      expect(images).toHaveLength(2);
+      expect(sources).toEqual(["stream", "probe"]);
+    } finally {
+      client.close();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => error ? reject(error) : resolve())
+      );
+    }
+  });
 });
 
 describe("emulator image protobuf", () => {
@@ -208,5 +434,13 @@ describe("emulator keyboard protobuf", () => {
         Buffer.from("GoBack"),
       ]),
     );
+  });
+});
+
+describe("emulator touch protobuf", () => {
+  test("keeps an all-zero touch as a present empty sub-message", () => {
+    expect(
+      encodeTouchEvent([{ x: 0, y: 0, identifier: 0, pressure: 0 }]),
+    ).toEqual(Buffer.from([0x0a, 0x00]));
   });
 });

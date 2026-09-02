@@ -96,7 +96,13 @@ export function App() {
 
   return (
     <>
-      <StatusBar status={state.status} deviceSize={state.deviceSize} fps={state.fps} stats={state.stats} />
+      <StatusBar
+        status={state.status}
+        deviceSize={state.deviceSize}
+        fps={state.fps}
+        stats={state.stats}
+        controlError={state.controlError}
+      />
       <StreamControlsContext.Provider value={controls}>
         <AppShell />
       </StreamControlsContext.Provider>

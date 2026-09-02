@@ -1,4 +1,5 @@
 import { listAllDevices, type Device } from "./adb.ts";
+import { isEmulatorSerial } from "./device-capabilities.ts";
 import {
   listAvds,
   resolveRunningAvds,
@@ -71,7 +72,7 @@ export async function loadDeviceGrid(
   );
   const rows: GridDevice[] = adbDevices.map((device) => {
     const running = runningBySerial.get(device.serial);
-    const isEmulator = /^emulator-\d+$/.test(device.serial);
+    const isEmulator = isEmulatorSerial(device.serial);
     return {
       id: device.serial,
       kind: isEmulator ? "emulator" : "physical",

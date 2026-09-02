@@ -452,7 +452,7 @@ describe("domain API failures", () => {
       response,
       400,
       "invalid_request",
-      "mode must be scrcpy or grpc-screenshot",
+      "stream mode request.mode is invalid",
     );
     expect(invoked).toBe(false);
   });

@@ -54,6 +54,12 @@ import {
   type StartEmuSessionOptions,
 } from "./stream-session.ts";
 import {
+  streamModeConflictResponse,
+  streamModeMethodNotAllowedResponse,
+  streamModeRequestErrorResponse,
+  streamModeUnavailableResponse,
+} from "./stream-mode-api.ts";
+import {
   listAvds,
   listRunningAvds,
   startEmulator,
@@ -67,6 +73,10 @@ import {
   ControlInputError,
   ControlInputQueue,
 } from "./control-input-queue.ts";
+import {
+  availableStreamModesForSerial,
+  isEmulatorSerial,
+} from "./device-capabilities.ts";
 import {
   parseGeoFix,
   setEmulatorLocationAsync,
@@ -128,6 +138,7 @@ import {
 } from "./webrtc-publisher.ts";
 import {
   isStreamMode,
+  parseStreamModeRequest,
   STREAM_MODES,
   type StreamMode,
 } from "./shared/api-contracts.ts";
@@ -325,7 +336,7 @@ export async function startServer(
   }
   if (
     requestedDefaultStreamMode === "grpc-screenshot" &&
-    !/^emulator-\d+$/.test(opts.serial)
+    !isEmulatorSerial(opts.serial)
   ) {
     throw new Error(
       "grpc-screenshot is available only for Android Emulator devices",
@@ -444,11 +455,11 @@ export async function startServer(
   const host = opts.host ?? DEFAULT_HOST;
   const authToken = opts.token && opts.token.length > 0 ? opts.token : null;
   const streamSettings = opts.streamSettings ?? DEFAULT_STREAM_SETTINGS;
-  const streamModes = new Map<string, StreamMode>();
+  const preferredStreamModes = new Map<string, StreamMode>();
 
   const modeForSerial = (serial: string): StreamMode =>
-    streamModes.get(serial) ??
-    (/^emulator-\d+$/.test(serial) ? defaultStreamMode : "scrcpy");
+    preferredStreamModes.get(serial) ??
+    (isEmulatorSerial(serial) ? defaultStreamMode : "scrcpy");
 
   const openStream = (
     serial: string,
@@ -543,7 +554,7 @@ export async function startServer(
     await initialStream.close().catch(() => {});
     throw err;
   }
-  streamModes.set(opts.serial, initialMode);
+  preferredStreamModes.set(opts.serial, initialMode);
   const sessions = new DeviceSessionManager(initialContext);
   const recoveries = new WeakMap<
     DeviceContext,
@@ -668,7 +679,7 @@ export async function startServer(
     );
     const rows: GridDevice[] = adbDevices.map((device) => {
       const running = runningBySerial.get(device.serial);
-      const isEmulator = /^emulator-\d+$/.test(device.serial);
+      const isEmulator = isEmulatorSerial(device.serial);
       return {
         id: device.serial,
         kind: isEmulator ? "emulator" : "physical",
@@ -1491,23 +1502,44 @@ export async function startServer(
     signal: AbortSignal,
     deviceState?: DeviceSessionState,
   ): Promise<DeviceContext> => {
-    const stream = await openStream(serial, mode, signal);
+    const stagingOwner = {};
+    let retainedDeviceState =
+      deviceState && !deviceState.disposed && !deviceState.signal.aborted
+        ? deviceState
+        : undefined;
+    if (retainedDeviceState) {
+      try {
+        retainedDeviceState.acquire(stagingOwner);
+      } catch {
+        retainedDeviceState = undefined;
+      }
+    }
     try {
-      return createContext(serial, generation, stream, deviceState);
-    } catch (error) {
-      await stream.close().catch(() => {});
-      throw error;
+      const stream = await openStream(serial, mode, signal);
+      try {
+        return createContext(
+          serial,
+          generation,
+          stream,
+          retainedDeviceState,
+        );
+      } catch (error) {
+        await stream.close().catch(() => {});
+        throw error;
+      }
+    } finally {
+      await retainedDeviceState?.release(
+        stagingOwner,
+        "stream source staging finished",
+      );
     }
   };
-
-  const availableStreamModes = (serial: string): StreamMode[] =>
-    /^emulator-\d+$/.test(serial) ? [...STREAM_MODES] : ["scrcpy"];
 
   const streamModeResponse = (context: DeviceContext) => ({
     ok: true as const,
     serial: context.serial,
     mode: context.stream.mode,
-    availableModes: availableStreamModes(context.serial),
+    availableModes: availableStreamModesForSerial(context.serial),
     sessionGeneration: context.generation,
   });
 
@@ -1566,7 +1598,7 @@ export async function startServer(
       throw new SessionChangedError(expected.generation, active.generation);
     }
     const requestedSerial = active.serial;
-    if (!availableStreamModes(active.serial).includes(mode)) {
+    if (!availableStreamModesForSerial(active.serial).includes(mode)) {
       throw new Error(
         "grpc-screenshot is available only for Android Emulator devices",
       );
@@ -1578,7 +1610,7 @@ export async function startServer(
           generation,
           mode,
           signal,
-          current.deviceState,
+          current.signal.aborted ? undefined : current.deviceState,
         ),
       activateContext,
       "stream source switched",
@@ -1592,7 +1624,7 @@ export async function startServer(
         return current.stream.mode !== mode;
       },
     );
-    streamModes.set(context.serial, mode);
+    preferredStreamModes.set(context.serial, mode);
     if (context.generation !== active.generation) {
       console.log(
         `${context.stream.mode} ready: ${context.stream.meta.deviceName} • ${context.stream.meta.codecId} • ${context.stream.meta.width}×${context.stream.meta.height}`,
@@ -1704,30 +1736,15 @@ export async function startServer(
           });
         }
         if (req.method !== "PUT") {
-          return new Response("method not allowed", {
-            status: 405,
-            headers: { Allow: "GET, PUT" },
-          });
+          return streamModeMethodNotAllowedResponse();
         }
         let mode: StreamMode;
         try {
           const payload = await readJsonBody(req, MAX_JSON_BODY_BYTES);
-          if (
-            typeof payload !== "object" ||
-            payload === null ||
-            Array.isArray(payload)
-          ) {
-            throw new Error("stream mode payload must be an object");
-          }
-          const requestedMode = (payload as Record<string, unknown>).mode;
-          if (!isStreamMode(requestedMode)) {
-            throw new Error(
-              `mode must be one of: ${STREAM_MODES.join(", ")}`,
-            );
-          }
+          const { mode: requestedMode } = parseStreamModeRequest(payload);
           if (
             requestedMode === "grpc-screenshot" &&
-            !/^emulator-\d+$/.test(requestContext.serial)
+            !isEmulatorSerial(requestContext.serial)
           ) {
             throw new Error(
               "grpc-screenshot is available only for Android Emulator devices",
@@ -1735,12 +1752,14 @@ export async function startServer(
           }
           mode = requestedMode;
         } catch (error) {
-          return errorResponse(error);
+          return streamModeRequestErrorResponse(error);
         }
         try {
           return Response.json(await switchStreamMode(mode, requestContext));
         } catch (error) {
-          return errorResponse(error, 503);
+          return error instanceof SessionChangedError
+            ? streamModeConflictResponse(error)
+            : streamModeUnavailableResponse(error);
         }
       }
 
@@ -1936,7 +1955,7 @@ export async function startServer(
               )?.serial ?? "";
           }
           if (!serial) throw new Error("serial or running avd is required");
-          if (!/^emulator-\d+$/.test(serial))
+          if (!isEmulatorSerial(serial))
             throw new Error(`${serial} is not an emulator`);
           if (serial === requestContext.serial) {
             await stopCurrentSession(requestContext, "current emulator stopped");
@@ -2380,7 +2399,7 @@ export async function startServer(
           return Response.json({
             generation: requestContext.generation,
             serial: requestContext.serial,
-            emulator: /^emulator-\d+$/.test(requestContext.serial),
+            emulator: isEmulatorSerial(requestContext.serial),
             location: requestContext.lastLocation,
           });
         }

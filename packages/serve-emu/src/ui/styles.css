@@ -44,6 +44,19 @@ header .meta {
   color: #8a8a93;
   font-variant-numeric: tabular-nums;
 }
+header .status-details {
+  min-width: 0;
+  text-align: right;
+}
+header .control-error {
+  max-width: min(60vw, 680px);
+  margin-bottom: 2px;
+  overflow: hidden;
+  color: #ff8a8a;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 main {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 380px;

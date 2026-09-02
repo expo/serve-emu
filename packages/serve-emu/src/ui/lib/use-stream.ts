@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
-import { logControlAcknowledgement } from "./control-ack";
+import {
+  controlAcknowledgementMessage,
+  logControlAcknowledgement,
+} from "./control-ack";
 import { scanAU } from "./h264";
 import { MsePlayer } from "./mse-player";
 import { parseFramePacket } from "../../shared/frame-meta";
@@ -40,6 +43,7 @@ export type StreamState = {
   fps: number;
   deviceSize: DeviceSize | null;
   stats: StreamStats | null;
+  controlError: string | null;
 };
 
 export type Sender = (msg: Record<string, unknown>, ack?: boolean) => void;
@@ -74,6 +78,7 @@ const WEBRTC_BUSY_RETRY_COUNT = 30;
 const WEBRTC_TRANSPORT_RETRY_BASE_MS = 500;
 const WEBRTC_TRANSPORT_RETRY_MAX_MS = 5_000;
 const WEBRTC_DISCONNECTED_GRACE_MS = 10_000;
+const CONTROL_ERROR_VISIBLE_MS = 5_000;
 
 function createWebRtcSessionId(): string {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
@@ -153,6 +158,7 @@ export function useStream(
     fps: 0,
     deviceSize: null,
     stats: null,
+    controlError: null,
   });
   const workerRef = useRef<Worker | null>(null);
   const directWsRef = useRef<WebSocket | null>(null);
@@ -162,8 +168,44 @@ export function useStream(
   const [webRtcRetryGeneration, setWebRtcRetryGeneration] = useState(0);
   const [serverGeneration, setServerGeneration] = useState<number | null>(null);
   const webRtcTransportRetryAttemptRef = useRef(0);
+  const controlErrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transport = streamSettings?.transport ?? null;
   const currentStreamSettingsKey = streamSettingsKey(streamSettings);
+
+  const showControlError = useCallback((message: string) => {
+    if (controlErrorTimerRef.current) {
+      clearTimeout(controlErrorTimerRef.current);
+    }
+    setState((current) => ({ ...current, controlError: message }));
+    controlErrorTimerRef.current = setTimeout(() => {
+      controlErrorTimerRef.current = null;
+      setState((current) =>
+        current.controlError === message
+          ? { ...current, controlError: null }
+          : current,
+      );
+    }, CONTROL_ERROR_VISIBLE_MS);
+  }, []);
+
+  const handleControlAcknowledgement = useCallback(
+    (raw: string): boolean => {
+      const message = controlAcknowledgementMessage(raw);
+      if (!message) return false;
+      logControlAcknowledgement(raw);
+      showControlError(message);
+      return true;
+    },
+    [showControlError],
+  );
+
+  useEffect(
+    () => () => {
+      if (controlErrorTimerRef.current) {
+        clearTimeout(controlErrorTimerRef.current);
+      }
+    },
+    [],
+  );
 
   const send = useCallback<Sender>((msg, ack = true) => {
     const directWs = directWsRef.current;
@@ -347,6 +389,7 @@ export function useStream(
       if (msg.type === "status" && isStreamFatalStatus(msg.status)) {
         workerFatalStatus = msg.status;
       }
+      if (msg.type === "control-error") showControlError(msg.message);
 
       setState((prev) => {
         let next: StreamState = isNewGeneration
@@ -506,7 +549,7 @@ export function useStream(
       if (clientEpochRef.current === clientEpoch) clientEpochRef.current = 0;
       workerRef.current = null;
     };
-  }, [canvasRef, transport]);
+  }, [canvasRef, showControlError, transport]);
 
   // WebCodecs is unavailable on some plain-HTTP LAN origins. Keep the fork's
   // Media Source Extensions fallback for those browsers while the normal path
@@ -565,7 +608,7 @@ export function useStream(
       ws.onerror = () => setStatus("connection error");
       ws.onmessage = (event) => {
         if (typeof event.data === "string") {
-          logControlAcknowledgement(event.data);
+          handleControlAcknowledgement(event.data);
           try {
             const message = JSON.parse(event.data) as {
               type?: string;
@@ -631,7 +674,7 @@ export function useStream(
       if (directWsRef.current === ws) directWsRef.current = null;
       resetPlayer();
     };
-  }, [canvasRef, transport]);
+  }, [canvasRef, handleControlAcknowledgement, transport]);
 
   useEffect(() => {
     webRtcTransportRetryAttemptRef.current = 0;
@@ -662,7 +705,7 @@ export function useStream(
       ws.onerror = () => setStatus("input connection error");
       ws.onmessage = (event) => {
         if (typeof event.data !== "string") return;
-        logControlAcknowledgement(event.data);
+        handleControlAcknowledgement(event.data);
       };
       ws.onclose = () => {
         if (directWsRef.current === ws) directWsRef.current = null;
@@ -685,7 +728,7 @@ export function useStream(
       } catch {}
       if (directWsRef.current === ws) directWsRef.current = null;
     };
-  }, [transport]);
+  }, [handleControlAcknowledgement, transport]);
 
   useEffect(() => {
     if (transport !== "webrtc" || streamSettings?.transport !== "webrtc") {

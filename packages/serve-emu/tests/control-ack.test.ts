@@ -1,11 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
   controlAcknowledgementError,
+  controlAcknowledgementMessage,
   logControlAcknowledgement,
 } from "../src/ui/lib/control-ack.ts";
 
 describe("browser control acknowledgements", () => {
   test("formats negative control acknowledgements for the browser console", () => {
+    expect(
+      controlAcknowledgementMessage(
+        '{"ok":false,"error":"  gesture rejected  "}',
+      ),
+    ).toBe("gesture rejected");
     expect(
       controlAcknowledgementError(
         JSON.stringify({

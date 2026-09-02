@@ -126,7 +126,6 @@ export class ActiveDeviceSession<
       opts.deviceState ??
       new DeviceSessionState({
         serial: opts.serial,
-        generation: opts.generation,
         applyLocation: async (serial, fix, signal) => {
           if (!applyLocation) {
             throw new Error("applyLocation is required for a new device state");

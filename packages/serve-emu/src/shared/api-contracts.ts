@@ -71,6 +71,7 @@ export type DeviceSelectionResponse = ApiSuccess<{
 
 export const STREAM_MODES = ["scrcpy", "grpc-screenshot"] as const;
 export type StreamMode = (typeof STREAM_MODES)[number];
+export type StreamModeRequest = { mode: StreamMode };
 export function isStreamMode(value: unknown): value is StreamMode {
   return (
     typeof value === "string" &&
@@ -356,7 +357,7 @@ export type ApiContractMap = {
   };
   "/api/stream-mode": {
     GET: EndpointContract<undefined, StreamModeResponse>;
-    PUT: EndpointContract<{ mode: StreamMode }, StreamModeResponse>;
+    PUT: EndpointContract<StreamModeRequest, StreamModeResponse>;
   };
   "/api/avds/start": {
     POST: EndpointContract<{ avd: string; select?: boolean }, AvdStartResponse>;
@@ -656,6 +657,13 @@ function parseOkDeviceResponse(value: unknown, kind: "selection" | "avd-start"):
 
 export function parseDeviceSelectionResponse(value: unknown): DeviceSelectionResponse {
   return parseOkDeviceResponse(value, "selection") as DeviceSelectionResponse;
+}
+
+export function parseStreamModeRequest(value: unknown): StreamModeRequest {
+  const root = record(value, "stream mode request");
+  return {
+    mode: oneOf(root.mode, STREAM_MODES, "stream mode request.mode"),
+  };
 }
 
 export function parseStreamModeResponse(value: unknown): StreamModeResponse {

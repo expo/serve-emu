@@ -4,6 +4,10 @@ import { createConnection, createServer } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import {
+  isEmulatorSerial,
+  parseEmulatorSerial,
+} from "./device-capabilities.ts";
 import { execText, type ExecResult } from "./exec.ts";
 
 /** Minimal dependency-free client for Android Emulator's control gRPC API. */
@@ -19,6 +23,7 @@ const MAX_PROTO_VARINT_BYTES = 10;
 const CONTROLLER_PREFIX =
   "/android.emulation.control.EmulatorController/";
 const UNARY_TIMEOUT_MS = 5_000;
+const STREAM_INACTIVITY_TIMEOUT_MS = 10_000;
 
 function abortReason(signal: AbortSignal, fallback: string): Error {
   return signal.reason instanceof Error
@@ -45,6 +50,23 @@ function discoveryDirs(): string[] {
   return dirs;
 }
 
+export type EmulatorGrpcDiscoveryDependencies = {
+  discoveryDirs?(): string[];
+  readDirectory?(directory: string): string[];
+  processIsAlive?(file: string): boolean;
+  readText?(path: string): string;
+  modifiedMs?(path: string): number;
+  portIsReachable?(
+    port: number,
+    signal?: AbortSignal,
+  ): Promise<boolean>;
+  pickAvailablePort?(signal?: AbortSignal): Promise<number>;
+  runAdb?: typeof execText;
+  readAvdName?(serial: string, signal?: AbortSignal): Promise<string | null>;
+  wait?(ms: number, signal?: AbortSignal): Promise<void>;
+  warn?(message: string): void;
+};
+
 function discoveryProcessIsAlive(file: string): boolean {
   const match = file.match(/^pid_(\d+)(?:_info)?\.ini$/);
   if (!match) return false;
@@ -58,25 +80,34 @@ function discoveryProcessIsAlive(file: string): boolean {
 
 export function findEmulatorGrpcEndpoint(
   serial: string,
+  dependencies: EmulatorGrpcDiscoveryDependencies = {},
 ): GrpcEndpoint | null {
-  const match = serial.match(/^emulator-(\d+)$/);
-  if (!match) return null;
+  const parsedSerial = parseEmulatorSerial(serial);
+  if (!parsedSerial) return null;
+  const directories = dependencies.discoveryDirs ?? discoveryDirs;
+  const readDirectory = dependencies.readDirectory ?? readdirSync;
+  const processIsAlive =
+    dependencies.processIsAlive ?? discoveryProcessIsAlive;
+  const readText =
+    dependencies.readText ?? ((path: string) => readFileSync(path, "utf8"));
+  const readModifiedMs =
+    dependencies.modifiedMs ?? ((path: string) => statSync(path).mtimeMs);
   const candidates: Array<GrpcEndpoint & { modifiedMs: number }> = [];
-  for (const dir of discoveryDirs()) {
+  for (const dir of directories()) {
     let files: string[];
     try {
-      files = readdirSync(dir).filter((file) =>
+      files = readDirectory(dir).filter((file) =>
         /^pid_\d+(?:_info)?\.ini$/.test(file),
       );
     } catch {
       continue;
     }
     for (const file of files) {
-      if (!discoveryProcessIsAlive(file)) continue;
+      if (!processIsAlive(file)) continue;
       const path = join(dir, file);
       let text: string;
       try {
-        text = readFileSync(path, "utf8");
+        text = readText(path);
       } catch {
         continue;
       }
@@ -89,12 +120,12 @@ export function findEmulatorGrpcEndpoint(
           line.slice(separator + 1).trim(),
         );
       }
-      if (values.get("port.serial") !== match[1]) continue;
+      if (values.get("port.serial") !== parsedSerial.consolePort) continue;
       const port = Number(values.get("grpc.port"));
       if (!Number.isInteger(port) || port <= 0 || port > 65_535) continue;
       let modifiedMs = 0;
       try {
-        modifiedMs = statSync(path).mtimeMs;
+        modifiedMs = readModifiedMs(path);
       } catch {}
       candidates.push({
         port,
@@ -208,21 +239,37 @@ export function parseEmulatorGrpcPort(output: string): number | null {
     : null;
 }
 
-/** Find or activate the loopback-only gRPC endpoint for a running emulator. */
+/** Find or explicitly activate the gRPC endpoint for a running emulator. */
 export async function ensureEmulatorGrpcEndpoint(
   serial: string,
   signal?: AbortSignal,
+  dependencies: EmulatorGrpcDiscoveryDependencies = {},
 ): Promise<GrpcEndpoint> {
-  if (!/^emulator-\d+$/.test(serial)) {
+  if (!isEmulatorSerial(serial)) {
     throw new Error(`gRPC screenshot streaming requires an emulator; received ${serial}`);
   }
+  const checkPort = dependencies.portIsReachable ?? portIsReachable;
+  const allocatePort = dependencies.pickAvailablePort ?? pickAvailablePort;
+  const runAdb = dependencies.runAdb ?? execText;
+  const readAvdName = dependencies.readAvdName ?? runningAvdName;
+  const wait = dependencies.wait ?? ((ms: number, waitSignal?: AbortSignal) =>
+    sleep(ms, undefined, { signal: waitSignal }));
+  const warn = dependencies.warn ?? console.warn;
+  const useEndpoint = (endpoint: GrpcEndpoint): GrpcEndpoint => {
+    if (!endpoint.token) {
+      warn(
+        `serve-emu warning: emulator gRPC endpoint for ${serial} has no bearer token; grpc-screenshot will use this explicitly selected local endpoint without authentication`,
+      );
+    }
+    return endpoint;
+  };
   throwIfAborted(signal, "emulator gRPC discovery aborted");
-  const discovered = findEmulatorGrpcEndpoint(serial);
+  const discovered = findEmulatorGrpcEndpoint(serial, dependencies);
   if (
     discovered &&
-    (await portIsReachable(discovered.port, signal))
+    (await checkPort(discovered.port, signal))
   ) {
-    return discovered;
+    return useEndpoint(discovered);
   }
 
   let lastError = discovered
@@ -230,8 +277,8 @@ export async function ensureEmulatorGrpcEndpoint(
     : "no live emulator gRPC discovery file";
   for (let attempt = 0; attempt < 5; attempt++) {
     throwIfAborted(signal, "emulator gRPC discovery aborted");
-    const port = await pickAvailablePort(signal);
-    const result = await execText(
+    const port = await allocatePort(signal);
+    const result = await runAdb(
       "adb",
       ["-s", serial, "emu", "grpc", String(port)],
       { timeout: 5_000, signal, lane: "interactive" },
@@ -245,25 +292,25 @@ export async function ensureEmulatorGrpcEndpoint(
     const reportedPort = parseEmulatorGrpcPort(output);
     for (let probe = 0; probe < 40; probe++) {
       throwIfAborted(signal, "emulator gRPC discovery aborted");
-      const activated = findEmulatorGrpcEndpoint(serial);
+      const activated = findEmulatorGrpcEndpoint(serial, dependencies);
       if (
         activated &&
-        (await portIsReachable(activated.port, signal))
+        (await checkPort(activated.port, signal))
       ) {
-        return activated;
+        return useEndpoint(activated);
       }
       const activePort = reportedPort ?? port;
       if (
         probe === 39 &&
-        (await portIsReachable(activePort, signal))
+        (await checkPort(activePort, signal))
       ) {
-        return {
+        return useEndpoint({
           port: activePort,
           token: null,
-          avdName: await runningAvdName(serial, signal),
-        };
+          avdName: await readAvdName(serial, signal),
+        });
       }
-      await sleep(50, undefined, { signal });
+      await wait(50, signal);
     }
     lastError =
       "emulator accepted the gRPC command, but no usable endpoint became reachable";
@@ -295,6 +342,16 @@ function lenField(
   bytes: number[] | Buffer,
 ): void {
   if (!bytes.length) return;
+  writeVarint(output, (fieldNo << 3) | 2);
+  writeVarint(output, bytes.length);
+  for (const byte of bytes) output.push(byte);
+}
+
+function messageField(
+  output: number[],
+  fieldNo: number,
+  bytes: number[] | Buffer,
+): void {
   writeVarint(output, (fieldNo << 3) | 2);
   writeVarint(output, bytes.length);
   for (const byte of bytes) output.push(byte);
@@ -455,7 +512,7 @@ export type TouchPoint = {
   pressure: number;
 };
 
-function encodeTouchEvent(touches: TouchPoint[]): Buffer {
+export function encodeTouchEvent(touches: TouchPoint[]): Buffer {
   const output: number[] = [];
   for (const point of touches) {
     const touch: number[] = [];
@@ -463,7 +520,9 @@ function encodeTouchEvent(touches: TouchPoint[]): Buffer {
     varintField(touch, 2, Math.max(0, Math.round(point.y)));
     varintField(touch, 3, point.identifier);
     varintField(touch, 4, point.pressure);
-    lenField(output, 1, touch);
+    // A repeated message is present even when every scalar has its protobuf
+    // default. In particular, pressure=0 releases pointer 0 at pixel 0,0.
+    messageField(output, 1, touch);
   }
   return Buffer.from(output);
 }
@@ -750,16 +809,45 @@ type RequestOptions = {
   timeoutMs?: number;
   maxMessageBytes?: number;
   messageIntervalMs?: number;
+  inactivityTimeoutMs?: number;
+  onInactivity?: () => Promise<void>;
 };
+
+export type EmulatorGrpcClientOptions = {
+  unaryTimeoutMs?: number;
+  streamInactivityTimeoutMs?: number;
+};
+
+export type GrpcScreenshotImageSource = "stream" | "probe";
+
+function positiveTimeout(value: number, name: string): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new RangeError(`${name} must be a positive number`);
+  }
+  return value;
+}
 
 export class EmulatorGrpcClient {
   readonly #session: http2.ClientHttp2Session;
   readonly #endpoint: GrpcEndpoint;
+  readonly #unaryTimeoutMs: number;
+  readonly #streamInactivityTimeoutMs: number;
   readonly #errorListeners = new Set<(error: Error) => void>();
   #closed = false;
 
-  constructor(endpoint: GrpcEndpoint) {
+  constructor(
+    endpoint: GrpcEndpoint,
+    options: EmulatorGrpcClientOptions = {},
+  ) {
     this.#endpoint = endpoint;
+    this.#unaryTimeoutMs = positiveTimeout(
+      options.unaryTimeoutMs ?? UNARY_TIMEOUT_MS,
+      "unaryTimeoutMs",
+    );
+    this.#streamInactivityTimeoutMs = positiveTimeout(
+      options.streamInactivityTimeoutMs ?? STREAM_INACTIVITY_TIMEOUT_MS,
+      "streamInactivityTimeoutMs",
+    );
     this.#session = http2.connect(`http://127.0.0.1:${endpoint.port}`);
     this.#session.on("error", (error: Error) => {
       if (!this.#closed) {
@@ -806,24 +894,59 @@ export class EmulatorGrpcClient {
       let grpcMessage = "";
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | null = null;
+      let inactivityTimer: ReturnType<typeof setTimeout> | null = null;
+      let activityGeneration = 0;
       let pacer: GrpcMessagePacer | null = null;
-      const onMessage = (body: Buffer) => {
-        if (options.onMessage) options.onMessage(body);
-        else messages.push(body);
-      };
-      const parser = options.messageIntervalMs
-        ? null
-        : new GrpcMessageParser(maxMessageBytes, onMessage);
 
       const settle = (error?: Error) => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
+        if (inactivityTimer) clearTimeout(inactivityTimer);
         pacer?.close();
         options.signal?.removeEventListener("abort", onAbort);
         if (error) reject(error);
         else resolve(messages);
       };
+      const resetInactivityTimer = () => {
+        if (!options.inactivityTimeoutMs || settled) return;
+        if (inactivityTimer) clearTimeout(inactivityTimer);
+        const generation = ++activityGeneration;
+        inactivityTimer = setTimeout(() => {
+          inactivityTimer = null;
+          void (async () => {
+            try {
+              if (!options.onInactivity) {
+                throw new Error("no health probe is configured");
+              }
+              await options.onInactivity();
+              if (!settled && generation === activityGeneration) {
+                resetInactivityTimer();
+              }
+            } catch (error) {
+              if (settled || generation !== activityGeneration) return;
+              const detail = error instanceof Error
+                ? error.message
+                : String(error);
+              settle(
+                new Error(
+                  `${method}: no decoded message received for ${options.inactivityTimeoutMs}ms; health probe failed: ${detail}`,
+                ),
+              );
+              stream.close(http2.constants.NGHTTP2_CANCEL);
+            }
+          })();
+        }, options.inactivityTimeoutMs);
+        inactivityTimer.unref?.();
+      };
+      const onMessage = (body: Buffer) => {
+        if (options.onMessage) options.onMessage(body);
+        else messages.push(body);
+        resetInactivityTimer();
+      };
+      const parser = options.messageIntervalMs
+        ? null
+        : new GrpcMessageParser(maxMessageBytes, onMessage);
       const onAbort = () => {
         try {
           stream.close(http2.constants.NGHTTP2_CANCEL);
@@ -908,7 +1031,7 @@ export class EmulatorGrpcClient {
     const [message] = await this.#request(
       "getScreenshot",
       encodeImageFormat(format),
-      { timeoutMs: UNARY_TIMEOUT_MS, signal },
+      { timeoutMs: this.#unaryTimeoutMs, signal },
     );
     if (!message) throw new Error("getScreenshot returned no image");
     return decodeEmulatorImage(message);
@@ -916,10 +1039,11 @@ export class EmulatorGrpcClient {
 
   async streamScreenshot(
     format: ImageFormatRequest,
-    onImage: (image: EmuImage) => void,
+    onImage: (image: EmuImage, source: GrpcScreenshotImageSource) => void,
     signal: AbortSignal,
     options: { maxFps?: number } = {},
   ): Promise<void> {
+    let streamedImageGeneration = 0;
     const messageIntervalMs = options.maxFps === undefined
       ? undefined
       : 1_000 / options.maxFps;
@@ -933,7 +1057,21 @@ export class EmulatorGrpcClient {
       await this.#request("streamScreenshot", encodeImageFormat(format), {
         signal,
         messageIntervalMs,
-        onMessage: (message) => onImage(decodeEmulatorImage(message)),
+        inactivityTimeoutMs: this.#streamInactivityTimeoutMs,
+        onInactivity: async () => {
+          // Static emulator displays may legitimately stop producing stream
+          // notifications. A bounded unary capture distinguishes that from a
+          // dead endpoint and also refreshes the frame while the stream is idle.
+          const generation = streamedImageGeneration;
+          const image = await this.getScreenshot(format, signal);
+          if (generation === streamedImageGeneration && !signal.aborted) {
+            onImage(image, "probe");
+          }
+        },
+        onMessage: (message) => {
+          streamedImageGeneration++;
+          onImage(decodeEmulatorImage(message), "stream");
+        },
       });
     } catch (error) {
       if (!signal.aborted) throw error;
@@ -945,7 +1083,7 @@ export class EmulatorGrpcClient {
     signal?: AbortSignal,
   ): Promise<void> {
     await this.#request("sendTouch", encodeTouchEvent(touches), {
-      timeoutMs: UNARY_TIMEOUT_MS,
+      timeoutMs: this.#unaryTimeoutMs,
       signal,
       maxMessageBytes: 1024,
     });
@@ -956,7 +1094,7 @@ export class EmulatorGrpcClient {
     signal?: AbortSignal,
   ): Promise<void> {
     await this.#request("sendKey", encodeKeyboardEvent(event), {
-      timeoutMs: UNARY_TIMEOUT_MS,
+      timeoutMs: this.#unaryTimeoutMs,
       signal,
       maxMessageBytes: 1024,
     });

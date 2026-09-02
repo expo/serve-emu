@@ -22,7 +22,6 @@ type ReplayInputTarget = {
 
 type DeviceSessionStateOptions = {
   serial: string;
-  generation: number;
   applyLocation(
     serial: string,
     fix: GeoFix,
@@ -33,8 +32,6 @@ type DeviceSessionStateOptions = {
   routeClock?: RoutePlaybackClock;
   now?: () => number;
 };
-
-type Cleanup = () => void | Promise<void>;
 
 function abortReason(signal: AbortSignal, fallback: string): Error {
   return signal.reason instanceof Error
@@ -52,7 +49,6 @@ function abortReason(signal: AbortSignal, fallback: string): Error {
  */
 export class DeviceSessionState {
   readonly serial: string;
-  readonly generation: number;
   readonly recorder: SessionRecorder;
   readonly logcat: LogcatHub;
   readonly route: RoutePlayback;
@@ -64,14 +60,12 @@ export class DeviceSessionState {
   readonly #applyLocation: DeviceSessionStateOptions["applyLocation"];
   readonly #now: () => number;
   readonly #owners = new Set<DeviceStateOwner>();
-  readonly #cleanup = new Set<Cleanup>();
   readonly #inputTargets = new Map<DeviceStateOwner, ReplayInputTarget>();
   #activeInputOwner: DeviceStateOwner | null = null;
   #disposeTask: Promise<void> | null = null;
 
   constructor(options: DeviceSessionStateOptions) {
     this.serial = options.serial;
-    this.generation = options.generation;
     this.#applyLocation = options.applyLocation;
     this.#now = options.now ?? Date.now;
     this.recorder = options.recorder ?? new SessionRecorder();
@@ -136,15 +130,6 @@ export class DeviceSessionState {
     this.#activeInputOwner = owner;
   }
 
-  registerCleanup(cleanup: Cleanup): () => void {
-    if (this.#disposeTask) {
-      void Promise.resolve().then(cleanup).catch(() => {});
-      return () => {};
-    }
-    this.#cleanup.add(cleanup);
-    return () => this.#cleanup.delete(cleanup);
-  }
-
   async applyLocation(
     fix: GeoFix,
     signal: AbortSignal = this.signal,
@@ -198,13 +183,8 @@ export class DeviceSessionState {
     this.route.stop();
     this.route.close();
     this.logcat.close(reason);
-    const cleanups = Array.from(this.#cleanup);
-    this.#cleanup.clear();
     this.#disposeTask = (async () => {
       await this.recorder.dispose();
-      await Promise.allSettled(
-        cleanups.map((cleanup) => Promise.resolve().then(cleanup)),
-      );
       // A start awaiting its first fix may otherwise install a timer after the
       // initial close. Closing twice is deliberately idempotent.
       this.route.stop();

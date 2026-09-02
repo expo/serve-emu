@@ -475,8 +475,14 @@ See the [protocol reference](packages/serve-emu/docs/protocol.md) for the comple
 4. The Bun server reads scrcpy's framed H.264 stream and publishes each access unit over the selected WebSocket or WebRTC transport. Raw `/ws` clients receive Annex-B payloads unchanged; the built-in WebSocket UI opts into the 24-byte frame metadata header.
 5. The browser uses WebCodecs in a worker, falls back to MSE where necessary, or renders the WebRTC track into a `<video>`. Pointer events are normalized to unit coordinates and dispatched through the active source's ordered control channel.
 
-With `--stream-mode grpc-screenshot`, the emulator's loopback gRPC endpoint
-provides raw RGB frames and accepts touch/key input on the host. `serve-emu`
+With `--stream-mode grpc-screenshot`, the emulator's gRPC endpoint provides raw
+RGB frames and accepts touch/key input on the host. `serve-emu` uses the bearer
+token advertised by the emulator's discovery file when one is present. If an
+explicitly selected emulator exposes an endpoint without a token, `serve-emu`
+prints a warning before using that local endpoint; only select this mode for an
+emulator you trust.
+
+`serve-emu`
 encodes those frames with ffmpeg/libx264 into the same Annex-B H.264 packet
 shape, so browser streaming, backpressure recovery, recording, and the REST and
 WebSocket control APIs remain unchanged. The UI can replace either source at

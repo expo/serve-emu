@@ -1,5 +1,7 @@
 import { ControlInputQueue } from "./control-input-queue.ts";
+import { isEmulatorSerial } from "./device-capabilities.ts";
 import { startGrpcSession } from "./grpc-session.ts";
+import { H264StartupGate } from "./h264-readiness.ts";
 import {
   startScrcpy,
   type ScrcpySession,
@@ -8,6 +10,12 @@ import {
 } from "./scrcpy.ts";
 import type { StreamMode } from "./shared/api-contracts.ts";
 import { isAbnormalExit, procExitDetail } from "./session-status.ts";
+
+const SCRCPY_READINESS_TIMEOUT_MS = 10_000;
+const MAX_SCRCPY_STARTUP_PACKETS = 256;
+const MAX_SCRCPY_STARTUP_BYTES = 64 * 1024 * 1024;
+const STARTUP_READY: unique symbol = Symbol("scrcpy-startup-ready");
+const NEVER_ABORTED = new AbortController().signal;
 
 export type StreamFailure = {
   message: string;
@@ -29,6 +37,7 @@ export type EmuSession = {
   /** Present only on the scrcpy adapter during the server migration. */
   readonly rawScrcpy?: ScrcpySession;
   readFrame(): Promise<VideoPacket | null>;
+  /** Emits only the first terminal failure and immediately replays it to late subscribers. */
   onFatal(listener: (failure: StreamFailure) => void): () => void;
   close(): Promise<void>;
 };
@@ -42,7 +51,7 @@ export async function startEmuSession(
   options: StartEmuSessionOptions,
 ): Promise<EmuSession> {
   if (options.mode === "grpc-screenshot") {
-    if (!/^emulator-\d+$/.test(options.serial)) {
+    if (!isEmulatorSerial(options.serial)) {
       throw new Error(
         `grpc-screenshot requires an Android Emulator serial; received ${options.serial}`,
       );
@@ -53,19 +62,80 @@ export async function startEmuSession(
     const exhaustive: never = options.mode;
     throw new Error(`unsupported stream mode ${String(exhaustive)}`);
   }
-  return adaptScrcpySession(await startScrcpy(options));
+  return prepareDecodableScrcpySession(
+    await startScrcpy(options),
+    options.signal,
+  );
+}
+
+/**
+ * Buffer scrcpy output until SPS, PPS, and an initial keyframe are available.
+ * This keeps a replacement private until a newly joined browser can decode it.
+ */
+export async function prepareDecodableScrcpySession(
+  raw: ScrcpySession,
+  signal: AbortSignal = NEVER_ABORTED,
+  timeoutMs = SCRCPY_READINESS_TIMEOUT_MS,
+): Promise<EmuSession> {
+  const gate = new H264StartupGate();
+  const buffered: VideoPacket[] = [];
+  let bufferedBytes = 0;
+  const readiness = gate.wait(signal, timeoutMs);
+
+  try {
+    while (!gate.ready) {
+      const packet = await Promise.race([
+        raw.readFrame(),
+        readiness.then(() => STARTUP_READY),
+      ]);
+      if (typeof packet === "symbol") break;
+      if (packet === null) {
+        throw new Error(
+          "scrcpy stream ended before producing decodable H.264 output",
+        );
+      }
+
+      bufferedBytes += packet.type === "frame" ? packet.data.length : 16;
+      if (
+        buffered.length >= MAX_SCRCPY_STARTUP_PACKETS ||
+        bufferedBytes > MAX_SCRCPY_STARTUP_BYTES
+      ) {
+        throw new Error("scrcpy startup output exceeded the readiness buffer");
+      }
+      buffered.push(packet);
+      if (packet.type === "frame") gate.observe(packet);
+    }
+    await readiness;
+    return adaptScrcpySession(raw, undefined, buffered);
+  } catch (error) {
+    const cause = error instanceof Error ? error : new Error(String(error));
+    gate.fail(cause);
+    await readiness.catch(() => {});
+    try {
+      await raw.close();
+    } catch (cleanupError) {
+      throw new AggregateError([cause, cleanupError], cause.message, {
+        cause,
+      });
+    }
+    throw cause;
+  }
 }
 
 export function adaptScrcpySession(
   raw: ScrcpySession,
   controls = new ControlInputQueue({ socket: raw.controlSocket }),
+  initialPackets: readonly VideoPacket[] = [],
 ): EmuSession {
   const listeners = new Set<(failure: StreamFailure) => void>();
+  const buffered = [...initialPackets];
   let closed = false;
   let closeTask: Promise<void> | null = null;
+  let fatalFailure: StreamFailure | null = null;
 
   const emitFatal = (failure: StreamFailure) => {
-    if (closed) return;
+    if (closed || fatalFailure) return;
+    fatalFailure = failure;
     for (const listener of listeners) listener(failure);
   };
   const onExit = (
@@ -91,9 +161,13 @@ export function adaptScrcpySession(
     meta: raw.meta,
     controls,
     rawScrcpy: raw,
-    readFrame: raw.readFrame,
+    readFrame() {
+      const packet = buffered.shift();
+      return packet ? Promise.resolve(packet) : raw.readFrame();
+    },
     onFatal(listener) {
       listeners.add(listener);
+      if (fatalFailure) listener(fatalFailure);
       return () => listeners.delete(listener);
     },
     close() {
@@ -102,6 +176,7 @@ export function adaptScrcpySession(
       raw.proc.off("exit", onExit);
       raw.controlSocket.off("error", onControlError);
       controls.close(new Error("stream session closed"));
+      buffered.length = 0;
       listeners.clear();
       closeTask = Promise.resolve(raw.close());
       return closeTask;

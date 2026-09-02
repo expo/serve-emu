@@ -9,6 +9,7 @@ import {
   parseDeviceGridResponse,
   parseHealthResponse,
   parseLogcatEventJson,
+  parseStreamModeRequest,
   parseStreamModeResponse,
   type ApiPath,
   type ApiRequest,
@@ -38,6 +39,18 @@ describe("API contracts", () => {
     expect(isStreamMode("grpc-screenshot")).toBe(true);
     expect(isStreamMode("screen-copy")).toBe(false);
     expect(isStreamMode(null)).toBe(false);
+  });
+
+  test("validates the shared stream mode request", () => {
+    expect(parseStreamModeRequest({ mode: "grpc-screenshot" })).toEqual({
+      mode: "grpc-screenshot",
+    });
+    expect(() => parseStreamModeRequest(null)).toThrow(
+      "stream mode request must be an object",
+    );
+    expect(() => parseStreamModeRequest({ mode: "screen-copy" })).toThrow(
+      "stream mode request.mode is invalid",
+    );
   });
 
   test("accepts every stable failure code and rejects drift", () => {

@@ -20,6 +20,9 @@ function deferred<T>(): Deferred<T> {
 function fakeSession(serial: string, mode: StreamMode) {
   const end = deferred<null>();
   let closeCalls = 0;
+  const fatalListeners = new Set<
+    Parameters<EmuSession["onFatal"]>[0]
+  >();
   const controls = new ControlInputQueue({
     writer: { async write() {} },
   });
@@ -34,14 +37,23 @@ function fakeSession(serial: string, mode: StreamMode) {
     },
     controls,
     readFrame: () => end.promise,
-    onFatal: () => () => {},
+    onFatal(listener) {
+      fatalListeners.add(listener);
+      return () => fatalListeners.delete(listener);
+    },
     async close() {
       closeCalls += 1;
       controls.close();
       end.resolve(null);
     },
   };
-  return { session, closeCalls: () => closeCalls };
+  return {
+    session,
+    closeCalls: () => closeCalls,
+    fail(message: string) {
+      for (const listener of fatalListeners) listener({ message });
+    },
+  };
 }
 
 type CapturedServer = {
@@ -92,6 +104,34 @@ const postJson = (
   });
 
 describe("server stream source switching", () => {
+  test("uses the shared stream mode request validation", async () => {
+    const initial = fakeSession("emulator-5554", "scrcpy");
+    const captured: CapturedServer = { options: null };
+    const started = await startServer(
+      { serial: "emulator-5554", port: 3300 },
+      {
+        openSession: async () => initial.session,
+        serve: capturingServe(captured),
+      },
+    );
+
+    const response = await request(captured, "/api/stream-mode", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "screen-copy" }),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      ok: false,
+      error: {
+        code: "invalid_request",
+        message: "stream mode request.mode is invalid",
+      },
+    });
+
+    await started.stop();
+  });
+
   test("rejects an explicit initial gRPC source for a physical device", async () => {
     let openCalls = 0;
     await expect(
@@ -147,6 +187,18 @@ describe("server stream source switching", () => {
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 0,
     });
+    const methodNotAllowed = await request(captured, "/api/stream-mode", {
+      method: "POST",
+    });
+    expect(methodNotAllowed.status).toBe(405);
+    expect(methodNotAllowed.headers.get("allow")).toBe("GET, PUT");
+    expect(await methodNotAllowed.json()).toEqual({
+      ok: false,
+      error: {
+        code: "method_not_allowed",
+        message: "Method must be GET or PUT",
+      },
+    });
 
     const switching = putMode(captured, "grpc-screenshot");
     await grpcStarted.promise;
@@ -172,7 +224,13 @@ describe("server stream source switching", () => {
     failScrcpy = true;
     const failed = await putMode(captured, "scrcpy");
     expect(failed.status).toBe(503);
-    expect(await failed.json()).toMatchObject({ error: "replacement failed" });
+    expect(await failed.json()).toEqual({
+      ok: false,
+      error: {
+        code: "service_unavailable",
+        message: "replacement failed",
+      },
+    });
     expect(
       (await (await request(captured, "/api/stream-mode")).json()).mode,
     ).toBe("grpc-screenshot");
@@ -251,6 +309,72 @@ describe("server stream source switching", () => {
     await started.stop();
   });
 
+  test("creates fresh device state when switching after a terminal failure", async () => {
+    const failed = fakeSession("emulator-5554", "scrcpy");
+    const replacement = fakeSession("emulator-5554", "grpc-screenshot");
+    let openCount = 0;
+    const captured: CapturedServer = { options: null };
+    const started = await startServer(
+      { serial: "emulator-5554", port: 3300 },
+      {
+        openSession: async () =>
+          openCount++ === 0 ? failed.session : replacement.session,
+        serve: capturingServe(captured),
+      },
+    );
+
+    failed.fail("capture process exited");
+    expect((await (await request(captured, "/health")).json()).status).toBe(
+      "error",
+    );
+
+    const response = await putMode(captured, "grpc-screenshot");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      ok: true,
+      mode: "grpc-screenshot",
+      sessionGeneration: 1,
+    });
+
+    await started.stop();
+  });
+
+  test("retains device state when the old source fails during replacement startup", async () => {
+    const initial = fakeSession("emulator-5554", "scrcpy");
+    const replacement = fakeSession("emulator-5554", "grpc-screenshot");
+    const replacementStart = deferred<EmuSession>();
+    const replacementRequested = deferred<void>();
+    let openCount = 0;
+    const captured: CapturedServer = { options: null };
+    const started = await startServer(
+      { serial: "emulator-5554", port: 3300 },
+      {
+        openSession: async () => {
+          openCount += 1;
+          if (openCount === 1) return initial.session;
+          replacementRequested.resolve(undefined);
+          return replacementStart.promise;
+        },
+        serve: capturingServe(captured),
+      },
+    );
+
+    const switching = putMode(captured, "grpc-screenshot");
+    await replacementRequested.promise;
+    initial.fail("capture process exited during replacement startup");
+    replacementStart.resolve(replacement.session);
+
+    const response = await switching;
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      ok: true,
+      mode: "grpc-screenshot",
+      sessionGeneration: 1,
+    });
+
+    await started.stop();
+  });
+
   test("does not offer or start gRPC capture for a physical device", async () => {
     const physical = fakeSession("usb-device", "scrcpy");
     const captured: CapturedServer = { options: null };
@@ -268,8 +392,13 @@ describe("server stream source switching", () => {
     });
     const response = await putMode(captured, "grpc-screenshot");
     expect(response.status).toBe(400);
-    expect(await response.json()).toMatchObject({
-      error: "grpc-screenshot is available only for Android Emulator devices",
+    expect(await response.json()).toEqual({
+      ok: false,
+      error: {
+        code: "invalid_request",
+        message:
+          "grpc-screenshot is available only for Android Emulator devices",
+      },
     });
     await started.stop();
   });

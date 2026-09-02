@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  GrpcAccessUnitBoundaryCadence,
+  GrpcEncoderLifecycle,
   GrpcFrameWritePacer,
   GrpcInputState,
   GrpcNativeTouchGeometryMonitor,
+  GrpcVideoPacketQueue,
   H264StartupGate,
   androidKeyGestureToKeyboardEvents,
   androidKeycodeToW3c,
@@ -10,10 +13,19 @@ import {
   normalizeGrpcGestureText,
   normalizeGrpcText,
   parseDisplaySizeSignal,
-  readInitialDisplayRotation,
   resolveGrpcDisplayGeometry,
+  startGrpcSession,
+  type GrpcSessionClient,
+  type GrpcSessionEncoder,
+  type GrpcSessionRuntime,
 } from "../src/grpc-session.ts";
-import { IMG_FORMAT_RGB888 } from "../src/emulator-grpc.ts";
+import {
+  IMG_FORMAT_RGB888,
+  type EmuImage,
+  type GrpcScreenshotImageSource,
+  type KeyboardEventRequest,
+} from "../src/emulator-grpc.ts";
+import type { H264EncoderOpts, QuarterTurn } from "../src/h264-encoder.ts";
 import { compileGesture, parseGesture } from "../src/input.ts";
 import type { VideoFrame } from "../src/scrcpy.ts";
 
@@ -148,29 +160,18 @@ describe("gRPC screenshot session helpers", () => {
     ).toBe(false);
   });
 
-  test("derives rotated encoded size and logical touch coordinates", () => {
+  test("uses the oriented screenshot dimensions and touch coordinate space", () => {
     const geometry = resolveGrpcDisplayGeometry({
-      inputWidth: 288,
-      inputHeight: 640,
+      inputWidth: 289,
+      inputHeight: 641,
       nativeWidth: 1080,
       nativeHeight: 2400,
-      quarterTurn: 1,
     });
 
-    expect(geometry.encodedSize).toEqual({ width: 640, height: 288 });
+    expect(geometry.encodedSize).toEqual({ width: 288, height: 640 });
     expect(geometry.touchSize).toEqual({ width: 1080, height: 2400 });
-    expect(geometry.mapTouch(0.25, 0.75)).toEqual({ x: 270, y: 600 });
-    expect(geometry.mapTouch(1, 1)).toEqual({ x: 0, y: 2399 });
-
-    expect(
-      resolveGrpcDisplayGeometry({
-        inputWidth: 288,
-        inputHeight: 640,
-        nativeWidth: 1080,
-        nativeHeight: 2400,
-        quarterTurn: 3,
-      }).mapTouch(0.25, 0.75),
-    ).toEqual({ x: 810, y: 1800 });
+    expect(geometry.mapTouch(0.25, 0.75)).toEqual({ x: 270, y: 1800 });
+    expect(geometry.mapTouch(1, 1)).toEqual({ x: 1079, y: 2399 });
   });
 
   test("does not let a boundary repeat delay the next fresh frame", () => {
@@ -188,6 +189,234 @@ describe("gRPC screenshot session helpers", () => {
 
     pacer.recordWrite(50, false);
     expect(pacer.waitMs(50)).toBe(50);
+  });
+
+  test("learns a robust boundary cadence without retaining idle gaps", () => {
+    const cadence = new GrpcAccessUnitBoundaryCadence(1_000 / 60);
+    cadence.recordFreshImage(0);
+    expect(cadence.boundaryDelayMs()).toBe(100);
+
+    for (const now of [50, 100, 150, 200]) cadence.recordFreshImage(now);
+    expect(cadence.boundaryDelayMs()).toBe(75);
+
+    // An isolated slower frame does not dominate the rolling estimate.
+    cadence.recordFreshImage(300);
+    expect(cadence.boundaryDelayMs()).toBe(75);
+
+    // A static pause is ignored rather than poisoning the learned cadence.
+    cadence.recordFreshImage(1_000);
+    expect(cadence.boundaryDelayMs()).toBe(75);
+
+    // A genuinely slow source is learned, but final-frame latency stays bounded.
+    const slowCadence = new GrpcAccessUnitBoundaryCadence(1_000 / 60);
+    slowCadence.recordFreshImage(0);
+    slowCadence.recordFreshImage(1_000);
+    expect(slowCadence.boundaryDelayMs()).toBe(100);
+    slowCadence.recordFreshImage(2_000);
+    expect(slowCadence.boundaryDelayMs()).toBe(250);
+  });
+
+  test("serializes and coalesces encoder resets without clearing queued packets", async () => {
+    const queuedPackets = ["encoded-before-reset"];
+    const createRequests: Array<{
+      announceSize: boolean;
+      clearPending: boolean;
+    }> = [];
+    let nextId = 0;
+    let active = 0;
+    let maxActive = 0;
+    let releaseFirstClose!: () => void;
+    const firstClose = new Promise<void>((resolve) => {
+      releaseFirstClose = resolve;
+    });
+
+    const lifecycle = new GrpcEncoderLifecycle((restart) => {
+      createRequests.push(restart);
+      if (restart.clearPending) queuedPackets.length = 0;
+      const id = ++nextId;
+      let encoderClosed = false;
+      active++;
+      maxActive = Math.max(maxActive, active);
+      return {
+        async close() {
+          if (encoderClosed) return;
+          encoderClosed = true;
+          if (id === 1) await firstClose;
+          active--;
+        },
+      };
+    });
+
+    await lifecycle.restart({ announceSize: false, clearPending: false });
+    const restarting = lifecycle.restart({
+      announceSize: true,
+      clearPending: false,
+    });
+    const coalesced = lifecycle.restart({
+      announceSize: false,
+      clearPending: false,
+    });
+
+    expect(restarting).toBe(coalesced);
+    expect(createRequests).toHaveLength(1);
+    releaseFirstClose();
+    await restarting;
+
+    expect(createRequests).toEqual([
+      { announceSize: false, clearPending: false },
+      { announceSize: true, clearPending: false },
+    ]);
+    expect(queuedPackets).toEqual(["encoded-before-reset"]);
+    expect(maxActive).toBe(1);
+
+    await lifecycle.close();
+    expect(active).toBe(0);
+  });
+
+  test("does not lose a reset requested as the lifecycle drain completes", async () => {
+    const createRequests: Array<{
+      announceSize: boolean;
+      clearPending: boolean;
+    }> = [];
+    let boundaryRestart: Promise<unknown> | null = null;
+    let lifecycle!: GrpcEncoderLifecycle<{ close(): Promise<void> }>;
+    lifecycle = new GrpcEncoderLifecycle((restart) => {
+      createRequests.push(restart);
+      if (createRequests.length === 1) {
+        queueMicrotask(() => {
+          queueMicrotask(() => {
+            boundaryRestart = lifecycle.restart({
+              announceSize: true,
+              clearPending: false,
+            });
+          });
+        });
+      }
+      return { async close() {} };
+    });
+
+    await lifecycle.restart({ announceSize: false, clearPending: false });
+    await Promise.resolve();
+    expect(boundaryRestart).not.toBeNull();
+    await boundaryRestart;
+
+    expect(createRequests).toEqual([
+      { announceSize: false, clearPending: false },
+      { announceSize: true, clearPending: false },
+    ]);
+    await lifecycle.close();
+  });
+
+  test("bounds queued H.264 bytes at a decodable keyframe boundary", () => {
+    const config: VideoFrame = {
+      ...CONFIG_FRAME,
+      data: Buffer.from([0x67, 0x01]),
+    };
+    const firstKey: VideoFrame = {
+      ...KEY_FRAME,
+      data: Buffer.from([0x65, 0x01]),
+    };
+    const delta: VideoFrame = {
+      ...KEY_FRAME,
+      data: Buffer.alloc(5, 0x41),
+      isKey: false,
+    };
+    const latestKey: VideoFrame = {
+      ...KEY_FRAME,
+      data: Buffer.from([0x65, 0x02]),
+    };
+    const queue = new GrpcVideoPacketQueue(10);
+
+    expect(queue.push(config).queued).toBe(true);
+    expect(queue.push(firstKey).queued).toBe(true);
+    expect(queue.push(delta).queued).toBe(true);
+    expect(queue.push(latestKey)).toEqual({
+      queued: true,
+      needsKeyFrame: false,
+    });
+
+    expect(queue.byteLength).toBe(4);
+    expect(queue.shift()).toBe(config);
+    expect(queue.shift()).toBe(latestKey);
+    expect(queue.shift()).toBeUndefined();
+  });
+
+  test("keeps the config associated with the retained keyframe", () => {
+    const configA: VideoFrame = {
+      ...CONFIG_FRAME,
+      data: Buffer.from([0x67, 0x01]),
+    };
+    const firstKey: VideoFrame = {
+      ...KEY_FRAME,
+      data: Buffer.from([0x65, 0x00]),
+    };
+    const oldDelta: VideoFrame = {
+      ...KEY_FRAME,
+      data: Buffer.alloc(5, 0x40),
+      isKey: false,
+    };
+    const retainedKey: VideoFrame = {
+      ...KEY_FRAME,
+      data: Buffer.from([0x65, 0x01]),
+    };
+    const retainedDelta: VideoFrame = {
+      ...KEY_FRAME,
+      data: Buffer.from([0x41]),
+      isKey: false,
+    };
+    const configB: VideoFrame = {
+      ...CONFIG_FRAME,
+      data: Buffer.from([0x67, 0x02]),
+    };
+    const queue = new GrpcVideoPacketQueue(12);
+
+    queue.push(configA);
+    queue.push(firstKey);
+    queue.push(oldDelta);
+    queue.push(retainedKey);
+    queue.push(retainedDelta);
+    expect(queue.push(configB)).toEqual({
+      queued: true,
+      needsKeyFrame: false,
+    });
+
+    expect(queue.shift()).toBe(configA);
+    expect(queue.shift()).toBe(retainedKey);
+    expect(queue.shift()).toBe(retainedDelta);
+    expect(queue.shift()).toBe(configB);
+    expect(queue.shift()).toBeUndefined();
+  });
+
+  test("drops deltas and requests a keyframe when no safe queue boundary exists", () => {
+    const config: VideoFrame = {
+      ...CONFIG_FRAME,
+      data: Buffer.from([0x67, 0x01]),
+    };
+    const delta: VideoFrame = {
+      ...KEY_FRAME,
+      data: Buffer.alloc(4, 0x41),
+      isKey: false,
+    };
+    const key: VideoFrame = {
+      ...KEY_FRAME,
+      data: Buffer.from([0x65, 0x01]),
+    };
+    const queue = new GrpcVideoPacketQueue(8);
+
+    queue.push(config);
+    queue.push(delta);
+    expect(queue.push(delta)).toEqual({
+      queued: false,
+      needsKeyFrame: true,
+    });
+    expect(queue.byteLength).toBe(0);
+    expect(queue.push(delta).queued).toBe(false);
+    expect(queue.push(config).queued).toBe(false);
+    expect(queue.push(key).queued).toBe(true);
+
+    expect(queue.shift()).toBe(config);
+    expect(queue.shift()).toBe(key);
+    expect(queue.shift()).toBeUndefined();
   });
 
   test("refreshes native touch size only after the display-size signal changes", async () => {
@@ -229,6 +458,36 @@ describe("gRPC screenshot session helpers", () => {
     await monitor.poll(signal);
     expect(probeCalls).toBe(3);
     expect(updates.at(-1)).toEqual({ width: 1200, height: 2400 });
+  });
+
+  test("reruns a forced native-size probe and suppresses its stale result", async () => {
+    let resolveFirstProbe!: (size: { width: number; height: number }) => void;
+    let probeCalls = 0;
+    const updates: Array<{ width: number; height: number }> = [];
+    const monitor = new GrpcNativeTouchGeometryMonitor({
+      initialDisplaySizeSignal: "physical:1080x2400",
+      readDisplaySizeSignal: async () => "physical:1080x2400",
+      readNativeImage: async () => {
+        probeCalls++;
+        if (probeCalls === 1) {
+          return new Promise((resolve) => {
+            resolveFirstProbe = resolve;
+          });
+        }
+        return { width: 1080, height: 2400 };
+      },
+      onNativeSize: (size) => updates.push(size),
+    });
+    const signal = new AbortController().signal;
+
+    const firstRotation = monitor.poll(signal, true);
+    await Promise.resolve();
+    const secondRotation = monitor.poll(signal, true);
+    resolveFirstProbe({ width: 2400, height: 1080 });
+    await Promise.all([firstRotation, secondRotation]);
+
+    expect(probeCalls).toBe(2);
+    expect(updates).toEqual([{ width: 1080, height: 2400 }]);
   });
 
   test("parses bounded physical and override size signals", () => {
@@ -302,7 +561,7 @@ describe("gRPC screenshot session helpers", () => {
     expect(cleanup.signal.aborted).toBe(false);
   });
 
-  test("rejects the entire non-ASCII text payload before normalization", () => {
+  test("validates the normalized text shared by both control backends", () => {
     expect(normalizeGrpcText("hello\nworld")).toBe("hello\nworld");
     expect(() => normalizeGrpcText(`${"a".repeat(300)}é`)).toThrow(
       "ASCII text only",
@@ -318,35 +577,7 @@ describe("gRPC screenshot session helpers", () => {
     }).gesture;
     if (compiled.type !== "text") throw new Error("expected text gesture");
     expect(compiled.text).toBe("a".repeat(300));
-    expect(() => normalizeGrpcGestureText(compiled)).toThrow(
-      "ASCII text only",
-    );
-  });
-
-  test("keeps startup recoverable when the initial rotation read fails", async () => {
-    const warnings: string[] = [];
-
-    await expect(
-      readInitialDisplayRotation(
-        () => Promise.reject(new Error("adb queue unavailable")),
-        new AbortController().signal,
-        (message) => warnings.push(message),
-      ),
-    ).resolves.toBeNull();
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain("polling for recovery");
-  });
-
-  test("does not hide an aborted initial rotation read", async () => {
-    const controller = new AbortController();
-    controller.abort(new Error("switch cancelled"));
-
-    await expect(
-      readInitialDisplayRotation(
-        () => Promise.reject(new Error("adb aborted")),
-        controller.signal,
-      ),
-    ).rejects.toThrow("switch cancelled");
+    expect(normalizeGrpcGestureText(compiled)).toBe("a".repeat(300));
   });
 
   test("becomes ready only after H.264 config and a keyframe", async () => {
@@ -390,5 +621,307 @@ describe("gRPC screenshot session helpers", () => {
     await expect(
       new H264StartupGate().wait(new AbortController().signal, 5),
     ).rejects.toThrow("timed out waiting for decodable H.264 output");
+  });
+});
+
+class FakeGrpcClient implements GrpcSessionClient {
+  readonly keys: KeyboardEventRequest[] = [];
+  readonly touches: unknown[] = [];
+  closed = false;
+  streamImage: ((
+    image: EmuImage,
+    source: GrpcScreenshotImageSource,
+  ) => void) | null = null;
+  sessionError: ((error: Error) => void) | null = null;
+
+  constructor(
+    readonly probe: EmuImage,
+    readonly emitInitialStreamImage = true,
+  ) {}
+
+  async getScreenshot(): Promise<EmuImage> {
+    return this.probe;
+  }
+
+  streamScreenshot(
+    _format: unknown,
+    onImage: (image: EmuImage, source: GrpcScreenshotImageSource) => void,
+    signal: AbortSignal,
+  ): Promise<void> {
+    this.streamImage = onImage;
+    if (this.emitInitialStreamImage) onImage(this.probe, "stream");
+    return new Promise((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+
+  async sendTouch(points: unknown[]): Promise<void> {
+    this.touches.push(points);
+  }
+
+  async sendKey(event: KeyboardEventRequest): Promise<void> {
+    this.keys.push(event);
+  }
+
+  onSessionError(listener: (error: Error) => void): () => void {
+    this.sessionError = listener;
+    return () => {
+      if (this.sessionError === listener) this.sessionError = null;
+    };
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+}
+
+class FakeGrpcEncoder implements GrpcSessionEncoder {
+  readonly width: number;
+  readonly height: number;
+  readonly quarterTurn: QuarterTurn;
+  closed = false;
+  writes = 0;
+  acceptedWrites = 0;
+  #published = false;
+
+  constructor(
+    readonly options: H264EncoderOpts,
+    readonly behavior: {
+      writeResults?: boolean[];
+      publishAfterAcceptedWrites?: number;
+    } = {},
+  ) {
+    this.width = options.width;
+    this.height = options.height;
+    this.quarterTurn = options.quarterTurn ?? 0;
+  }
+
+  write(_rgb: Buffer, _ptsUs: bigint): boolean {
+    this.writes++;
+    const accepted = this.behavior.writeResults?.shift() ?? true;
+    if (!accepted) return false;
+    this.acceptedWrites++;
+    if (
+      !this.#published &&
+      this.acceptedWrites >= (this.behavior.publishAfterAcceptedWrites ?? 1)
+    ) {
+      this.#published = true;
+      this.options.onFrame(CONFIG_FRAME);
+      this.options.onFrame(KEY_FRAME);
+    }
+    return true;
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+  }
+}
+
+function integrationImage(
+  rotation = 0,
+  width = 4,
+  height = 6,
+): EmuImage {
+  return {
+    width,
+    height,
+    format: IMG_FORMAT_RGB888,
+    rotation,
+    image: Buffer.alloc(width * height * 3),
+    seq: rotation + 1,
+    timestampUs: BigInt(rotation + 1),
+  };
+}
+
+function integrationRuntime(
+  client: FakeGrpcClient,
+  encoders: FakeGrpcEncoder[],
+  encoderBehavior: {
+    writeResults?: boolean[];
+    publishAfterAcceptedWrites?: number;
+  } = {},
+): GrpcSessionRuntime {
+  return {
+    async assertFfmpeg() {},
+    async ensureEndpoint() {
+      return { port: 8554, token: "token", avdName: "Pixel_9" };
+    },
+    createClient: () => client,
+    createEncoder: (options) => {
+      const encoder = new FakeGrpcEncoder(options, encoderBehavior);
+      encoders.push(encoder);
+      return encoder;
+    },
+    async isDeviceAwake() {
+      return true;
+    },
+    async wakeDevice() {},
+    async sleep() {},
+  };
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 250; attempt++) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error("condition was not reached");
+}
+
+describe("startGrpcSession integration", () => {
+  test("starts, routes hardware controls through gRPC keys, and closes resources", async () => {
+    const client = new FakeGrpcClient(integrationImage());
+    const encoders: FakeGrpcEncoder[] = [];
+    const session = await startGrpcSession(
+      { serial: "emulator-5554" },
+      {
+        readDisplaySizeSignal: async () => "physical:4x6",
+        runtime: integrationRuntime(client, encoders),
+      },
+    );
+
+    for (const type of ["back", "home", "recents", "power"] as const) {
+      await session.controls.enqueue(
+        { type },
+        { width: 4, height: 6 },
+      ).completion;
+    }
+
+    expect(client.keys).toEqual([
+      { key: "GoBack" },
+      { key: "GoHome" },
+      { key: "AppSwitch" },
+      { key: "Power" },
+    ]);
+    expect(encoders).toHaveLength(1);
+    await waitFor(() => encoders[0]!.writes >= 2);
+    await session.readFrame();
+    await session.readFrame();
+    const pendingRead = session.readFrame();
+    await session.close();
+    await expect(pendingRead).resolves.toBeNull();
+    expect(client.closed).toBe(true);
+    expect(encoders[0]!.closed).toBe(true);
+  });
+
+  test("retries a boundary write rejected by encoder backpressure", async () => {
+    const client = new FakeGrpcClient(integrationImage());
+    const encoders: FakeGrpcEncoder[] = [];
+    const session = await startGrpcSession(
+      { serial: "emulator-5554" },
+      {
+        readDisplaySizeSignal: async () => "physical:4x6",
+        runtime: integrationRuntime(client, encoders, {
+          writeResults: [true, false, true],
+          publishAfterAcceptedWrites: 2,
+        }),
+      },
+    );
+
+    expect(encoders[0]!.writes).toBe(3);
+    expect(encoders[0]!.acceptedWrites).toBe(2);
+    await session.close();
+  });
+
+  test("uses the bounded startup boundary flush at a very low max FPS", async () => {
+    const client = new FakeGrpcClient(integrationImage());
+    const encoders: FakeGrpcEncoder[] = [];
+    const session = await startGrpcSession(
+      { serial: "emulator-5554", maxFps: 0.01 },
+      {
+        readDisplaySizeSignal: async () => "physical:4x6",
+        runtime: integrationRuntime(client, encoders, {
+          publishAfterAcceptedWrites: 2,
+        }),
+      },
+    );
+
+    expect(encoders[0]!.writes).toBe(2);
+    await session.close();
+  });
+
+  test("does not rotate or restart an already oriented streamed image", async () => {
+    const client = new FakeGrpcClient(integrationImage());
+    const encoders: FakeGrpcEncoder[] = [];
+    const session = await startGrpcSession(
+      { serial: "emulator-5554" },
+      {
+        readDisplaySizeSignal: async () => "physical:4x6",
+        runtime: integrationRuntime(client, encoders),
+      },
+    );
+
+    client.streamImage!(integrationImage(2), "stream");
+    await Promise.resolve();
+
+    expect(encoders.map((encoder) => encoder.quarterTurn)).toEqual([0]);
+    expect(encoders[0]!.closed).toBe(false);
+    await session.close();
+  });
+
+  test("restarts the encoder once when streamed image dimensions change", async () => {
+    const client = new FakeGrpcClient(integrationImage());
+    const encoders: FakeGrpcEncoder[] = [];
+    const session = await startGrpcSession(
+      { serial: "emulator-5554" },
+      {
+        readDisplaySizeSignal: async () => "physical:4x6",
+        runtime: integrationRuntime(client, encoders),
+      },
+    );
+
+    client.streamImage!(integrationImage(0, 6, 4), "stream");
+    await waitFor(() => encoders.length === 2);
+
+    expect(encoders.map(({ width, height }) => ({ width, height }))).toEqual([
+      { width: 4, height: 6 },
+      { width: 6, height: 4 },
+    ]);
+    expect(encoders.map((encoder) => encoder.quarterTurn)).toEqual([0, 0]);
+    await session.close();
+  });
+
+  test("latches a transport failure for late subscribers", async () => {
+    const client = new FakeGrpcClient(integrationImage());
+    const session = await startGrpcSession(
+      { serial: "emulator-5554" },
+      {
+        readDisplaySizeSignal: async () => "physical:4x6",
+        runtime: integrationRuntime(client, []),
+      },
+    );
+    const early: unknown[] = [];
+    const late: unknown[] = [];
+    session.onFatal((failure) => early.push(failure));
+
+    client.sessionError!(new Error("connection reset"));
+    session.onFatal((failure) => late.push(failure));
+
+    expect(early).toEqual([
+      {
+        message: "emulator gRPC connection error: connection reset",
+        code: "grpc-connection-error",
+      },
+    ]);
+    expect(late).toEqual(early);
+    await session.close();
+  });
+
+  test("aborts startup and closes the client while waiting for its first stream image", async () => {
+    const controller = new AbortController();
+    const client = new FakeGrpcClient(integrationImage(), false);
+    const starting = startGrpcSession(
+      { serial: "emulator-5554", signal: controller.signal },
+      {
+        readDisplaySizeSignal: async () => "physical:4x6",
+        runtime: integrationRuntime(client, []),
+      },
+    );
+    await waitFor(() => client.streamImage !== null);
+
+    controller.abort(new Error("source switch cancelled"));
+
+    await expect(starting).rejects.toThrow("source switch cancelled");
+    expect(client.closed).toBe(true);
   });
 });

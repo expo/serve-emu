@@ -426,6 +426,127 @@ describe("createApp session compatibility and cancellation", () => {
 });
 
 describe("createRouter stream mode", () => {
+  test("rejects cross-origin browser mutations before starting a device", async () => {
+    const state = {
+      devices: [{ serial: "emulator-5554", state: "device" }],
+      avds: [] as string[],
+      running: [] as RunningAvd[],
+      created: [] as string[],
+      stopped: [] as string[],
+    };
+    const router = createRouter({}, routerDependencies(state));
+    const response = await router.handleRequest(
+      new Request("http://router.test/api/stream-mode", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://attacker.test",
+        },
+        body: JSON.stringify({ mode: "grpc-screenshot" }),
+      }),
+    );
+
+    expect(response.status).toBe(403);
+    expect(await responseJson(response)).toEqual({
+      ok: false,
+      error: {
+        code: "forbidden",
+        message: "Browser origin is not allowed to mutate serve-emu state",
+      },
+    });
+    expect(state.created).toEqual([]);
+
+    const otherMutation = await router.handleRequest(
+      new Request("http://router.test/api/devices/select", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://attacker.test",
+        },
+        body: JSON.stringify({ serial: "emulator-5554" }),
+      }),
+    );
+    expect(otherMutation.status).toBe(403);
+    expect(state.created).toEqual([]);
+
+    const mismatchedLoopbackOrigin = await router.handleRequest(
+      new Request("http://127.0.0.1:3300/api/stream-mode", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "http://localhost:5173",
+        },
+        body: JSON.stringify({ mode: "grpc-screenshot" }),
+      }),
+    );
+    expect(mismatchedLoopbackOrigin.status).toBe(403);
+    expect(state.created).toEqual([]);
+    await router.stopAll();
+  });
+
+  test("allows configured browser origins and origin-less agent mutations", async () => {
+    const state = {
+      devices: [{ serial: "emulator-5554", state: "device" }],
+      avds: [] as string[],
+      running: [] as RunningAvd[],
+      created: [] as string[],
+      stopped: [] as string[],
+    };
+    const router = createRouter(
+      { allowedOrigins: ["https://trusted.test"] },
+      routerDependencies(state),
+    );
+
+    const trusted = await router.handleRequest(
+      new Request("http://router.test/api/stream-mode", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://trusted.test",
+        },
+        body: JSON.stringify({ mode: "scrcpy" }),
+      }),
+    );
+    expect(trusted.status).toBe(200);
+    expect(
+      (
+        await router.handleRequest(
+          put("/api/stream-mode", { mode: "scrcpy" }),
+        )
+      ).status,
+    ).toBe(200);
+    await router.stopAll();
+  });
+
+  test("uses the shared stream mode request validation", async () => {
+    const state = {
+      devices: [{ serial: "emulator-5554", state: "device" }],
+      avds: [] as string[],
+      running: [] as RunningAvd[],
+      created: [] as string[],
+      stopped: [] as string[],
+      createdModes: [] as StreamMode[],
+    };
+    const router = createRouter(
+      { serial: "emulator-5554" },
+      routerDependencies(state),
+    );
+
+    const response = await router.handleRequest(
+      put("/api/stream-mode", { mode: "screen-copy" }),
+    );
+    expect(response.status).toBe(400);
+    expect(await responseJson(response)).toEqual({
+      ok: false,
+      error: {
+        code: "invalid_request",
+        message: "stream mode request.mode is invalid",
+      },
+    });
+
+    await router.stopAll();
+  });
+
   test("reports the source and replaces it through the GET/PUT contract", async () => {
     const state = {
       devices: [{ serial: "emulator-5554", state: "device" }],
@@ -450,6 +571,18 @@ describe("createRouter stream mode", () => {
       mode: "scrcpy",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 0,
+    });
+    const methodNotAllowed = await router.handleRequest(
+      new Request("http://router.test/api/stream-mode", { method: "POST" }),
+    );
+    expect(methodNotAllowed.status).toBe(405);
+    expect(methodNotAllowed.headers.get("allow")).toBe("GET, PUT");
+    expect(await responseJson(methodNotAllowed)).toEqual({
+      ok: false,
+      error: {
+        code: "method_not_allowed",
+        message: "Method must be GET or PUT",
+      },
     });
 
     const switched = await router.handleRequest(
@@ -544,6 +677,114 @@ describe("createRouter stream mode", () => {
     );
     expect(healthAfter.location).toEqual(healthBefore.location);
     expect((healthAfter.route as JsonObject).status).toBe("running");
+    await router.stopAll();
+  });
+
+  test("creates fresh device state when switching after a terminal failure", async () => {
+    const fatalListeners = new Map<
+      StreamMode,
+      Parameters<EmuSession["onFatal"]>[0]
+    >();
+    const router = createRouter(
+      { serial: "emulator-5554" },
+      {
+        listDevices: async () => [
+          { serial: "emulator-5554", state: "device" },
+        ],
+        listAllDevices: async () => [
+          { serial: "emulator-5554", state: "device" },
+        ],
+        createApp: (options) =>
+          createApp(options, {
+            startSession: async ({ mode }) =>
+              liveStreamSession(mode, (listener) => {
+                fatalListeners.set(mode, listener);
+              }),
+            setLocation: async () => {},
+          }),
+      },
+    );
+
+    const initial = await router.handleRequest(
+      new Request("http://router.test/api/stream-mode"),
+    );
+    expect(initial.status).toBe(200);
+    const failInitial = fatalListeners.get("scrcpy");
+    if (!failInitial) throw new Error("fatal listener was not registered");
+    failInitial({ message: "capture process exited" });
+
+    const switched = await router.handleRequest(
+      put("/api/stream-mode", { mode: "grpc-screenshot" }),
+    );
+    expect(switched.status).toBe(200);
+    expect(await responseJson(switched)).toMatchObject({
+      ok: true,
+      mode: "grpc-screenshot",
+      sessionGeneration: 1,
+    });
+
+    await router.stopAll();
+  });
+
+  test("retains device state when the old source fails during replacement startup", async () => {
+    const fatalListeners = new Map<
+      StreamMode,
+      Parameters<EmuSession["onFatal"]>[0]
+    >();
+    const replacementStart = deferred<EmuSession>();
+    const replacementRequested = deferred<void>();
+    const router = createRouter(
+      { serial: "emulator-5554" },
+      {
+        listDevices: async () => [
+          { serial: "emulator-5554", state: "device" },
+        ],
+        listAllDevices: async () => [
+          { serial: "emulator-5554", state: "device" },
+        ],
+        createApp: (options) =>
+          createApp(options, {
+            startSession: async ({ mode }) => {
+              if (mode === "grpc-screenshot") {
+                replacementRequested.resolve(undefined);
+                return replacementStart.promise;
+              }
+              return liveStreamSession(mode, (listener) => {
+                fatalListeners.set(mode, listener);
+              });
+            },
+            setLocation: async () => {},
+          }),
+      },
+    );
+
+    expect(
+      (
+        await router.handleRequest(
+          new Request("http://router.test/api/stream-mode"),
+        )
+      ).status,
+    ).toBe(200);
+    const failInitial = fatalListeners.get("scrcpy");
+    if (!failInitial) throw new Error("fatal listener was not registered");
+
+    const switching = router.handleRequest(
+      put("/api/stream-mode", { mode: "grpc-screenshot" }),
+    );
+    await replacementRequested.promise;
+    failInitial({
+      message: "capture process exited during replacement startup",
+    });
+    replacementStart.resolve(liveStreamSession("grpc-screenshot"));
+
+    const response = await switching;
+    expect(response.status).toBe(200);
+    expect(await responseJson(response)).toMatchObject({
+      ok: true,
+      mode: "grpc-screenshot",
+      sessionGeneration: 1,
+    });
+
     await router.stopAll();
   });
 
@@ -667,7 +908,10 @@ describe("createRouter stream mode", () => {
     expect(failed.status).toBe(503);
     expect(await responseJson(failed)).toEqual({
       ok: false,
-      error: "gRPC startup failed",
+      error: {
+        code: "service_unavailable",
+        message: "gRPC startup failed",
+      },
     });
 
     const current = await router.handleRequest(
@@ -710,7 +954,10 @@ describe("createRouter stream mode", () => {
     expect(failed.status).toBe(503);
     expect(await responseJson(failed)).toEqual({
       ok: false,
-      error: "grpc-screenshot stopped before publication",
+      error: {
+        code: "service_unavailable",
+        message: "grpc-screenshot stopped before publication",
+      },
     });
 
     const current = await router.handleRequest(
@@ -740,8 +987,11 @@ describe("createRouter stream mode", () => {
     expect(response.status).toBe(400);
     expect(await responseJson(response)).toEqual({
       ok: false,
-      error:
-        "grpc-screenshot is only available for Android Emulator devices",
+      error: {
+        code: "invalid_request",
+        message:
+          "grpc-screenshot is only available for Android Emulator devices",
+      },
     });
     expect(state.created).toEqual([]);
   });

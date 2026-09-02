@@ -49,6 +49,34 @@ const PROCESS_TERM_MS = 500;
 const PROCESS_KILL_MS = 500;
 const FFMPEG_PROBE_TIMEOUT_MS = 10_000;
 const FFMPEG_PROBE_MAX_BYTES = 8 * 1024 * 1024;
+const MAX_FFMPEG_STDERR_BYTES = 16 * 1024;
+
+/** Keeps only a bounded tail of subprocess diagnostics. */
+export class FfmpegStderrTail {
+  #buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+
+  append(chunk: Uint8Array): void {
+    const incoming = Buffer.isBuffer(chunk)
+      ? chunk
+      : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    if (incoming.length >= MAX_FFMPEG_STDERR_BYTES) {
+      this.#buffer = Buffer.from(
+        incoming.subarray(incoming.length - MAX_FFMPEG_STDERR_BYTES),
+      );
+      return;
+    }
+    const combined = this.#buffer.length
+      ? Buffer.concat([this.#buffer, incoming])
+      : incoming;
+    this.#buffer = combined.length > MAX_FFMPEG_STDERR_BYTES
+      ? Buffer.from(combined.subarray(combined.length - MAX_FFMPEG_STDERR_BYTES))
+      : combined;
+  }
+
+  text(): string {
+    return this.#buffer.toString("utf8").trim();
+  }
+}
 
 type Nal = { pos: number; dataPos: number; type: number };
 
@@ -173,7 +201,7 @@ export class H264OutputParser {
   }
 
   #scanNals(): void {
-    const lastFound = this.#nals.at(-1)?.pos ?? -1;
+    const lastDataPos = this.#nals.at(-1)?.dataPos ?? -1;
     let i = Math.max(0, this.#scanFrom - 4);
     while (i + 3 < this.#pending.length) {
       if (this.#pending[i] !== 0 || this.#pending[i + 1] !== 0) {
@@ -194,7 +222,10 @@ export class H264OutputParser {
         continue;
       }
       if (dataPos >= this.#pending.length) break;
-      if (i > lastFound) {
+      // A four-byte start code also contains a three-byte start code beginning
+      // one byte later. Compare the payload position so an overlap rescan
+      // cannot record that same NAL twice across a chunk boundary.
+      if (dataPos > lastDataPos) {
         this.#nals.push({
           pos: i,
           dataPos,
@@ -356,6 +387,7 @@ export class H264Encoder {
   readonly #parser: H264OutputParser;
   readonly #inputFrameBytes: number;
   readonly #processDone: Promise<void>;
+  readonly #stderr = new FfmpegStderrTail();
   #resolveProcessDone!: () => void;
   #closed = false;
   #failureReported = false;
@@ -442,6 +474,7 @@ export class H264Encoder {
       this.#reportFailure(`ffmpeg stdout failed: ${error.message}`);
     });
     this.#proc.stderr.on("data", (chunk: Buffer) => {
+      this.#stderr.append(chunk);
       const text = chunk.toString("utf8").trim();
       if (text) console.warn(`serve-emu ffmpeg: ${text}`);
     });
@@ -454,8 +487,9 @@ export class H264Encoder {
     });
     this.#proc.once("close", (code, signal) => {
       if (!this.#closed) {
+        const stderr = this.#stderr.text();
         this.#reportFailure(
-          `ffmpeg exited with code ${code ?? "null"} signal ${signal ?? "null"}`,
+          `ffmpeg exited with code ${code ?? "null"} signal ${signal ?? "null"}${stderr ? `: ${stderr}` : ""}`,
         );
       }
       this.#resolveProcessDone();

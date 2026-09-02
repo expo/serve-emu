@@ -1,5 +1,8 @@
 import { buildCodecString, scanAU } from "./h264";
-import { logControlAcknowledgement } from "./control-ack";
+import {
+  controlAcknowledgementMessage,
+  logControlAcknowledgement,
+} from "./control-ack";
 import { epochNowMs, parseFramePacket } from "../../shared/frame-meta";
 import {
   StreamSessionResources,
@@ -45,6 +48,7 @@ type StreamWorkerEventPayload =
   | { type: "session"; generation: number; size: { width: number; height: number } }
   | { type: "rendered"; generation: number; at: number }
   | { type: "stats"; generation: number; stats: StreamStats }
+  | { type: "control-error"; generation: number; message: string }
   | {
       type: "control-dropped";
       generation: number;
@@ -497,7 +501,15 @@ const connect = (reason: "connect" | "reconnect") => {
   sock.onmessage = (e) => {
     if (stopped || ws !== sock) return;
     if (typeof e.data === "string") {
+      const controlError = controlAcknowledgementMessage(e.data);
       logControlAcknowledgement(e.data);
+      if (controlError) {
+        postEvent({
+          type: "control-error",
+          generation: lifecycle.generation,
+          message: controlError,
+        });
+      }
       try {
         const msg = JSON.parse(e.data) as { type?: string; size?: { width: number; height: number } };
         if (

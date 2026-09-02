@@ -111,17 +111,8 @@ function textBytes(text: string): Buffer {
   return Buffer.from(out.join(""), "utf8");
 }
 
-const ORIGINAL_TEXT = new WeakMap<object, string>();
-
 export function normalizeTextForControl(text: string): string {
   return textBytes(text).toString("utf8");
-}
-
-/** Recover the pre-truncation payload while a parsed gesture stays in memory. */
-export function originalTextForControl(
-  gesture: Extract<Gesture, { type: "text" }>,
-): string {
-  return ORIGINAL_TEXT.get(gesture) ?? gesture.text;
 }
 
 export function normalizeGesture(gesture: Gesture): Gesture {
@@ -166,15 +157,10 @@ export function parseGesture(value: unknown): Gesture {
       };
     case "text":
       if (typeof value.text !== "string") throw new Error("text must be a string");
-      const gesture = {
+      return {
         type: "text" as const,
         text: textBytes(value.text).toString("utf8"),
       };
-      ORIGINAL_TEXT.set(
-        gesture,
-        ORIGINAL_TEXT.get(value) ?? value.text,
-      );
-      return gesture;
     case "back":
     case "home":
     case "recents":

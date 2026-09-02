@@ -17,6 +17,10 @@ import {
   launchApp,
 } from "./app-management.ts";
 import { getForegroundApp } from "./app-info.ts";
+import {
+  availableStreamModesForSerial,
+  isEmulatorSerial,
+} from "./device-capabilities.ts";
 import { loadDeviceGrid } from "./device-grid.ts";
 import {
   listAvds,
@@ -39,6 +43,7 @@ import {
 import {
   corsHeadersForRequest,
   isAllowedBrowserOrigin,
+  isAllowedMutationOrigin,
   type BrowserOriginPolicy,
 } from "./origin-policy.ts";
 import {
@@ -51,9 +56,14 @@ import { createWebRtcPublisher, type WebRtcPublisher } from "./webrtc-publisher.
 import { HttpBodyError, readBodyLimited, readJsonLimited } from "./request-body.ts";
 import { createMiddlewareUploader } from "./middleware-upload.ts";
 import { startEmuSession, type EmuSession } from "./stream-session.ts";
+import {
+  streamModeMethodNotAllowedResponse,
+  streamModeRequestErrorResponse,
+  streamModeUnavailableResponse,
+} from "./stream-mode-api.ts";
 import { ScrcpyStreamError, type ScrcpySession } from "./scrcpy.ts";
 import {
-  STREAM_MODES,
+  parseStreamModeRequest,
   type StreamMode,
   type StreamModeResponse,
 } from "./shared/api-contracts.ts";
@@ -271,7 +281,6 @@ async function createAppInternal(
     opts.deviceState ??
     new DeviceSessionState({
       serial: opts.serial,
-      generation: 0,
       applyLocation:
         dependencies.setLocation ??
         ((serial, fix, signal) =>
@@ -1090,7 +1099,7 @@ async function createAppInternal(
       if (req.method === "GET") {
         return Response.json({
           serial: opts.serial,
-          emulator: /^emulator-\d+$/.test(opts.serial),
+          emulator: isEmulatorSerial(opts.serial),
           location: deviceState.lastLocation,
         });
       }
@@ -1599,15 +1608,37 @@ export function createRouter(
       return current;
     }
 
+    // Hold the shared device state across asynchronous source startup. A fatal
+    // from the old source may otherwise release its final owner before the
+    // candidate has a chance to acquire it.
+    const stagingOwner = {};
+    let retainedDeviceState =
+      current?.isStreaming() ? deviceStateForApp(current) : undefined;
+    if (retainedDeviceState) {
+      try {
+        retainedDeviceState.acquire(stagingOwner);
+      } catch {
+        retainedDeviceState = undefined;
+      }
+    }
+
     // Stage the requested source while the previous app remains published and
     // its existing sockets continue streaming. Only a ready replacement is
     // made visible; startup failure leaves the working app untouched.
-    const replacement = await createConfiguredApp(
-      serial,
-      streamMode,
-      signal,
-      current ? deviceStateForApp(current) : undefined,
-    );
+    let replacement: EmuApp;
+    try {
+      replacement = await createConfiguredApp(
+        serial,
+        streamMode,
+        signal,
+        retainedDeviceState,
+      );
+    } finally {
+      await retainedDeviceState?.release(
+        stagingOwner,
+        "stream source staging finished",
+      );
+    }
     if (stopped || stoppingSerials.has(serial)) {
       try {
         await replacement.stop();
@@ -1684,9 +1715,7 @@ export function createRouter(
     ok: true,
     serial,
     mode: streamSessionForApp(app).mode,
-    availableModes: /^emulator-\d+$/.test(serial)
-      ? [...STREAM_MODES]
-      : ["scrcpy"],
+    availableModes: availableStreamModesForSerial(serial),
     sessionGeneration: sessionGenerations.get(serial) ?? 0,
   });
 
@@ -1747,6 +1776,23 @@ export function createRouter(
 
   const handleRequest = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
+    if (
+      req.method !== "GET" &&
+      req.method !== "HEAD" &&
+      req.method !== "OPTIONS" &&
+      !isAllowedMutationOrigin(req, defaults)
+    ) {
+      return Response.json(
+        {
+          ok: false,
+          error: {
+            code: "forbidden",
+            message: "Browser origin is not allowed to mutate serve-emu state",
+          },
+        },
+        { status: 403 },
+      );
+    }
 
     // Fleet endpoint — lists every adb device, so it is not device-scoped.
     if (url.pathname === "/api/devices") {
@@ -1762,20 +1808,13 @@ export function createRouter(
     // so this endpoint is owned by the router rather than one app generation.
     if (url.pathname === "/api/stream-mode") {
       if (req.method !== "GET" && req.method !== "PUT") {
-        return new Response("method not allowed", {
-          status: 405,
-          headers: { Allow: "GET, PUT" },
-        });
+        return streamModeMethodNotAllowedResponse();
       }
-
       let serial: string;
       try {
         serial = await resolveSerial(url.searchParams.get("device"));
       } catch (err) {
-        return Response.json(
-          { ok: false, error: errMsg(err) },
-          { status: 503 },
-        );
+        return streamModeUnavailableResponse(err);
       }
 
       if (req.method === "GET") {
@@ -1785,44 +1824,29 @@ export function createRouter(
           );
           return Response.json(streamModeResponse(serial, app));
         } catch (err) {
-          return Response.json(
-            { ok: false, error: errMsg(err) },
-            { status: 503 },
-          );
+          return streamModeUnavailableResponse(err);
         }
       }
 
       let streamMode: StreamMode;
       try {
         const payload = await readRouterPayload(req);
-        const mode = payload.mode;
-        if (
-          typeof mode !== "string" ||
-          !STREAM_MODES.includes(mode as StreamMode)
-        ) {
-          throw new Error(`mode must be one of: ${STREAM_MODES.join(", ")}`);
-        }
-        if (mode === "grpc-screenshot" && !/^emulator-\d+$/.test(serial)) {
+        const { mode } = parseStreamModeRequest(payload);
+        if (mode === "grpc-screenshot" && !isEmulatorSerial(serial)) {
           throw new Error(
             "grpc-screenshot is only available for Android Emulator devices",
           );
         }
-        streamMode = mode as StreamMode;
+        streamMode = mode;
       } catch (err) {
-        return Response.json(
-          { ok: false, error: errMsg(err) },
-          { status: 400 },
-        );
+        return streamModeRequestErrorResponse(err);
       }
 
       try {
         const app = await switchStreamMode(serial, streamMode);
         return Response.json(streamModeResponse(serial, app));
       } catch (err) {
-        return Response.json(
-          { ok: false, error: errMsg(err) },
-          { status: 503 },
-        );
+        return streamModeUnavailableResponse(err);
       }
     }
 
@@ -1926,7 +1950,7 @@ export function createRouter(
             running.find((candidate) => candidate.avd === avd)?.serial ?? "";
         }
         if (!serial) throw new Error("serial or running avd is required");
-        if (!/^emulator-\d+$/.test(serial)) {
+        if (!isEmulatorSerial(serial)) {
           throw new Error(`${serial} is not an emulator`);
         }
         stoppingSerials.add(serial);

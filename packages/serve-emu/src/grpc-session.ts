@@ -3,28 +3,29 @@ import {
   ControlInputQueue,
   ControlInputRejectedError,
 } from "./control-input-queue.ts";
+import { isEmulatorSerial } from "./device-capabilities.ts";
 import {
   EmulatorGrpcClient,
   ensureEmulatorGrpcEndpoint,
   IMG_FORMAT_PNG,
   IMG_FORMAT_RGB888,
   type EmuImage,
+  type GrpcEndpoint,
+  type GrpcScreenshotImageSource,
+  type ImageFormatRequest,
   type KeyboardEventRequest,
   type TouchPoint,
 } from "./emulator-grpc.ts";
-import {
-  getDisplayRotation,
-  type DisplayRotation,
-} from "./adb.ts";
 import { execText, type ExecResult } from "./exec.ts";
 import {
   H264Encoder,
   assertFfmpegAvailable,
+  type H264EncoderOpts,
   type QuarterTurn,
 } from "./h264-encoder.ts";
+import { H264StartupGate } from "./h264-readiness.ts";
 import {
   normalizeTextForControl,
-  originalTextForControl,
   type Gesture,
 } from "./input.ts";
 import {
@@ -39,11 +40,23 @@ import type {
   StreamMeta,
 } from "./stream-session.ts";
 
-const FLUSH_MS = 40;
+export { H264StartupGate } from "./h264-readiness.ts";
+
+// Annex-B does not expose the final access-unit length. Submit one duplicate
+// RGB frame only after the observed source cadence goes idle, so ffmpeg emits
+// the preceding frame at a real AUD boundary. Parsing stdout merely because it
+// went idle is unsafe.
+const ACCESS_UNIT_BOUNDARY_IDLE_INTERVALS = 1.5;
+const ACCESS_UNIT_BOUNDARY_STARTUP_DELAY_MS = 100;
+const ACCESS_UNIT_BOUNDARY_MAX_DELAY_MS = 250;
+const ACCESS_UNIT_CADENCE_WINDOW = 8;
+const ACCESS_UNIT_CADENCE_OUTLIER_FLOOR_MS = 250;
+const ACCESS_UNIT_CADENCE_OUTLIER_MULTIPLIER = 4;
+const ACCESS_UNIT_SLOW_CADENCE_SIMILARITY = 1.5;
+const ENCODER_WRITE_RETRY_DELAY_MS = 8;
 const DEFAULT_IDLE_REPEAT_MS = 500;
 const FIRST_FRAME_TIMEOUT_MS = 10_000;
-const MAX_QUEUED_PACKETS = 256;
-const DISPLAY_ROTATION_POLL_MS = 500;
+const MAX_QUEUED_PACKET_BYTES = 64 * 1024 * 1024;
 const DISPLAY_SIZE_POLL_MS = 2_000;
 const MAX_DISPLAY_SIZE_OUTPUT_BYTES = 4_096;
 const INPUT_RELEASE_TIMEOUT_MS = 500;
@@ -196,21 +209,6 @@ function commandFailure(
   return new Error(`${description}: ${detail}`);
 }
 
-async function readNavigationMode(
-  serial: string,
-  signal: AbortSignal,
-): Promise<0 | 1 | 2 | null> {
-  const result = await execText(
-    "adb",
-    ["-s", serial, "shell", "settings", "get", "secure", "navigation_mode"],
-    { timeout: 5_000, signal, lane: "interactive" },
-  );
-  const mode = Number(result.stdout.trim());
-  return result.status === 0 && (mode === 0 || mode === 1 || mode === 2)
-    ? mode
-    : null;
-}
-
 async function runPowerCommand(
   serial: string,
   action: "sleep" | "wakeup",
@@ -239,17 +237,6 @@ async function isDeviceAwake(
     throw commandFailure(`could not read power state for ${serial}`, result);
   }
   return /mWakefulness=Awake\b/.test(result.stdout);
-}
-
-async function toggleDevicePower(
-  serial: string,
-  signal: AbortSignal,
-): Promise<void> {
-  await runPowerCommand(
-    serial,
-    (await isDeviceAwake(serial, signal)) ? "sleep" : "wakeup",
-    signal,
-  );
 }
 
 export function androidKeycodeToW3c(keycode: number): string | null {
@@ -294,84 +281,6 @@ export function androidKeyGestureToKeyboardEvents(
   return [...modifiers, key, ...releaseModifiers];
 }
 
-function annexBNalTypes(data: Buffer): Set<number> {
-  const types = new Set<number>();
-  for (let offset = 0; offset + 3 < data.length; offset++) {
-    if (data[offset] !== 0 || data[offset + 1] !== 0) continue;
-    const header = data[offset + 2] === 1
-      ? offset + 3
-      : data[offset + 2] === 0 && data[offset + 3] === 1
-        ? offset + 4
-        : -1;
-    if (header >= 0 && header < data.length) {
-      types.add(data[header]! & 0x1f);
-      offset = header;
-    }
-  }
-  return types;
-}
-
-/** Startup latch that proves a new browser can decode the encoder output. */
-export class H264StartupGate {
-  readonly #promise: Promise<void>;
-  #resolve!: () => void;
-  #reject!: (error: Error) => void;
-  #settled = false;
-  #sawSps = false;
-  #sawPps = false;
-  #sawKeyFrame = false;
-
-  constructor() {
-    this.#promise = new Promise<void>((resolve, reject) => {
-      this.#resolve = resolve;
-      this.#reject = reject;
-    });
-    // A transport can fail before startGrpcSession reaches its await point.
-    void this.#promise.catch(() => {});
-  }
-
-  observe(frame: VideoFrame): void {
-    if (this.#settled) return;
-    if (frame.isConfig) {
-      const types = annexBNalTypes(frame.data);
-      this.#sawSps ||= types.has(7);
-      this.#sawPps ||= types.has(8);
-    }
-    this.#sawKeyFrame ||= frame.isKey;
-    if (this.#sawSps && this.#sawPps && this.#sawKeyFrame) {
-      this.#settled = true;
-      this.#resolve();
-    }
-  }
-
-  fail(error: Error): void {
-    if (this.#settled) return;
-    this.#settled = true;
-    this.#reject(error);
-  }
-
-  wait(signal: AbortSignal, timeoutMs: number): Promise<void> {
-    if (signal.aborted) {
-      this.fail(abortReason(signal, "H.264 startup aborted"));
-    }
-    const onAbort = () =>
-      this.fail(abortReason(signal, "H.264 startup aborted"));
-    signal.addEventListener("abort", onAbort, { once: true });
-    const timer = setTimeout(() => {
-      this.fail(
-        new Error(
-          `timed out waiting for decodable H.264 output after ${timeoutMs}ms`,
-        ),
-      );
-    }, timeoutMs);
-    timer.unref?.();
-    return this.#promise.finally(() => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", onAbort);
-    });
-  }
-}
-
 export function isUsableRgbFrame(image: EmuImage): boolean {
   return (
     image.format === IMG_FORMAT_RGB888 &&
@@ -384,7 +293,6 @@ export function isUsableRgbFrame(image: EmuImage): boolean {
 }
 
 export type GrpcDisplayGeometry = {
-  quarterTurn: QuarterTurn;
   encodedSize: { width: number; height: number };
   touchSize: { width: number; height: number };
   mapTouch(unitX: number, unitY: number): { x: number; y: number };
@@ -395,14 +303,10 @@ export function resolveGrpcDisplayGeometry(options: {
   inputHeight: number;
   nativeWidth: number;
   nativeHeight: number;
-  quarterTurn: QuarterTurn;
 }): GrpcDisplayGeometry {
   const croppedWidth = options.inputWidth - (options.inputWidth % 2);
   const croppedHeight = options.inputHeight - (options.inputHeight % 2);
-  const transposed = options.quarterTurn === 1 || options.quarterTurn === 3;
-  const encodedSize = transposed
-    ? { width: croppedHeight, height: croppedWidth }
-    : { width: croppedWidth, height: croppedHeight };
+  const encodedSize = { width: croppedWidth, height: croppedHeight };
   const touchSize = {
     width: options.nativeWidth,
     height: options.nativeHeight,
@@ -412,31 +316,11 @@ export function resolveGrpcDisplayGeometry(options: {
     Math.max(0, Math.min(size - 1, Math.round(unit * size)));
 
   return {
-    quarterTurn: options.quarterTurn,
     encodedSize,
     touchSize,
     mapTouch(unitX, unitY) {
-      // sendTouch consumes coordinates in the emulator's unrotated physical
-      // surface. Map the point back through the inverse of ffmpeg's display
-      // transform so a click follows the pixels the browser presents.
-      if (options.quarterTurn === 1) {
-        return {
-          x: toPixel(1 - unitY, touchSize.width),
-          y: toPixel(unitX, touchSize.height),
-        };
-      }
-      if (options.quarterTurn === 2) {
-        return {
-          x: toPixel(1 - unitX, touchSize.width),
-          y: toPixel(1 - unitY, touchSize.height),
-        };
-      }
-      if (options.quarterTurn === 3) {
-        return {
-          x: toPixel(unitY, touchSize.width),
-          y: toPixel(1 - unitX, touchSize.height),
-        };
-      }
+      // Emulator screenshots are already oriented and touch coordinates use
+      // that same physical top-left coordinate space.
       return {
         x: toPixel(unitX, touchSize.width),
         y: toPixel(unitY, touchSize.height),
@@ -470,6 +354,80 @@ export class GrpcFrameWritePacer {
 
   waitMs(now: number): number {
     return Math.max(0, this.#nextFreshWriteAt - now);
+  }
+}
+
+export class GrpcAccessUnitBoundaryCadence {
+  readonly #minimumIntervalMs: number;
+  #lastFreshImageAt: number | null = null;
+  readonly #freshImageIntervals: number[] = [];
+  #slowIntervalCandidate: number | null = null;
+
+  constructor(minimumIntervalMs: number) {
+    if (!Number.isFinite(minimumIntervalMs) || minimumIntervalMs <= 0) {
+      throw new RangeError("minimumIntervalMs must be a positive number");
+    }
+    this.#minimumIntervalMs = minimumIntervalMs;
+  }
+
+  recordFreshImage(now: number): void {
+    if (this.#lastFreshImageAt !== null) {
+      const interval = now - this.#lastFreshImageAt;
+      if (interval > 0) {
+        const observedInterval = this.#observedInterval();
+        const outlierThreshold = Math.max(
+          ACCESS_UNIT_CADENCE_OUTLIER_FLOOR_MS,
+          (observedInterval ?? 0) * ACCESS_UNIT_CADENCE_OUTLIER_MULTIPLIER,
+        );
+        if (interval > outlierThreshold) {
+          if (
+            observedInterval === null &&
+            this.#slowIntervalCandidate !== null &&
+            Math.max(interval, this.#slowIntervalCandidate) /
+                Math.min(interval, this.#slowIntervalCandidate) <=
+              ACCESS_UNIT_SLOW_CADENCE_SIMILARITY
+          ) {
+            this.#pushInterval(this.#slowIntervalCandidate);
+            this.#pushInterval(interval);
+            this.#slowIntervalCandidate = null;
+          } else if (observedInterval === null) {
+            this.#slowIntervalCandidate = interval;
+          }
+        } else {
+          this.#slowIntervalCandidate = null;
+          this.#pushInterval(interval);
+        }
+      }
+    }
+    this.#lastFreshImageAt = now;
+  }
+
+  boundaryDelayMs(): number {
+    const observedInterval = this.#observedInterval();
+    if (observedInterval === null) {
+      return ACCESS_UNIT_BOUNDARY_STARTUP_DELAY_MS;
+    }
+    return Math.min(
+      ACCESS_UNIT_BOUNDARY_MAX_DELAY_MS,
+      Math.max(this.#minimumIntervalMs, observedInterval) *
+        ACCESS_UNIT_BOUNDARY_IDLE_INTERVALS,
+    );
+  }
+
+  #pushInterval(interval: number): void {
+    this.#freshImageIntervals.push(interval);
+    if (this.#freshImageIntervals.length > ACCESS_UNIT_CADENCE_WINDOW) {
+      this.#freshImageIntervals.shift();
+    }
+  }
+
+  #observedInterval(): number | null {
+    if (this.#freshImageIntervals.length === 0) return null;
+    const sorted = [...this.#freshImageIntervals].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0
+      ? (sorted[middle - 1]! + sorted[middle]!) / 2
+      : sorted[middle]!;
   }
 }
 
@@ -585,7 +543,7 @@ export function normalizeGrpcText(text: string): string {
 export function normalizeGrpcGestureText(
   gesture: Extract<Gesture, { type: "text" }>,
 ): string {
-  return normalizeGrpcText(originalTextForControl(gesture));
+  return normalizeGrpcText(gesture.text);
 }
 
 export function parseDisplaySizeSignal(output: string): string {
@@ -622,6 +580,8 @@ export class GrpcNativeTouchGeometryMonitor {
   readonly #onNativeSize: (size: { width: number; height: number }) => void;
   #displaySizeSignal: string | null;
   #pollTask: Promise<void> | null = null;
+  #forcePending = false;
+  #forceGeneration = 0;
 
   constructor(options: {
     initialDisplaySizeSignal: string | null;
@@ -637,21 +597,45 @@ export class GrpcNativeTouchGeometryMonitor {
     this.#onNativeSize = options.onNativeSize;
   }
 
-  poll(signal: AbortSignal): Promise<void> {
+  poll(signal: AbortSignal, force = false): Promise<void> {
+    if (force) {
+      this.#forcePending = true;
+      this.#forceGeneration++;
+    }
     if (this.#pollTask) return this.#pollTask;
-    const task = this.#pollOnce(signal).finally(() => {
+    const task = this.#drainPolls(signal).finally(() => {
       if (this.#pollTask === task) this.#pollTask = null;
     });
     this.#pollTask = task;
     return task;
   }
 
-  async #pollOnce(signal: AbortSignal): Promise<void> {
+  async #drainPolls(signal: AbortSignal): Promise<void> {
+    let first = true;
+    while (first || this.#forcePending) {
+      first = false;
+      const force = this.#forcePending;
+      this.#forcePending = false;
+      const generation = this.#forceGeneration;
+      try {
+        await this.#pollOnce(signal, force, generation);
+      } catch (error) {
+        if (!this.#forcePending) throw error;
+      }
+    }
+  }
+
+  async #pollOnce(
+    signal: AbortSignal,
+    force: boolean,
+    generation: number,
+  ): Promise<void> {
     throwIfAborted(signal, "display size refresh aborted");
     const nextSignal = await this.#readDisplaySizeSignal(signal);
-    if (nextSignal === this.#displaySizeSignal) return;
+    if (!force && nextSignal === this.#displaySizeSignal) return;
     const image = await this.#readNativeImage(signal);
     throwIfAborted(signal, "display size refresh aborted");
+    if (generation !== this.#forceGeneration) return;
     if (
       !Number.isSafeInteger(image.width) ||
       !Number.isSafeInteger(image.height) ||
@@ -666,19 +650,298 @@ export class GrpcNativeTouchGeometryMonitor {
 }
 
 export type GrpcSessionDependencies = {
-  readDisplayRotation?: (
-    serial: string,
-    signal: AbortSignal,
-  ) => Promise<DisplayRotation>;
   readDisplaySizeSignal?: (
     serial: string,
     signal: AbortSignal,
   ) => Promise<string>;
+  runtime?: Partial<GrpcSessionRuntime>;
 };
 
-const defaultReadDisplayRotation: NonNullable<
-  GrpcSessionDependencies["readDisplayRotation"]
-> = (serial, signal) => getDisplayRotation(serial, execText, signal);
+export type GrpcSessionClient = {
+  getScreenshot(
+    format: ImageFormatRequest,
+    signal?: AbortSignal,
+  ): Promise<EmuImage>;
+  streamScreenshot(
+    format: ImageFormatRequest,
+    onImage: (image: EmuImage, source: GrpcScreenshotImageSource) => void,
+    signal: AbortSignal,
+    options?: { maxFps?: number },
+  ): Promise<void>;
+  sendTouch(points: TouchPoint[], signal?: AbortSignal): Promise<void>;
+  sendKey(event: KeyboardEventRequest, signal?: AbortSignal): Promise<void>;
+  onSessionError(listener: (error: Error) => void): () => void;
+  close(): void;
+};
+
+export type GrpcSessionEncoder = {
+  readonly width: number;
+  readonly height: number;
+  readonly quarterTurn: QuarterTurn;
+  write(rgb: Buffer, ptsUs: bigint): boolean;
+  close(): Promise<void>;
+};
+
+export type GrpcSessionRuntime = {
+  assertFfmpeg(signal: AbortSignal): Promise<void>;
+  ensureEndpoint(serial: string, signal: AbortSignal): Promise<GrpcEndpoint>;
+  createClient(endpoint: GrpcEndpoint): GrpcSessionClient;
+  createEncoder(options: H264EncoderOpts): GrpcSessionEncoder;
+  isDeviceAwake(serial: string, signal: AbortSignal): Promise<boolean>;
+  wakeDevice(serial: string, signal: AbortSignal): Promise<void>;
+  sleep(ms: number, signal: AbortSignal): Promise<void>;
+};
+
+export type GrpcEncoderRestart = {
+  announceSize: boolean;
+  clearPending: boolean;
+};
+
+type SessionPacket = Extract<VideoPacket, { type: "session" }>;
+type FramePacket = Extract<VideoPacket, { type: "frame" }>;
+export type GrpcPacketQueuePushResult = {
+  queued: boolean;
+  needsKeyFrame: boolean;
+};
+
+const PACKET_QUEUED: GrpcPacketQueuePushResult = {
+  queued: true,
+  needsKeyFrame: false,
+};
+const PACKET_DROPPED: GrpcPacketQueuePushResult = {
+  queued: false,
+  needsKeyFrame: false,
+};
+
+function queuedPacketBytes(packet: VideoPacket): number {
+  return packet.type === "frame" ? packet.data.length : 16;
+}
+
+function lastKeyFrameIndex(packets: readonly VideoPacket[]): number {
+  for (let index = packets.length - 1; index >= 0; index--) {
+    const packet = packets[index]!;
+    if (packet.type === "frame" && packet.isKey) return index;
+  }
+  return -1;
+}
+
+function lastSessionPacket(
+  packets: readonly VideoPacket[],
+  end = packets.length,
+): SessionPacket | null {
+  for (let index = end - 1; index >= 0; index--) {
+    const packet = packets[index]!;
+    if (packet.type === "session") return packet;
+  }
+  return null;
+}
+
+/** A byte-bounded queue that only resumes readers from decodable H.264 state. */
+export class GrpcVideoPacketQueue {
+  readonly #maxBytes: number;
+  #packets: VideoPacket[] = [];
+  #byteLength = 0;
+  #latestConfig: FramePacket | null = null;
+  #configByKeyFrame = new WeakMap<FramePacket, FramePacket>();
+  #pendingSession: SessionPacket | null = null;
+  #awaitingKeyFrame = false;
+
+  constructor(maxBytes = MAX_QUEUED_PACKET_BYTES) {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+      throw new RangeError("maxBytes must be a positive safe integer");
+    }
+    this.#maxBytes = maxBytes;
+  }
+
+  get byteLength(): number {
+    return this.#byteLength;
+  }
+
+  push(packet: VideoPacket): GrpcPacketQueuePushResult {
+    if (packet.type === "frame" && packet.isConfig) {
+      this.#latestConfig = packet;
+    }
+    if (
+      packet.type === "frame" &&
+      packet.isKey &&
+      this.#latestConfig
+    ) {
+      this.#configByKeyFrame.set(packet, this.#latestConfig);
+    }
+
+    if (this.#awaitingKeyFrame) {
+      if (packet.type === "session") {
+        this.#pendingSession = packet;
+        return PACKET_DROPPED;
+      }
+      if (packet.isConfig || !packet.isKey) return PACKET_DROPPED;
+      return this.#resumeAtKeyFrame(packet);
+    }
+
+    this.#packets.push(packet);
+    this.#byteLength += queuedPacketBytes(packet);
+    if (this.#byteLength <= this.#maxBytes) return PACKET_QUEUED;
+
+    const keyIndex = lastKeyFrameIndex(this.#packets);
+    const keyFrame = this.#packets[keyIndex];
+    const keyFrameConfig =
+      keyFrame?.type === "frame"
+        ? this.#configByKeyFrame.get(keyFrame)
+        : undefined;
+    if (keyIndex < 0 || !keyFrameConfig) {
+      return this.#dropUntilKeyFrame();
+    }
+
+    const session = lastSessionPacket(this.#packets, keyIndex);
+    const suffix = this.#packets.slice(keyIndex);
+    const retained = [
+      ...(session ? [session] : []),
+      keyFrameConfig,
+      ...suffix,
+    ];
+    const retainedBytes = retained.reduce(
+      (total, queued) => total + queuedPacketBytes(queued),
+      0,
+    );
+    if (retainedBytes > this.#maxBytes) {
+      throw new Error(
+        `decodable gRPC H.264 queue exceeds ${this.#maxBytes} byte limit`,
+      );
+    }
+    this.#packets = retained;
+    this.#byteLength = retainedBytes;
+    return PACKET_QUEUED;
+  }
+
+  shift(): VideoPacket | undefined {
+    const packet = this.#packets.shift();
+    if (packet) this.#byteLength -= queuedPacketBytes(packet);
+    return packet;
+  }
+
+  clear(): void {
+    this.#packets = [];
+    this.#byteLength = 0;
+    this.#latestConfig = null;
+    this.#configByKeyFrame = new WeakMap<FramePacket, FramePacket>();
+    this.#pendingSession = null;
+    this.#awaitingKeyFrame = false;
+  }
+
+  #dropUntilKeyFrame(): GrpcPacketQueuePushResult {
+    this.#pendingSession = lastSessionPacket(this.#packets);
+    this.#packets = [];
+    this.#byteLength = 0;
+    this.#awaitingKeyFrame = true;
+    return { queued: false, needsKeyFrame: true };
+  }
+
+  #resumeAtKeyFrame(keyFrame: FramePacket): GrpcPacketQueuePushResult {
+    if (!this.#latestConfig) return PACKET_DROPPED;
+    const resumed = [
+      ...(this.#pendingSession ? [this.#pendingSession] : []),
+      this.#latestConfig,
+      keyFrame,
+    ];
+    const resumedBytes = resumed.reduce(
+      (total, queued) => total + queuedPacketBytes(queued),
+      0,
+    );
+    if (resumedBytes > this.#maxBytes) {
+      throw new Error(
+        `decodable gRPC H.264 queue exceeds ${this.#maxBytes} byte limit`,
+      );
+    }
+    this.#packets = resumed;
+    this.#byteLength = resumedBytes;
+    this.#pendingSession = null;
+    this.#awaitingKeyFrame = false;
+    return PACKET_QUEUED;
+  }
+}
+
+type ClosableEncoder = {
+  close(): Promise<void>;
+};
+
+/** Serializes encoder replacement and folds a burst into one fresh process. */
+export class GrpcEncoderLifecycle<T extends ClosableEncoder> {
+  readonly #create: (restart: GrpcEncoderRestart) => T | null | Promise<T | null>;
+  #current: T | null = null;
+  #pending: GrpcEncoderRestart | null = null;
+  #drainTask: Promise<T | null> | null = null;
+  #closeTask: Promise<void> | null = null;
+  #closed = false;
+
+  constructor(
+    create: (restart: GrpcEncoderRestart) => T | null | Promise<T | null>,
+  ) {
+    this.#create = create;
+  }
+
+  get current(): T | null {
+    return this.#current;
+  }
+
+  restart(restart: GrpcEncoderRestart): Promise<T | null> {
+    if (this.#closed) return Promise.resolve(null);
+    this.#pending = this.#pending
+      ? {
+          announceSize: this.#pending.announceSize || restart.announceSize,
+          clearPending: this.#pending.clearPending || restart.clearPending,
+        }
+      : restart;
+    if (this.#drainTask) return this.#drainTask;
+
+    const task = this.#drain();
+    this.#drainTask = task;
+    return task;
+  }
+
+  close(): Promise<void> {
+    if (this.#closeTask) return this.#closeTask;
+    this.#closed = true;
+    this.#pending = null;
+    this.#closeTask = (async () => {
+      await this.#drainTask?.catch(() => {});
+      const current = this.#current;
+      this.#current = null;
+      await current?.close();
+    })();
+    return this.#closeTask;
+  }
+
+  async #drain(): Promise<T | null> {
+    let latest = this.#current;
+    try {
+      while (this.#pending && !this.#closed) {
+        const current = this.#current;
+        this.#current = null;
+        await current?.close();
+        if (this.#closed) break;
+
+        // Read after shutdown so requests received while it was in progress are
+        // coalesced before another ffmpeg process is spawned.
+        const restart = this.#pending;
+        this.#pending = null;
+        const next = await this.#create(restart);
+        if (!next) continue;
+        if (this.#closed) {
+          await next.close();
+          break;
+        }
+        this.#current = next;
+        latest = next;
+      }
+      return latest;
+    } finally {
+      // Clear the published task in the same microtask that observes an empty
+      // queue. A restart arriving afterward must start a new drain instead of
+      // joining a promise whose work has already completed.
+      this.#drainTask = null;
+    }
+  }
+}
 
 const defaultReadDisplaySizeSignal: NonNullable<
   GrpcSessionDependencies["readDisplaySizeSignal"]
@@ -699,28 +962,15 @@ const defaultReadDisplaySizeSignal: NonNullable<
   return parseDisplaySizeSignal(result.stdout);
 };
 
-export async function readInitialDisplayRotation(
-  readRotation: () => Promise<DisplayRotation>,
-  signal: AbortSignal,
-  reportWarning: (message: string) => void = console.warn,
-): Promise<DisplayRotation | null> {
-  try {
-    return await readRotation();
-  } catch (error) {
-    throwIfAborted(signal, "gRPC screenshot startup aborted");
-    reportWarning(
-      `serve-emu could not read the initial display rotation; starting with the emulator screenshot rotation and polling for recovery: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return null;
-  }
-}
-
-function rotationFromEmulatorImage(rotation: number): DisplayRotation {
-  const quarterTurns = rotation > 3 ? rotation / 90 : rotation;
-  return Number.isInteger(quarterTurns) && quarterTurns >= 0 && quarterTurns <= 3
-    ? (quarterTurns as DisplayRotation)
-    : 0;
-}
+const DEFAULT_GRPC_SESSION_RUNTIME: GrpcSessionRuntime = {
+  assertFfmpeg: assertFfmpegAvailable,
+  ensureEndpoint: ensureEmulatorGrpcEndpoint,
+  createClient: (endpoint) => new EmulatorGrpcClient(endpoint),
+  createEncoder: (options) => new H264Encoder(options),
+  isDeviceAwake,
+  wakeDevice: (serial, signal) => runPowerCommand(serial, "wakeup", signal),
+  sleep,
+};
 
 function positiveNumber(value: number, name: string, maximum: number): number {
   if (!Number.isFinite(value) || value <= 0 || value > maximum) {
@@ -761,8 +1011,10 @@ export async function startGrpcSession(
   dependencies: GrpcSessionDependencies = {},
 ): Promise<EmuSession> {
   const serial = options.serial;
-  const readDisplayRotation =
-    dependencies.readDisplayRotation ?? defaultReadDisplayRotation;
+  const runtime: GrpcSessionRuntime = {
+    ...DEFAULT_GRPC_SESSION_RUNTIME,
+    ...dependencies.runtime,
+  };
   const readDisplaySizeSignal =
     dependencies.readDisplaySizeSignal ?? defaultReadDisplaySizeSignal;
   const maxFps = positiveNumber(
@@ -796,8 +1048,11 @@ export async function startGrpcSession(
       : DEFAULT_IDLE_REPEAT_MS;
   const frameIntervalMs = 1_000 / maxFps;
   const frameWritePacer = new GrpcFrameWritePacer(frameIntervalMs);
+  const accessUnitBoundaryCadence = new GrpcAccessUnitBoundaryCadence(
+    frameIntervalMs,
+  );
 
-  if (!/^emulator-\d+$/.test(serial)) {
+  if (!isEmulatorSerial(serial)) {
     throw new Error(
       `grpc-screenshot requires an Android Emulator serial; received ${serial}`,
     );
@@ -812,34 +1067,33 @@ export async function startGrpcSession(
 
   let endpoint: Awaited<ReturnType<typeof ensureEmulatorGrpcEndpoint>>;
   try {
-    await assertFfmpegAvailable(lifetime.signal);
-    endpoint = await ensureEmulatorGrpcEndpoint(serial, lifetime.signal);
+    await runtime.assertFfmpeg(lifetime.signal);
+    endpoint = await runtime.ensureEndpoint(serial, lifetime.signal);
   } catch (error) {
     options.signal?.removeEventListener("abort", abortFromParent);
     throw error;
   }
-  const client = new EmulatorGrpcClient(endpoint);
+  const client = runtime.createClient(endpoint);
   const listeners = new Set<(failure: StreamFailure) => void>();
-  const packetQueue: VideoPacket[] = [];
+  const packetQueue = new GrpcVideoPacketQueue();
   const waiters: Array<(packet: VideoPacket | null) => void> = [];
   const startupGate = new H264StartupGate();
   let fatalFailure: StreamFailure | null = null;
   let closed = false;
   let closeTask: Promise<void> | null = null;
-  let encoder: H264Encoder | null = null;
+  let encoderLifecycle: GrpcEncoderLifecycle<GrpcSessionEncoder> | null = null;
   let latest: EmuImage | null = null;
   let lastWriteAt = 0;
   let writeTimer: ReturnType<typeof setTimeout> | null = null;
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   let idleTimer: ReturnType<typeof setInterval> | null = null;
-  let rotationPollTimer: ReturnType<typeof setTimeout> | null = null;
   let displaySizePollTimer: ReturnType<typeof setTimeout> | null = null;
-  let displayRotation: DisplayRotation = 0;
-  let nativePortrait = { width: 0, height: 0 };
+  let nativeTouchSize = { width: 0, height: 0 };
   let nativeTouchGeometryMonitor: GrpcNativeTouchGeometryMonitor | null = null;
   let sessionMeta: StreamMeta | null = null;
   let resolveFirstImage: ((image: EmuImage) => void) | null = null;
   let rejectFirstImage: ((error: Error) => void) | null = null;
+  let requestQueuedKeyFrame: (() => void) | null = null;
 
   const wakeReaders = () => {
     while (waiters.length) waiters.shift()!(null);
@@ -856,15 +1110,12 @@ export async function startGrpcSession(
   };
   const pushPacket = (packet: VideoPacket) => {
     if (closed || fatalFailure) return;
-    if (packet.type === "frame") startupGate.observe(packet);
-    const waiter = waiters.shift();
-    if (waiter) {
-      waiter(packet);
-      return;
-    }
-    packetQueue.push(packet);
-    if (packetQueue.length > MAX_QUEUED_PACKETS) {
-      packetQueue.splice(0, packetQueue.length - MAX_QUEUED_PACKETS);
+    const queued = packetQueue.push(packet);
+    if (queued.queued && packet.type === "frame") startupGate.observe(packet);
+    if (queued.needsKeyFrame) requestQueuedKeyFrame?.();
+    if (waiters.length > 0) {
+      const next = packetQueue.shift();
+      if (next) waiters.shift()!(next);
     }
   };
   const readFrame = (): Promise<VideoPacket | null> => {
@@ -882,6 +1133,7 @@ export async function startGrpcSession(
   };
   const nowUs = () => BigInt(Math.round(performance.now() * 1_000));
   const writeFrame = (repeat: boolean) => {
+    const encoder = encoderLifecycle?.current;
     if (
       closed ||
       lifetime.signal.aborted ||
@@ -895,26 +1147,35 @@ export async function startGrpcSession(
     const accepted = encoder.write(latest.image, nowUs());
     frameWritePacer.recordWrite(now, repeat, accepted);
     if (accepted) lastWriteAt = Date.now();
-    if (repeat && flushTimer) {
-      clearTimeout(flushTimer);
+    if (repeat) {
+      if (flushTimer) clearTimeout(flushTimer);
       flushTimer = null;
+      if (!accepted) {
+        flushTimer = setTimeout(() => {
+          flushTimer = null;
+          writeFrame(true);
+        }, Math.min(ENCODER_WRITE_RETRY_DELAY_MS, frameIntervalMs));
+        flushTimer.unref?.();
+      }
+      return;
     }
     if (!repeat && accepted) {
       if (flushTimer) clearTimeout(flushTimer);
       flushTimer = setTimeout(() => {
         flushTimer = null;
         writeFrame(true);
-      }, FLUSH_MS);
+      }, accessUnitBoundaryCadence.boundaryDelayMs());
+      flushTimer.unref?.();
     } else if (!repeat && !writeTimer) {
       writeTimer = setTimeout(() => {
         writeTimer = null;
         scheduleWrite();
-      }, Math.min(FLUSH_MS, frameIntervalMs));
+      }, Math.min(ENCODER_WRITE_RETRY_DELAY_MS, frameIntervalMs));
       writeTimer.unref?.();
     }
   };
   const scheduleWrite = () => {
-    if (writeTimer || closed || !encoder || !latest) return;
+    if (writeTimer || closed || !encoderLifecycle?.current || !latest) return;
     const waitMs = frameWritePacer.waitMs(performance.now());
     if (waitMs <= 0) {
       writeFrame(false);
@@ -930,38 +1191,35 @@ export async function startGrpcSession(
     return resolveGrpcDisplayGeometry({
       inputWidth: image.width,
       inputHeight: image.height,
-      nativeWidth: nativePortrait.width,
-      nativeHeight: nativePortrait.height,
-      quarterTurn: displayRotation,
+      nativeWidth: nativeTouchSize.width,
+      nativeHeight: nativeTouchSize.height,
     });
   };
-  const startEncoder = (announceSize: boolean, clearPending: boolean) => {
-    if (closed || lifetime.signal.aborted || !latest) return;
-    clearWriteTimers();
-    void encoder?.close();
-    if (clearPending) packetQueue.length = 0;
+  encoderLifecycle = new GrpcEncoderLifecycle<GrpcSessionEncoder>((restart) => {
+    if (closed || lifetime.signal.aborted || !latest) return null;
+    if (restart.clearPending) packetQueue.clear();
     const geometry = currentGeometry(latest)!;
     const size = geometry.encodedSize;
     if (size.width <= 0 || size.height <= 0) {
       emitFatal({ message: "emulator returned an image too small to encode" });
-      return;
+      return null;
     }
     frameWritePacer.reset(performance.now());
     if (sessionMeta) {
       sessionMeta.width = size.width;
       sessionMeta.height = size.height;
     }
-    encoder = new H264Encoder({
+    const next = runtime.createEncoder({
       width: latest.width,
       height: latest.height,
-      quarterTurn: geometry.quarterTurn,
+      quarterTurn: 0,
       fps: maxFps,
       bitRate,
       keyFrameInterval,
       onFrame: (frame: VideoFrame) => pushPacket(frame),
       onExit: (message) => emitFatal({ message, code: "encoder-exit" }),
     });
-    if (announceSize) {
+    if (restart.announceSize) {
       pushPacket({
         type: "session",
         width: size.width,
@@ -969,43 +1227,34 @@ export async function startGrpcSession(
         clientResized: false,
       });
     }
-    writeFrame(false);
+    return next;
+  });
+  const restartEncoder = (
+    announceSize: boolean,
+    clearPending: boolean,
+  ): Promise<void> => {
+    if (closed || lifetime.signal.aborted || !latest) return Promise.resolve();
+    clearWriteTimers();
+    return encoderLifecycle!
+      .restart({ announceSize, clearPending })
+      .then((started) => {
+        if (started && encoderLifecycle?.current === started) writeFrame(false);
+      });
+  };
+  requestQueuedKeyFrame = () => {
+    void restartEncoder(false, false).catch((error) =>
+      emitFatal({
+        message: `could not recover the H.264 packet queue: ${error instanceof Error ? error.message : String(error)}`,
+        code: "encoder-exit",
+      })
+    );
   };
 
-  const scheduleRotationPoll = () => {
-    if (closed || lifetime.signal.aborted || rotationPollTimer) return;
-    rotationPollTimer = setTimeout(() => {
-      rotationPollTimer = null;
-      void (async () => {
-        try {
-          const nextRotation = await readDisplayRotation(
-            serial,
-            lifetime.signal,
-          );
-          if (closed || lifetime.signal.aborted) return;
-          if (nextRotation !== displayRotation) {
-            displayRotation = nextRotation;
-            startEncoder(true, true);
-          }
-        } catch (error) {
-          if (!closed && !lifetime.signal.aborted) {
-            console.warn(
-              `serve-emu could not refresh display rotation: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        } finally {
-          scheduleRotationPoll();
-        }
-      })();
-    }, DISPLAY_ROTATION_POLL_MS);
-    rotationPollTimer.unref?.();
-  };
-
-  const refreshNativeTouchGeometry = (): Promise<void> => {
+  const refreshNativeTouchGeometry = (force = false): Promise<void> => {
     if (!nativeTouchGeometryMonitor || closed || lifetime.signal.aborted) {
       return Promise.resolve();
     }
-    return nativeTouchGeometryMonitor.poll(lifetime.signal).catch((error) => {
+    return nativeTouchGeometryMonitor.poll(lifetime.signal, force).catch((error) => {
       if (!closed && !lifetime.signal.aborted) {
         console.warn(
           `serve-emu could not refresh native touch geometry: ${error instanceof Error ? error.message : String(error)}`,
@@ -1030,8 +1279,28 @@ export async function startGrpcSession(
     displaySizePollTimer.unref?.();
   };
 
-  const onImage = (image: EmuImage) => {
+  const onImage = (
+    image: EmuImage,
+    source: GrpcScreenshotImageSource = "stream",
+  ) => {
     if (closed || !isUsableRgbFrame(image)) return;
+    if (source === "stream") {
+      accessUnitBoundaryCadence.recordFreshImage(performance.now());
+    }
+    const encoder = encoderLifecycle?.current;
+    const geometryChanged =
+      encoder !== null &&
+      encoder !== undefined &&
+      (image.width !== encoder.width ||
+        image.height !== encoder.height);
+    const imageIsLandscape = image.width > image.height;
+    const nativeIsLandscape = nativeTouchSize.width > nativeTouchSize.height;
+    if (imageIsLandscape !== nativeIsLandscape) {
+      nativeTouchSize = {
+        width: nativeTouchSize.height,
+        height: nativeTouchSize.width,
+      };
+    }
     latest = image;
     if (resolveFirstImage) {
       const resolve = resolveFirstImage;
@@ -1039,12 +1308,14 @@ export async function startGrpcSession(
       resolve(image);
       return;
     }
-    if (
-      encoder &&
-      (image.width !== encoder.width || image.height !== encoder.height)
-    ) {
-      void refreshNativeTouchGeometry();
-      startEncoder(true, true);
+    if (geometryChanged) {
+      void refreshNativeTouchGeometry(true);
+      void restartEncoder(true, true).catch((error) =>
+        emitFatal({
+          message: `could not restart H.264 encoder: ${error instanceof Error ? error.message : String(error)}`,
+          code: "encoder-exit",
+        })
+      );
       return;
     }
     scheduleWrite();
@@ -1088,7 +1359,7 @@ export async function startGrpcSession(
     signal: AbortSignal,
   ) => {
     await touch(x, y, TOUCH_PRESSURE, 0, signal);
-    await sleep(20, signal);
+    await runtime.sleep(20, signal);
     await touch(x, y, 0, 0, signal);
   };
   const swipeTouch = async (
@@ -1097,7 +1368,6 @@ export async function startGrpcSession(
     x2: number,
     y2: number,
     durationMs: number,
-    holdMs: number,
     signal: AbortSignal,
   ) => {
     const duration = Math.max(80, durationMs);
@@ -1105,7 +1375,7 @@ export async function startGrpcSession(
     await touch(x1, y1, TOUCH_PRESSURE, 0, signal);
     for (let index = 1; index < steps; index++) {
       const progress = index / steps;
-      await sleep(duration / steps, signal);
+      await runtime.sleep(duration / steps, signal);
       await touch(
         x1 + (x2 - x1) * progress,
         y1 + (y2 - y1) * progress,
@@ -1114,11 +1384,10 @@ export async function startGrpcSession(
         signal,
       );
     }
-    await sleep(duration / steps + holdMs, signal);
+    await runtime.sleep(duration / steps, signal);
     await touch(x2, y2, 0, 0, signal);
   };
 
-  let navigationMode: 0 | 1 | 2 | null = null;
   const dispatchGesture = async (
     gesture: Gesture,
     signal: AbortSignal,
@@ -1134,7 +1403,6 @@ export async function startGrpcSession(
           gesture.x2,
           gesture.y2,
           gesture.durationMs ?? 250,
-          0,
           signal,
         );
       case "touch":
@@ -1157,25 +1425,13 @@ export async function startGrpcSession(
           signal,
         );
       case "back":
-        return navigationMode === 2
-          ? swipeTouch(0.002, 0.5, 0.28, 0.5, 180, 0, signal)
-          : navigationMode === 0 || navigationMode === 1
-            ? tapTouch(0.17, 0.985, signal)
-            : inputState.sendKey({ key: "GoBack" }, signal);
+        return inputState.sendKey({ key: "GoBack" }, signal);
       case "home":
-        return navigationMode === 2
-          ? swipeTouch(0.5, 0.995, 0.5, 0.65, 250, 0, signal)
-          : navigationMode === 0 || navigationMode === 1
-            ? tapTouch(0.5, 0.985, signal)
-            : inputState.sendKey({ key: "GoHome" }, signal);
+        return inputState.sendKey({ key: "GoHome" }, signal);
       case "recents":
-        return navigationMode === 0
-          ? tapTouch(0.83, 0.985, signal)
-          : navigationMode === 1 || navigationMode === 2
-            ? swipeTouch(0.5, 0.995, 0.5, 0.55, 280, 500, signal)
-            : inputState.sendKey({ key: "AppSwitch" }, signal);
+        return inputState.sendKey({ key: "AppSwitch" }, signal);
       case "power":
-        return toggleDevicePower(serial, signal);
+        return inputState.sendKey({ key: "Power" }, signal);
     }
   };
 
@@ -1210,7 +1466,10 @@ export async function startGrpcSession(
         dispatchGesture(gesture, signal),
       async resetVideo(signal) {
         throwIfAborted(signal, "gRPC video reset aborted");
-        startEncoder(false, true);
+        // Existing packets remain valid until the replacement emits its IDR.
+        // The lifecycle coalesces bursts and never overlaps ffmpeg shutdowns.
+        await restartEncoder(false, false);
+        throwIfAborted(signal, "gRPC video reset aborted");
       },
       close() {
         void releaseInput();
@@ -1230,16 +1489,13 @@ export async function startGrpcSession(
     clearWriteTimers();
     if (idleTimer) clearInterval(idleTimer);
     idleTimer = null;
-    if (rotationPollTimer) clearTimeout(rotationPollTimer);
-    rotationPollTimer = null;
     if (displaySizePollTimer) clearTimeout(displaySizePollTimer);
     displaySizePollTimer = null;
     controls.close(new Error("gRPC screenshot session closed"));
     const inputRelease = releaseInput();
-    const encoderClose = encoder?.close() ?? Promise.resolve();
-    encoder = null;
+    const encoderClose = encoderLifecycle?.close() ?? Promise.resolve();
     listeners.clear();
-    packetQueue.length = 0;
+    packetQueue.clear();
     wakeReaders();
     void Promise.allSettled([inputRelease, encoderClose]).then(() => {
       client.close();
@@ -1260,16 +1516,7 @@ export async function startGrpcSession(
 
   try {
     throwIfAborted(lifetime.signal, "gRPC screenshot startup aborted");
-    const [
-      initialNavigationMode,
-      initialDisplayRotation,
-      initialDisplaySizeSignal,
-    ] = await Promise.all([
-      readNavigationMode(serial, lifetime.signal),
-      readInitialDisplayRotation(
-        () => readDisplayRotation(serial, lifetime.signal),
-        lifetime.signal,
-      ),
+    const [initialDisplaySizeSignal] = await Promise.all([
       readDisplaySizeSignal(serial, lifetime.signal).catch((error) => {
         throwIfAborted(lifetime.signal, "gRPC screenshot startup aborted");
         console.warn(
@@ -1278,24 +1525,23 @@ export async function startGrpcSession(
         return null;
       }),
     ]);
-    navigationMode = initialNavigationMode;
     throwIfAborted(lifetime.signal, "gRPC screenshot startup aborted");
-    if (!(await isDeviceAwake(serial, lifetime.signal))) {
-      await runPowerCommand(serial, "wakeup", lifetime.signal);
-      await sleep(100, lifetime.signal);
+    if (!(await runtime.isDeviceAwake(serial, lifetime.signal))) {
+      await runtime.wakeDevice(serial, lifetime.signal);
+      await runtime.sleep(100, lifetime.signal);
     }
     let probe = await client.getScreenshot(
       { format: IMG_FORMAT_PNG },
       lifetime.signal,
     );
     if (probe.width <= 0 || probe.height <= 0) {
-      await runPowerCommand(serial, "wakeup", lifetime.signal);
+      await runtime.wakeDevice(serial, lifetime.signal);
       for (
         let attempt = 0;
         attempt < 20 && (probe.width <= 0 || probe.height <= 0);
         attempt++
       ) {
-        await sleep(100, lifetime.signal);
+        await runtime.sleep(100, lifetime.signal);
         probe = await client.getScreenshot(
           { format: IMG_FORMAT_PNG },
           lifetime.signal,
@@ -1307,9 +1553,7 @@ export async function startGrpcSession(
         );
       }
     }
-    displayRotation =
-      initialDisplayRotation ?? rotationFromEmulatorImage(probe.rotation);
-    nativePortrait = {
+    nativeTouchSize = {
       width: probe.width,
       height: probe.height,
     };
@@ -1320,7 +1564,7 @@ export async function startGrpcSession(
       readNativeImage: (signal) =>
         client.getScreenshot({ format: IMG_FORMAT_PNG }, signal),
       onNativeSize: (size) => {
-        nativePortrait = size;
+        nativeTouchSize = size;
       },
     });
     const existingFailure = getFatalFailure();
@@ -1388,18 +1632,17 @@ export async function startGrpcSession(
       );
     const first = await firstImage;
     latest = first;
-    startEncoder(false, false);
+    await restartEncoder(false, false);
     await startupGate.wait(lifetime.signal, FIRST_FRAME_TIMEOUT_MS);
     idleTimer = setInterval(() => {
       if (
         !closed &&
-        encoder &&
+        encoderLifecycle?.current &&
         Date.now() - lastWriteAt >= repeatFrameMs
       ) {
         writeFrame(true);
       }
     }, Math.max(16, Math.min(250, repeatFrameMs / 2)));
-    scheduleRotationPoll();
     scheduleDisplaySizePoll();
 
     const size = currentGeometry(first)!.encodedSize;

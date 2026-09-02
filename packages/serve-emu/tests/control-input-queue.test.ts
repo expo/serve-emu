@@ -8,10 +8,7 @@ import {
   type ControlBinaryWriter,
   type ControlInputClock,
 } from "../src/control-input-queue.ts";
-import {
-  originalTextForControl,
-  parseGesture,
-} from "../src/input.ts";
+import { parseGesture } from "../src/input.ts";
 
 const SCREEN = { width: 1080, height: 1920 };
 
@@ -175,17 +172,14 @@ function expectOverloaded(callback: () => unknown): ControlInputError {
 }
 
 describe("ControlInputQueue ordering and backpressure", () => {
-  test("preserves hidden original text through semantic normalization", async () => {
+  test("passes only normalized text through the semantic queue", async () => {
     const original = `${"a".repeat(300)}é`;
-    const dispatched: Array<{ text: string; original: string }> = [];
+    const dispatched: string[] = [];
     const queue = new ControlInputQueue({
       dispatcher: {
         async dispatchGesture(gesture) {
           if (gesture.type === "text") {
-            dispatched.push({
-              text: gesture.text,
-              original: originalTextForControl(gesture),
-            });
+            dispatched.push(gesture.text);
           }
         },
         async resetVideo() {},
@@ -202,9 +196,7 @@ describe("ControlInputQueue ordering and backpressure", () => {
     });
     await input.completion;
 
-    expect(dispatched).toEqual([
-      { text: "a".repeat(300), original },
-    ]);
+    expect(dispatched).toEqual(["a".repeat(300)]);
   });
 
   test("keeps an overlapping swipe and tap atomic", async () => {
