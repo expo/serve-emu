@@ -1,7 +1,11 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, test } from "bun:test";
 import { createApp } from "../src/middleware.ts";
-import type { ScrcpySession, StartOpts } from "../src/scrcpy.ts";
+import {
+  SCRCPY_DEFAULTS,
+  type ScrcpySession,
+  type StartOpts,
+} from "../src/scrcpy.ts";
 import type { StreamSocket } from "../src/stream-socket.ts";
 
 type CapturedStartOpts = StartOpts & { mode?: "scrcpy" };
@@ -14,6 +18,19 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function streamSettingsPatch(
+  body: unknown,
+  contentType: string | null = "application/json",
+): Request {
+  const headers = new Headers();
+  if (contentType) headers.set("Content-Type", contentType);
+  return new Request("http://localhost/api/stream-settings", {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify(body),
+  });
 }
 
 class TestStreamSocket implements StreamSocket {
@@ -79,6 +96,39 @@ function fakeSession(
 }
 
 describe("stream settings HTTP API", () => {
+  test("uses the canonical encoder defaults when options are omitted", async () => {
+    const starts: CapturedStartOpts[] = [];
+    const app = await createApp(
+      { serial: "emulator-test" },
+      {
+        startScrcpy: async (options: StartOpts) => {
+          starts.push(options);
+          return fakeSession();
+        },
+      },
+    );
+
+    try {
+      const response = await app.handleRequest(
+        new Request("http://localhost/api/stream-settings"),
+      );
+
+      expect(await response.json()).toEqual({
+        ok: true,
+        maxDimension: SCRCPY_DEFAULTS.maxSize,
+        h264Bitrate: SCRCPY_DEFAULTS.bitRate,
+        h264Fps: SCRCPY_DEFAULTS.maxFps,
+      });
+      expect(starts[0]).toMatchObject({
+        maxSize: SCRCPY_DEFAULTS.maxSize,
+        bitRate: SCRCPY_DEFAULTS.bitRate,
+        maxFps: SCRCPY_DEFAULTS.maxFps,
+      });
+    } finally {
+      await app.stop();
+    }
+  });
+
   test("GET /api/stream-settings reports the active scrcpy encoder settings", async () => {
     const starts: CapturedStartOpts[] = [];
     const app = await createApp(
@@ -103,6 +153,7 @@ describe("stream settings HTTP API", () => {
 
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({
+        ok: true,
         maxDimension: 960,
         h264Bitrate: 4_000_000,
         h264Fps: 24,
@@ -117,8 +168,13 @@ describe("stream settings HTTP API", () => {
         keyFrameInterval: undefined,
         mode: "scrcpy",
       });
+      expect(app.health().encoderSettings).toEqual({
+        maxDimension: 960,
+        h264Bitrate: 4_000_000,
+        h264Fps: 24,
+      });
     } finally {
-      app.stop();
+      await app.stop();
     }
   });
 
@@ -141,19 +197,16 @@ describe("stream settings HTTP API", () => {
 
     try {
       const response = await app.handleRequest(
-        new Request("http://localhost/api/stream-settings", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            maxDimension: 720,
-            h264Bitrate: 3_000_000,
-            h264Fps: 20,
-          }),
+        streamSettingsPatch({
+          maxDimension: 720,
+          h264Bitrate: 3_000_000,
+          h264Fps: 20,
         }),
       );
 
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({
+        ok: true,
         maxDimension: 720,
         h264Bitrate: 3_000_000,
         h264Fps: 20,
@@ -163,6 +216,11 @@ describe("stream settings HTTP API", () => {
       expect((await status.json()).size).toEqual({ width: 405, height: 720 });
       expect(app.session).not.toBe(initialSession);
       expect(app.session.meta).toMatchObject({ width: 405, height: 720 });
+      expect(app.health().encoderSettings).toEqual({
+        maxDimension: 720,
+        h264Bitrate: 3_000_000,
+        h264Fps: 20,
+      });
       expect(starts[1]).toEqual({
         serial: "emulator-test",
         signal: expect.any(AbortSignal),
@@ -198,11 +256,7 @@ describe("stream settings HTTP API", () => {
 
     try {
       const response = await app.handleRequest(
-        new Request("http://localhost/api/stream-settings", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ maxDimension: 720 }),
-        }),
+        streamSettingsPatch({ maxDimension: 720 }),
       );
 
       expect(response.status).toBe(200);
@@ -241,24 +295,24 @@ describe("stream settings HTTP API", () => {
         { resolution: 720 },
       ]) {
         const response = await app.handleRequest(
-          new Request("http://localhost/api/stream-settings", {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(patch),
-          }),
+          streamSettingsPatch(patch),
         );
 
         expect(response.status).toBe(400);
-        expect((await response.json()).error).toBe("invalid_stream_settings");
+        expect(await response.json()).toMatchObject({
+          ok: false,
+          error: "invalid_stream_settings",
+        });
       }
 
       const settings = await app.handleRequest(
         new Request("http://localhost/api/stream-settings"),
       );
       expect(await settings.json()).toEqual({
+        ok: true,
         maxDimension: 1280,
         h264Bitrate: 8_000_000,
-        h264Fps: 30,
+        h264Fps: SCRCPY_DEFAULTS.maxFps,
       });
       expect(starts).toBe(1);
     } finally {
@@ -274,14 +328,14 @@ describe("stream settings HTTP API", () => {
 
     try {
       const response = await app.handleRequest(
-        new Request("http://localhost/api/stream-settings", {
-          method: "PATCH",
-          body: JSON.stringify({ maxDimension: 720 }),
-        }),
+        streamSettingsPatch({ maxDimension: 720 }, null),
       );
 
       expect(response.status).toBe(415);
-      expect(await response.json()).toEqual({ error: "unsupported_media_type" });
+      expect(await response.json()).toEqual({
+        ok: false,
+        error: "unsupported_media_type",
+      });
     } finally {
       app.stop();
     }
@@ -302,30 +356,66 @@ describe("stream settings HTTP API", () => {
 
     try {
       const response = await app.handleRequest(
-        new Request("http://localhost/api/stream-settings", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ maxDimension: 720 }),
-        }),
+        streamSettingsPatch({ maxDimension: 720 }),
       );
 
       expect(response.status).toBe(500);
-      expect((await response.json()).error).toBe("stream_settings_failed");
+      expect(await response.json()).toMatchObject({
+        ok: false,
+        error: "stream_settings_failed",
+      });
 
       const settings = await app.handleRequest(
         new Request("http://localhost/api/stream-settings"),
       );
       expect(await settings.json()).toEqual({
+        ok: true,
         maxDimension: 960,
         h264Bitrate: 8_000_000,
-        h264Fps: 30,
+        h264Fps: SCRCPY_DEFAULTS.maxFps,
       });
       const health = await app.handleRequest(new Request("http://localhost/health"));
       expect(health.status).toBe(200);
-      expect((await health.json()).size).toEqual({ width: 540, height: 960 });
+      expect(await health.json()).toMatchObject({
+        size: { width: 540, height: 960 },
+        encoderSettings: {
+          maxDimension: 960,
+          h264Bitrate: SCRCPY_DEFAULTS.bitRate,
+          h264Fps: SCRCPY_DEFAULTS.maxFps,
+        },
+      });
       expect(starts).toBe(3);
     } finally {
       app.stop();
+    }
+  });
+
+  test("a failed replacement and rollback remains an internal failure", async () => {
+    let starts = 0;
+    const app = await createApp(
+      { serial: "emulator-test" },
+      {
+        startScrcpy: async () => {
+          starts++;
+          if (starts > 1) throw new Error(`capture start ${starts} failed`);
+          return fakeSession();
+        },
+      },
+    );
+
+    try {
+      const response = await app.handleRequest(
+        streamSettingsPatch({ maxDimension: 720 }),
+      );
+
+      expect(response.status).toBe(500);
+      expect(await response.json()).toMatchObject({
+        ok: false,
+        error: "stream_settings_failed",
+      });
+      expect(app.health().status).toBe("error");
+    } finally {
+      await app.stop();
     }
   });
 
@@ -354,11 +444,7 @@ describe("stream settings HTTP API", () => {
 
     try {
       const response = await app.handleRequest(
-        new Request("http://localhost/api/stream-settings", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ maxDimension: 720 }),
-        }),
+        streamSettingsPatch({ maxDimension: 720 }),
       );
 
       expect(response.status).toBe(200);
@@ -395,19 +481,11 @@ describe("stream settings HTTP API", () => {
 
     try {
       const firstPatch = app.handleRequest(
-        new Request("http://localhost/api/stream-settings", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ maxDimension: 720 }),
-        }),
+        streamSettingsPatch({ maxDimension: 720 }),
       );
       await firstReplacementStarted.promise;
       const secondPatch = app.handleRequest(
-        new Request("http://localhost/api/stream-settings", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ maxDimension: 960 }),
-        }),
+        streamSettingsPatch({ maxDimension: 960 }),
       );
       await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -415,18 +493,113 @@ describe("stream settings HTTP API", () => {
       firstReplacement.resolve(fakeSession({ width: 405, height: 720 }));
 
       expect(await (await firstPatch).json()).toEqual({
+        ok: true,
         maxDimension: 720,
         h264Bitrate: 8_000_000,
-        h264Fps: 30,
+        h264Fps: SCRCPY_DEFAULTS.maxFps,
       });
       expect(await (await secondPatch).json()).toEqual({
+        ok: true,
         maxDimension: 960,
         h264Bitrate: 8_000_000,
-        h264Fps: 30,
+        h264Fps: SCRCPY_DEFAULTS.maxFps,
       });
       expect(starts).toBe(3);
     } finally {
       app.stop();
+    }
+  });
+
+  test("PATCH returns a conflict while session replay is active", async () => {
+    let starts = 0;
+    const app = await createApp(
+      { serial: "emulator-test" },
+      {
+        startScrcpy: async () => {
+          starts++;
+          return fakeSession();
+        },
+      },
+    );
+    const replayGate = deferred<void>();
+    app.deviceState.recorder.recordGesture(
+      { type: "tap", x: 0.5, y: 0.5 },
+      "test",
+    );
+    const replay = app.deviceState.recorder.startReplay({
+      dispatchGesture: () => replayGate.promise,
+      setLocation: () => {},
+    });
+
+    try {
+      await Promise.resolve();
+      expect(app.deviceState.recorder.isReplaying).toBe(true);
+
+      const response = await app.handleRequest(
+        streamSettingsPatch({ maxDimension: 720 }),
+      );
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        ok: false,
+        error: "stream_settings_conflict",
+        message: "cannot update stream settings while session replay is running",
+      });
+      expect(starts).toBe(1);
+    } finally {
+      replayGate.resolve();
+      await replay.completion;
+      await app.stop();
+    }
+  });
+
+  test("session replay returns a conflict while capture replacement is active", async () => {
+    const replacement = deferred<ScrcpySession>();
+    const replacementStarted = deferred<void>();
+    let starts = 0;
+    const app = await createApp(
+      { serial: "emulator-test" },
+      {
+        startScrcpy: async () => {
+          starts++;
+          if (starts === 1) return fakeSession();
+          replacementStarted.resolve();
+          return replacement.promise;
+        },
+      },
+    );
+    app.deviceState.recorder.recordGesture(
+      { type: "tap", x: 0.5, y: 0.5 },
+      "test",
+    );
+
+    const patch = app.handleRequest(
+      streamSettingsPatch({ maxDimension: 720 }),
+    );
+    await replacementStarted.promise;
+
+    try {
+      const response = await app.handleRequest(
+        new Request("http://localhost/api/session/replay", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ multiplier: 1 }),
+        }),
+      );
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        ok: false,
+        error: "cannot start session replay while video capture is restarting",
+      });
+      expect(app.deviceState.recorder.isReplaying).toBe(false);
+
+      replacement.resolve(fakeSession({ width: 405, height: 720 }));
+      expect((await patch).status).toBe(200);
+    } finally {
+      replacement.resolve(fakeSession({ width: 405, height: 720 }));
+      await patch;
+      await app.stop();
     }
   });
 
@@ -459,11 +632,7 @@ describe("stream settings HTTP API", () => {
     const writesBeforeRestart = oldControlWrites;
 
     const patch = app.handleRequest(
-      new Request("http://localhost/api/stream-settings", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ maxDimension: 720 }),
-      }),
+      streamSettingsPatch({ maxDimension: 720 }),
     );
     await replacementStarted.promise;
     socket.receive(JSON.stringify({ type: "tap", x: 0.5, y: 0.5 }));
@@ -499,11 +668,7 @@ describe("stream settings HTTP API", () => {
     try {
       socket.receive(JSON.stringify({ type: "tap", x: 0.5, y: 0.5 }));
       const response = await app.handleRequest(
-        new Request("http://localhost/api/stream-settings", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ maxDimension: 720 }),
-        }),
+        streamSettingsPatch({ maxDimension: 720 }),
       );
       expect(response.status).toBe(200);
       await new Promise((resolve) => setTimeout(resolve, 30));
@@ -540,11 +705,7 @@ describe("stream settings HTTP API", () => {
     );
 
     const patch = app.handleRequest(
-      new Request("http://localhost/api/stream-settings", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ maxDimension: 720 }),
-      }),
+      streamSettingsPatch({ maxDimension: 720 }),
     );
     await replacementStarted.promise;
     app.stop();
@@ -556,10 +717,33 @@ describe("stream settings HTTP API", () => {
     replacement.resolve(lateCapture);
 
     const response = await patch;
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      error: "stream_settings_unavailable",
+    });
     expect(closed).toBe(1);
     expect(app.isStreaming()).toBe(false);
     expect(app.health().captureRestarting).toBe(false);
+  });
+
+  test("PATCH returns service unavailable after the app has stopped", async () => {
+    const app = await createApp(
+      { serial: "emulator-test" },
+      { startScrcpy: async () => fakeSession() },
+    );
+    await app.stop();
+
+    const response = await app.handleRequest(
+      streamSettingsPatch({ maxDimension: 720 }),
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      ok: false,
+      error: "stream_settings_unavailable",
+      message: "session is stopped",
+    });
   });
 
   test("stopping during rollback closes a late rollback capture", async () => {
@@ -580,11 +764,7 @@ describe("stream settings HTTP API", () => {
     );
 
     const patch = app.handleRequest(
-      new Request("http://localhost/api/stream-settings", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ maxDimension: 720 }),
-      }),
+      streamSettingsPatch({ maxDimension: 720 }),
     );
     await rollbackStarted.promise;
     app.stop();
@@ -596,7 +776,11 @@ describe("stream settings HTTP API", () => {
     rollback.resolve(lateRollback);
 
     const response = await patch;
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      error: "stream_settings_unavailable",
+    });
     expect(closed).toBe(1);
     expect(app.isStreaming()).toBe(false);
     expect(app.health().captureRestarting).toBe(false);

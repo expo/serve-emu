@@ -37,7 +37,13 @@ import { parseRoutePlaybackRequest } from "./route-playback.ts";
 import type { StreamSocket } from "./stream-socket.ts";
 import {
   DEFAULT_STREAM_SETTINGS,
+  isJsonRequest,
+  parseStreamEncoderSettingsPatch,
   redactedStreamSettings,
+  streamEncoderSettingsEqual,
+  StreamSettingsUnavailableError,
+  type StreamEncoderSettings,
+  type StreamEncoderSettingsPatch,
   type StreamSettings,
 } from "./stream-settings.ts";
 import {
@@ -56,6 +62,10 @@ import { createWebRtcPublisher, type WebRtcPublisher } from "./webrtc-publisher.
 import { HttpBodyError, readBodyLimited, readJsonLimited } from "./request-body.ts";
 import { createMiddlewareUploader } from "./middleware-upload.ts";
 import {
+  SessionReplayConflictError,
+  sessionReplayErrorStatus,
+} from "./session-recorder.ts";
+import {
   adaptScrcpySession,
   startEmuSession,
   type EmuSession,
@@ -66,6 +76,7 @@ import {
   streamModeUnavailableResponse,
 } from "./stream-mode-api.ts";
 import {
+  SCRCPY_DEFAULTS,
   ScrcpyStreamError,
   startScrcpy,
   type ScrcpySession,
@@ -136,85 +147,11 @@ const MAX_JSON_BODY_BYTES = 8 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_WEBRTC_CLOSE_BODY_BYTES = 4 * 1024;
 const MAX_LOGCAT_QUERY_BYTES = 200;
-const MAX_STREAM_DIMENSION = 4_096;
-const MIN_H264_BITRATE = 100_000;
-const MAX_H264_BITRATE = 50_000_000;
-const MAX_H264_FPS = 120;
 // After a device's scrcpy start fails, wait this long before retrying so a
 // flapping device doesn't get hammered on every request.
 const SPAWN_RETRY_COOLDOWN_MS = 5_000;
 
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
-
-type StreamEncoderSettings = {
-  maxDimension: number;
-  h264Bitrate: number;
-  h264Fps: number;
-};
-
-type StreamEncoderSettingsPatch = Partial<StreamEncoderSettings>;
-
-const STREAM_ENCODER_SETTING_KEYS = new Set<keyof StreamEncoderSettings>([
-  "maxDimension",
-  "h264Bitrate",
-  "h264Fps",
-]);
-
-class InvalidStreamSettingsError extends Error {}
-
-function parseStreamEncoderSettingsPatch(value: unknown): StreamEncoderSettingsPatch {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new InvalidStreamSettingsError("stream settings must be an object");
-  }
-  const input = value as Record<string, unknown>;
-  const keys = Object.keys(input);
-  if (keys.length === 0) {
-    throw new InvalidStreamSettingsError("stream settings patch must not be empty");
-  }
-  const unknownKey = keys.find(
-    (key) => !STREAM_ENCODER_SETTING_KEYS.has(key as keyof StreamEncoderSettings),
-  );
-  if (unknownKey) {
-    throw new InvalidStreamSettingsError(`unknown stream setting: ${unknownKey}`);
-  }
-
-  const readInteger = (key: keyof StreamEncoderSettings, min: number, max: number) => {
-    if (!(key in input)) return undefined;
-    const setting = input[key];
-    if (
-      typeof setting !== "number" ||
-      !Number.isFinite(setting) ||
-      !Number.isInteger(setting) ||
-      setting < min ||
-      setting > max
-    ) {
-      throw new InvalidStreamSettingsError(
-        `${key} must be an integer between ${min} and ${max}`,
-      );
-    }
-    return setting;
-  };
-
-  const maxDimension = readInteger("maxDimension", 0, MAX_STREAM_DIMENSION);
-  const h264Bitrate = readInteger("h264Bitrate", MIN_H264_BITRATE, MAX_H264_BITRATE);
-  const h264Fps = readInteger("h264Fps", 1, MAX_H264_FPS);
-  return {
-    ...(maxDimension !== undefined ? { maxDimension } : {}),
-    ...(h264Bitrate !== undefined ? { h264Bitrate } : {}),
-    ...(h264Fps !== undefined ? { h264Fps } : {}),
-  };
-}
-
-function streamEncoderSettingsEqual(
-  left: StreamEncoderSettings,
-  right: StreamEncoderSettings,
-): boolean {
-  return (
-    left.maxDimension === right.maxDimension &&
-    left.h264Bitrate === right.h264Bitrate &&
-    left.h264Fps === right.h264Fps
-  );
-}
 
 function abortError(signal: AbortSignal, fallback: string): Error {
   return signal.reason instanceof Error
@@ -311,9 +248,9 @@ async function createAppInternal(
     uploadQueueTimeoutMs: opts.uploadQueueTimeoutMs,
   });
   let streamEncoderSettings: StreamEncoderSettings = {
-    maxDimension: opts.maxSize ?? 1280,
-    h264Bitrate: opts.bitRate ?? 8_000_000,
-    h264Fps: opts.maxFps ?? 30,
+    maxDimension: opts.maxSize ?? SCRCPY_DEFAULTS.maxSize,
+    h264Bitrate: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
+    h264Fps: opts.maxFps ?? SCRCPY_DEFAULTS.maxFps,
   };
   const openSession: typeof startEmuSession =
     dependencies.startSession ??
@@ -423,6 +360,7 @@ async function createAppInternal(
     logcat: deviceState.logcat.snapshot(),
     uploads: uploader.snapshot(),
     stream: redactedStreamSettings(streamSettings),
+    encoderSettings: { ...streamEncoderSettings },
     webrtc: webRtcPublisher?.snapshot() ?? null,
     clientsDetail: Array.from(clients, (client) => ({
       id: client.id,
@@ -546,11 +484,6 @@ async function createAppInternal(
     } catch {
       throw new WebRtcSignalingError("Invalid JSON body", 400, code);
     }
-  };
-
-  const isJsonRequest = (req: Request): boolean => {
-    const contentType = req.headers.get("content-type");
-    return contentType?.split(";", 1)[0]?.trim().toLowerCase() === "application/json";
   };
 
   const shouldRecord = (value: unknown) =>
@@ -880,7 +813,7 @@ async function createAppInternal(
     try {
       validateCapture(nextSession);
       if (stopRequested || status !== "streaming") {
-        throw new Error(`session is ${status}`);
+        throw new StreamSettingsUnavailableError(`session is ${status}`);
       }
     } catch (err) {
       await nextSession.close();
@@ -934,12 +867,17 @@ async function createAppInternal(
   ): Promise<StreamEncoderSettings> => {
     const update = streamSettingsUpdate.then(async () => {
       if (stopRequested || status !== "streaming") {
-        throw new Error(`session is ${status}`);
+        throw new StreamSettingsUnavailableError(`session is ${status}`);
       }
       const previousSettings = streamEncoderSettings;
       const nextSettings = { ...previousSettings, ...patch };
       if (streamEncoderSettingsEqual(previousSettings, nextSettings)) {
         return { ...previousSettings };
+      }
+      if (sessionRecorder.isReplaying) {
+        throw new SessionReplayConflictError(
+          "cannot update stream settings while session replay is running",
+        );
       }
 
       const previousSession = session;
@@ -967,7 +905,9 @@ async function createAppInternal(
         return { ...streamEncoderSettings };
       } catch (updateError) {
         if (replacement) await replacement.close().catch(() => {});
-        if (stopRequested || status !== "streaming") throw updateError;
+        if (stopRequested || status !== "streaming") {
+          throw new StreamSettingsUnavailableError(`session is ${status}`);
+        }
 
         let rollback: EmuSession | null = null;
         try {
@@ -981,7 +921,9 @@ async function createAppInternal(
           await activateCapture(candidate, previousSettings, true);
         } catch (rollbackError) {
           if (rollback) await rollback.close().catch(() => {});
-          if (stopRequested || status !== "streaming") throw updateError;
+          if (stopRequested || status !== "streaming") {
+            throw new StreamSettingsUnavailableError(`session is ${status}`);
+          }
           captureRestarting = false;
           markTerminal(
             "error",
@@ -1027,15 +969,21 @@ async function createAppInternal(
     if (url.pathname === "/api/stream-settings") {
       if (req.method === "GET") {
         await streamSettingsUpdate;
-        return Response.json(streamEncoderSettings, {
+        return Response.json({ ok: true, ...streamEncoderSettings }, {
           headers: { "Cache-Control": "no-store" },
         });
       }
       if (req.method !== "PATCH") {
-        return Response.json({ error: "method_not_allowed" }, { status: 405 });
+        return Response.json(
+          { ok: false, error: "method_not_allowed" },
+          { status: 405, headers: { Allow: "GET, PATCH" } },
+        );
       }
       if (!isJsonRequest(req)) {
-        return Response.json({ error: "unsupported_media_type" }, { status: 415 });
+        return Response.json(
+          { ok: false, error: "unsupported_media_type" },
+          { status: 415 },
+        );
       }
       let patch: StreamEncoderSettingsPatch;
       try {
@@ -1044,6 +992,7 @@ async function createAppInternal(
         const bodyTooLarge = err instanceof HttpBodyError && err.status === 413;
         return Response.json(
           {
+            ok: false,
             error: bodyTooLarge ? "body_too_large" : "invalid_stream_settings",
             message: errMsg(err),
           },
@@ -1052,16 +1001,23 @@ async function createAppInternal(
       }
       try {
         const settings = await updateStreamEncoderSettings(patch);
-        return Response.json(settings, {
+        return Response.json({ ok: true, ...settings }, {
           headers: { "Cache-Control": "no-store" },
         });
       } catch (err) {
+        const conflict = err instanceof SessionReplayConflictError;
+        const unavailable = err instanceof StreamSettingsUnavailableError;
         return Response.json(
           {
-            error: "stream_settings_failed",
+            ok: false,
+            error: unavailable
+              ? "stream_settings_unavailable"
+              : conflict
+                ? "stream_settings_conflict"
+                : "stream_settings_failed",
             message: errMsg(err),
           },
-          { status: 500 },
+          { status: unavailable ? 503 : conflict ? 409 : 500 },
         );
       }
     }
@@ -1330,6 +1286,11 @@ async function createAppInternal(
           typeof payload === "object" && payload !== null && !Array.isArray(payload)
             ? Number((payload as Record<string, unknown>).multiplier ?? 1)
             : 1;
+        if (captureRestarting) {
+          throw new SessionReplayConflictError(
+            "cannot start session replay while video capture is restarting",
+          );
+        }
         const replay = sessionRecorder.startReplay(
           deviceState.replayHandlers,
           multiplier,
@@ -1339,7 +1300,12 @@ async function createAppInternal(
       } catch (err) {
         return Response.json(
           { ok: false, error: err instanceof Error ? err.message : String(err) },
-          { status: 400 },
+          {
+            status:
+              err instanceof HttpBodyError
+                ? err.status
+                : sessionReplayErrorStatus(err),
+          },
         );
       }
     }

@@ -25,6 +25,8 @@ const EXPECTED_ROUTES = [
   ["GET", "/api"],
   ["GET", "/api/stream-mode"],
   ["PUT", "/api/stream-mode"],
+  ["GET", "/api/stream-settings"],
+  ["PATCH", "/api/stream-settings"],
   ["GET", "/api/devices"],
   ["GET", "/api/device-grid"],
   ["POST", "/api/devices/select"],
@@ -78,6 +80,7 @@ const METHOD_ORDER: readonly ApiMethod[] = [
 
 const VALID_JSON_BODIES: Readonly<Record<string, unknown>> = {
   "PUT /api/stream-mode": { mode: "grpc-screenshot" },
+  "PATCH /api/stream-settings": { maxDimension: 720 },
   "POST /api/devices/select": { serial: "emulator-5554" },
   "POST /api/avds/start": { avd: "Pixel_8_API_35", select: true },
   "POST /api/avds/stop": { serial: "emulator-5554" },
@@ -167,6 +170,18 @@ function fakeDependencies(
       mode,
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 1,
+    }),
+    getStreamEncoderSettings: () => ({
+      ok: true,
+      maxDimension: 1280,
+      h264Bitrate: 8_000_000,
+      h264Fps: 60,
+    }),
+    setStreamEncoderSettings: async (patch) => ({
+      ok: true,
+      maxDimension: patch.maxDimension ?? 1280,
+      h264Bitrate: patch.h264Bitrate ?? 8_000_000,
+      h264Fps: patch.h264Fps ?? 60,
     }),
     listDevices: async () => ({
       ok: true,
@@ -371,14 +386,14 @@ const silentLogger: ApiLogger = {
 };
 
 describe("domain API route table", () => {
-  test("registers the exact 42 method/path pairs across 32 paths", () => {
+  test("registers the exact 44 method/path pairs across 33 paths", () => {
     const routes = createApiRoutes();
 
     expect(routes.map(({ method, path }) => [method, path])).toEqual(
       EXPECTED_ROUTES.map(([method, path]) => [method, path]),
     );
-    expect(routes).toHaveLength(42);
-    expect(new Set(routes.map((route) => route.path)).size).toBe(32);
+    expect(routes).toHaveLength(44);
+    expect(new Set(routes.map((route) => route.path)).size).toBe(33);
     const contractPairs = Object.entries(API_SUCCESS_PARSERS).flatMap(
       ([path, methods]) => Object.keys(methods).map((method) => `${method} ${path}`),
     );
@@ -408,15 +423,15 @@ describe("domain API route table", () => {
     );
   });
 
-  test("returns structured PATCH 405 with exact Allow for all 32 paths", async () => {
+  test("returns structured OPTIONS 405 with exact Allow for all 33 paths", async () => {
     const router = createApiRouter(createApiRoutes());
     const deps = fakeDependencies();
     const paths = [...new Set(EXPECTED_ROUTES.map((route) => route[1]))];
 
-    expect(paths).toHaveLength(32);
+    expect(paths).toHaveLength(33);
     for (const path of paths) {
       const response = await router.handle(
-        new Request(`${BASE_URL}${path}`, { method: "PATCH" }),
+        new Request(`${BASE_URL}${path}`, { method: "OPTIONS" }),
         deps,
       );
       await expectFailure(
@@ -472,6 +487,20 @@ describe("domain API failures", () => {
       400,
       "invalid_request",
       "orientation must be auto, portrait, or landscape",
+    );
+
+    const streamSettings = await router.handle(
+      new Request(`${BASE_URL}/api/stream-settings`, {
+        method: "PATCH",
+        body: JSON.stringify({ h264Fps: 0 }),
+      }),
+      fakeDependencies(),
+    );
+    await expectFailure(
+      streamSettings,
+      400,
+      "invalid_request",
+      "h264Fps must be an integer between 1 and 120",
     );
   });
 

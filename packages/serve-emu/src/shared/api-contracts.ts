@@ -1,7 +1,13 @@
 import { parseGesture, type Gesture } from "./control-contracts";
-import type {
-  StreamSettings,
-  WebRtcIceServer,
+import {
+  MAX_H264_BITRATE,
+  MAX_H264_FPS,
+  MAX_STREAM_DIMENSION,
+  MIN_H264_BITRATE,
+  type StreamEncoderSettings,
+  type StreamEncoderSettingsPatch,
+  type StreamSettings,
+  type WebRtcIceServer,
 } from "../stream-settings";
 
 /** Stable error codes sent by every JSON API failure. */
@@ -84,6 +90,8 @@ export type StreamModeResponse = ApiSuccess<{
   availableModes: StreamMode[];
   sessionGeneration: number;
 }>;
+
+export type StreamEncoderSettingsResponse = ApiSuccess<StreamEncoderSettings>;
 
 export type AvdStartResponse = ApiSuccess<{
   serial: string;
@@ -308,6 +316,7 @@ export type HealthResponse = {
   lastErrorMeta: Record<string, string | number> | null;
   /** Changes whenever the active device session or stream source changes. */
   sessionGeneration?: number;
+  encoderSettings?: StreamEncoderSettings;
 };
 
 export type ApiInfoResponse = {
@@ -358,6 +367,10 @@ export type ApiContractMap = {
   "/api/stream-mode": {
     GET: EndpointContract<undefined, StreamModeResponse>;
     PUT: EndpointContract<StreamModeRequest, StreamModeResponse>;
+  };
+  "/api/stream-settings": {
+    GET: EndpointContract<undefined, StreamEncoderSettingsResponse>;
+    PATCH: EndpointContract<StreamEncoderSettingsPatch, StreamEncoderSettingsResponse>;
   };
   "/api/avds/start": {
     POST: EndpointContract<{ avd: string; select?: boolean }, AvdStartResponse>;
@@ -707,6 +720,55 @@ export function parseStreamModeResponse(value: unknown): StreamModeResponse {
     availableModes,
     sessionGeneration,
   };
+}
+
+export function parseStreamEncoderSettingsResponse(
+  value: unknown,
+): StreamEncoderSettingsResponse {
+  const root = record(value, "stream encoder settings response");
+  if (root.ok !== true) {
+    fail("stream encoder settings response.ok must be true");
+  }
+  const maxDimension = number(
+    root.maxDimension,
+    "stream encoder settings response.maxDimension",
+  );
+  const h264Bitrate = number(
+    root.h264Bitrate,
+    "stream encoder settings response.h264Bitrate",
+  );
+  const h264Fps = number(
+    root.h264Fps,
+    "stream encoder settings response.h264Fps",
+  );
+  if (
+    !Number.isSafeInteger(maxDimension) ||
+    maxDimension < 0 ||
+    maxDimension > MAX_STREAM_DIMENSION
+  ) {
+    fail(
+      `stream encoder settings response.maxDimension must be an integer between 0 and ${MAX_STREAM_DIMENSION}`,
+    );
+  }
+  if (
+    !Number.isSafeInteger(h264Bitrate) ||
+    h264Bitrate < MIN_H264_BITRATE ||
+    h264Bitrate > MAX_H264_BITRATE
+  ) {
+    fail(
+      `stream encoder settings response.h264Bitrate must be an integer between ${MIN_H264_BITRATE} and ${MAX_H264_BITRATE}`,
+    );
+  }
+  if (
+    !Number.isSafeInteger(h264Fps) ||
+    h264Fps < 1 ||
+    h264Fps > MAX_H264_FPS
+  ) {
+    fail(
+      `stream encoder settings response.h264Fps must be an integer between 1 and ${MAX_H264_FPS}`,
+    );
+  }
+  return { ok: true, maxDimension, h264Bitrate, h264Fps };
 }
 
 export function parseAvdStartResponse(value: unknown): AvdStartResponse {
@@ -1191,6 +1253,17 @@ export function parseHealthResponse(value: unknown): HealthResponse {
     }
     health.sessionGeneration = generation;
   }
+  if (root.encoderSettings !== undefined) {
+    const encoderSettings = parseStreamEncoderSettingsResponse({
+      ok: true,
+      ...record(root.encoderSettings, "health response.encoderSettings"),
+    });
+    health.encoderSettings = {
+      maxDimension: encoderSettings.maxDimension,
+      h264Bitrate: encoderSettings.h264Bitrate,
+      h264Fps: encoderSettings.h264Fps,
+    };
+  }
   return health;
 }
 
@@ -1214,6 +1287,10 @@ export const API_SUCCESS_PARSERS = {
   "/api/stream-mode": {
     GET: parseStreamModeResponse,
     PUT: parseStreamModeResponse,
+  },
+  "/api/stream-settings": {
+    GET: parseStreamEncoderSettingsResponse,
+    PATCH: parseStreamEncoderSettingsResponse,
   },
   "/api/avds/start": { POST: parseAvdStartResponse },
   "/api/avds/stop": { POST: parseAvdStopResponse },

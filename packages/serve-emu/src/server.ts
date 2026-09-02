@@ -43,6 +43,7 @@ import {
   writeFrameMetaHeader,
 } from "./shared/frame-meta.ts";
 import {
+  SCRCPY_DEFAULTS,
   type StartOpts as ScrcpyStartOpts,
   type ScrcpySession,
   ScrcpyStreamError,
@@ -122,7 +123,13 @@ import {
 } from "./upload-manager.ts";
 import {
   DEFAULT_STREAM_SETTINGS,
+  isJsonRequest,
+  parseStreamEncoderSettingsPatch,
   redactedStreamSettings,
+  streamEncoderSettingsEqual,
+  StreamSettingsUnavailableError,
+  type StreamEncoderSettings,
+  type StreamEncoderSettingsPatch,
   type StreamSettings,
 } from "./stream-settings.ts";
 import {
@@ -278,6 +285,7 @@ export type ServerDependencies = {
   openScrcpy?: (
     serial: string,
     signal?: AbortSignal,
+    options?: ScrcpyStartOpts,
   ) => Promise<ScrcpySession>;
   /** @deprecated Prefer openScrcpy. Kept for lifecycle-test compatibility. */
   startScrcpy?: (opts: ScrcpyStartOpts) => Promise<ScrcpySession>;
@@ -362,24 +370,20 @@ export async function startServer(
     dependencies.createInputQueue ??
     ((session: ScrcpySession) =>
       new ControlInputQueue({ socket: session.controlSocket }));
-  const legacyOpenScrcpy = dependencies.openScrcpy ??
-    (dependencies.startScrcpy
-      ? ((serial: string, signal?: AbortSignal) =>
-          dependencies.startScrcpy!({
-            serial,
-            signal,
-            maxFps: opts.maxFps,
-            bitRate: opts.bitRate,
-            maxSize: opts.maxSize,
-            keyFrameInterval: opts.keyFrameInterval,
-            repeatFrameMs: opts.repeatFrameMs,
-          }))
-      : null);
   const openSession =
     dependencies.openSession ??
     (async (options: StartEmuSessionOptions) => {
-      if (options.mode === "scrcpy" && legacyOpenScrcpy) {
-        const raw = await legacyOpenScrcpy(options.serial, options.signal);
+      if (
+        options.mode === "scrcpy" &&
+        (dependencies.openScrcpy || dependencies.startScrcpy)
+      ) {
+        const raw = dependencies.openScrcpy
+          ? await dependencies.openScrcpy(
+              options.serial,
+              options.signal,
+              options,
+            )
+          : await dependencies.startScrcpy!(options);
         try {
           return adaptScrcpySession(raw, createInputQueue(raw));
         } catch (error) {
@@ -456,6 +460,15 @@ export async function startServer(
   const authToken = opts.token && opts.token.length > 0 ? opts.token : null;
   const streamSettings = opts.streamSettings ?? DEFAULT_STREAM_SETTINGS;
   const preferredStreamModes = new Map<string, StreamMode>();
+  const defaultStreamEncoderSettings: StreamEncoderSettings = {
+    maxDimension: opts.maxSize ?? SCRCPY_DEFAULTS.maxSize,
+    h264Bitrate: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
+    h264Fps: opts.maxFps ?? SCRCPY_DEFAULTS.maxFps,
+  };
+  const streamEncoderSettings = new Map<string, StreamEncoderSettings>();
+
+  const encoderSettingsForSerial = (serial: string): StreamEncoderSettings =>
+    streamEncoderSettings.get(serial) ?? defaultStreamEncoderSettings;
 
   const modeForSerial = (serial: string): StreamMode =>
     preferredStreamModes.get(serial) ??
@@ -465,14 +478,15 @@ export async function startServer(
     serial: string,
     mode: StreamMode,
     signal?: AbortSignal,
+    encoderSettings = encoderSettingsForSerial(serial),
   ) =>
     openSession({
       serial,
       mode,
       signal,
-      maxFps: opts.maxFps,
-      bitRate: opts.bitRate,
-      maxSize: opts.maxSize,
+      maxFps: encoderSettings.h264Fps,
+      bitRate: encoderSettings.h264Bitrate,
+      maxSize: encoderSettings.maxDimension,
       keyFrameInterval: opts.keyFrameInterval,
       repeatFrameMs: opts.repeatFrameMs,
     });
@@ -602,6 +616,7 @@ export async function startServer(
     videoClients: Array.from(context.clients).filter((client) => client.video)
       .length,
     stream: redactedStreamSettings(streamSettings),
+    encoderSettings: { ...encoderSettingsForSerial(context.serial) },
     webrtc: publishers.get(context)?.snapshot() ?? null,
     frames: context.frameCount,
     sourceFps: recoverySnapshot.sourceFps,
@@ -1501,6 +1516,7 @@ export async function startServer(
     mode: StreamMode,
     signal: AbortSignal,
     deviceState?: DeviceSessionState,
+    encoderSettings = encoderSettingsForSerial(serial),
   ): Promise<DeviceContext> => {
     const stagingOwner = {};
     let retainedDeviceState =
@@ -1515,7 +1531,7 @@ export async function startServer(
       }
     }
     try {
-      const stream = await openStream(serial, mode, signal);
+      const stream = await openStream(serial, mode, signal, encoderSettings);
       try {
         return createContext(
           serial,
@@ -1631,6 +1647,74 @@ export async function startServer(
       );
     }
     return streamModeResponse(context);
+  };
+
+  const updateStreamEncoderSettings = async (
+    patch: StreamEncoderSettingsPatch,
+    expected: DeviceContext,
+  ): Promise<StreamEncoderSettings> => {
+    let nextSettings: StreamEncoderSettings | null = null;
+    let previousSettings: StreamEncoderSettings | null = null;
+    let hadPreviousSettings = false;
+    const context = await sessions.replace(
+      (current, generation, signal) =>
+        prepareContext(
+          current.serial,
+          generation,
+          current.stream.mode,
+          signal,
+          current.deviceState,
+          nextSettings ?? encoderSettingsForSerial(current.serial),
+        ),
+      (next) => {
+        const settings = nextSettings;
+        if (!settings) {
+          activateContext(next);
+          return;
+        }
+        streamEncoderSettings.set(next.serial, settings);
+        try {
+          activateContext(next);
+        } catch (error) {
+          if (hadPreviousSettings && previousSettings) {
+            streamEncoderSettings.set(next.serial, previousSettings);
+          } else {
+            streamEncoderSettings.delete(next.serial);
+          }
+          throw error;
+        }
+      },
+      "stream settings changed",
+      (current) => {
+        if (current !== expected) {
+          throw new SessionChangedError(
+            expected.generation,
+            current.generation,
+          );
+        }
+        if (current.status !== "streaming" || current.signal.aborted) {
+          throw new StreamSettingsUnavailableError(
+            `session is ${current.status}`,
+          );
+        }
+        previousSettings = encoderSettingsForSerial(current.serial);
+        hadPreviousSettings = streamEncoderSettings.has(current.serial);
+        const requestedSettings = { ...previousSettings, ...patch };
+        if (
+          streamEncoderSettingsEqual(previousSettings, requestedSettings)
+        ) {
+          return false;
+        }
+        if (current.recorder.isReplaying) {
+          throw new SessionReplayConflictError(
+            "cannot update stream settings while session replay is running",
+          );
+        }
+        nextSettings = requestedSettings;
+        return true;
+      },
+    );
+    return { ...encoderSettingsForSerial(context.serial) };
   };
 
   const stopCurrentSession = (context: DeviceContext, reason: string) =>
@@ -1760,6 +1844,88 @@ export async function startServer(
           return error instanceof SessionChangedError
             ? streamModeConflictResponse(error)
             : streamModeUnavailableResponse(error);
+        }
+      }
+
+      if (url.pathname === "/api/stream-settings") {
+        const requestedSerial = url.searchParams.get("device")?.trim();
+        if (requestedSerial && requestedSerial !== requestContext.serial) {
+          return Response.json(
+            {
+              ok: false,
+              error: "stream_settings_conflict",
+              message: `active device is ${requestContext.serial}, not ${requestedSerial}`,
+            },
+            { status: 409 },
+          );
+        }
+        if (req.method === "GET") {
+          return Response.json(
+            {
+              ok: true,
+              ...encoderSettingsForSerial(requestContext.serial),
+            },
+            { headers: { "Cache-Control": "no-store" } },
+          );
+        }
+        if (req.method !== "PATCH") {
+          return Response.json(
+            { ok: false, error: "method_not_allowed" },
+            { status: 405, headers: { Allow: "GET, PATCH" } },
+          );
+        }
+        if (!isJsonRequest(req)) {
+          return Response.json(
+            { ok: false, error: "unsupported_media_type" },
+            { status: 415 },
+          );
+        }
+        let patch: StreamEncoderSettingsPatch;
+        try {
+          patch = parseStreamEncoderSettingsPatch(
+            await readJsonBody(req, MAX_JSON_BODY_BYTES),
+          );
+        } catch (error) {
+          const bodyTooLarge =
+            error instanceof HttpBodyError && error.status === 413;
+          return Response.json(
+            {
+              ok: false,
+              error: bodyTooLarge
+                ? "body_too_large"
+                : "invalid_stream_settings",
+              message: error instanceof Error ? error.message : String(error),
+            },
+            { status: bodyTooLarge ? 413 : 400 },
+          );
+        }
+        try {
+          const settings = await updateStreamEncoderSettings(
+            patch,
+            requestContext,
+          );
+          return Response.json(
+            { ok: true, ...settings },
+            { headers: { "Cache-Control": "no-store" } },
+          );
+        } catch (error) {
+          const unavailable =
+            stopRequested || error instanceof StreamSettingsUnavailableError;
+          const conflict =
+            error instanceof SessionReplayConflictError ||
+            error instanceof SessionChangedError;
+          return Response.json(
+            {
+              ok: false,
+              error: unavailable
+                ? "stream_settings_unavailable"
+                : conflict
+                  ? "stream_settings_conflict"
+                  : "stream_settings_failed",
+              message: error instanceof Error ? error.message : String(error),
+            },
+            { status: unavailable ? 503 : conflict ? 409 : 500 },
+          );
         }
       }
 
