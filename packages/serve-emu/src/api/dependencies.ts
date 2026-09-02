@@ -25,7 +25,7 @@ import type {
   RoutePlaybackRequest,
   RoutePlaybackSnapshot,
   SessionSnapshot,
-  StreamMode,
+  StreamModeRequest,
   StreamModeResponse,
   StreamEncoderSettingsResponse,
 } from "../shared/api-contracts.ts";
@@ -44,7 +44,7 @@ export type RouteControlAction = ApiRequest<
 export type ApiDependencies = {
   getInfo: () => ApiInfoResponse;
   getStreamMode: () => StreamModeResponse;
-  setStreamMode: (mode: StreamMode) => Promise<StreamModeResponse>;
+  setStreamMode: (request: StreamModeRequest) => Promise<StreamModeResponse>;
   getStreamEncoderSettings: () => StreamEncoderSettingsResponse;
   setStreamEncoderSettings: (
     patch: StreamEncoderSettingsPatch,

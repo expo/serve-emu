@@ -21,6 +21,10 @@ import {
   type Sender,
   type StreamTransport,
 } from "./lib/use-stream";
+import {
+  ViewerTransportControlsContext,
+  type ViewerTransportControls,
+} from "./lib/viewer-transport-context";
 
 // Android KeyEvent meta state bits (AMETA_*).
 const AMETA_SHIFT_ON = 0x1;
@@ -77,7 +81,18 @@ function useStreamControls(): StreamControls {
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const { state, send, transport } = useStream(canvasRef, videoRef);
+  const {
+    state,
+    send,
+    transport,
+    availableTransports,
+    switchingTo,
+    transportError,
+    selectTransport,
+    statsDownloadStatus,
+    statsDownloadMessage,
+    downloadStats,
+  } = useStream(canvasRef, videoRef);
   const deviceWidth = state.deviceSize?.width;
   const deviceHeight = state.deviceSize?.height;
   const controls = useMemo<StreamControls>(
@@ -93,6 +108,28 @@ export function App() {
     }),
     [send, transport, deviceWidth, deviceHeight],
   );
+  const viewerTransportControls = useMemo<ViewerTransportControls>(
+    () => ({
+      transport,
+      availableTransports,
+      switchingTo,
+      error: transportError,
+      selectTransport,
+      statsDownloadStatus,
+      statsDownloadMessage,
+      downloadStats,
+    }),
+    [
+      availableTransports,
+      downloadStats,
+      selectTransport,
+      statsDownloadMessage,
+      statsDownloadStatus,
+      switchingTo,
+      transport,
+      transportError,
+    ],
+  );
 
   return (
     <>
@@ -103,9 +140,11 @@ export function App() {
         stats={state.stats}
         controlError={state.controlError}
       />
-      <StreamControlsContext.Provider value={controls}>
-        <AppShell />
-      </StreamControlsContext.Provider>
+      <ViewerTransportControlsContext.Provider value={viewerTransportControls}>
+        <StreamControlsContext.Provider value={controls}>
+          <AppShell />
+        </StreamControlsContext.Provider>
+      </ViewerTransportControlsContext.Provider>
     </>
   );
 }

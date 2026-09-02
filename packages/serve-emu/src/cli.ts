@@ -23,6 +23,9 @@ import {
 } from "./stream-settings.ts";
 import packageJson from "../package.json";
 import {
+  DEFAULT_GRPC_IMAGE_MODE,
+  GRPC_IMAGE_MODES,
+  isGrpcImageMode,
   isStreamMode,
   STREAM_MODES,
 } from "./shared/api-contracts.ts";
@@ -42,6 +45,7 @@ const { values } = parseArgs({
     "key-frame-interval": { type: "string", default: String(SCRCPY_DEFAULTS.keyFrameInterval) },
     "repeat-frame-ms": { type: "string", default: String(SCRCPY_DEFAULTS.repeatFrameMs) },
     "stream-mode": { type: "string" },
+    "grpc-image-mode": { type: "string", default: DEFAULT_GRPC_IMAGE_MODE },
     transport: { type: "string", default: "websocket" },
     "stun-url": { type: "string" },
     "turn-url": { type: "string" },
@@ -176,7 +180,7 @@ if (values.help) {
   console.log(`serve-emu — host an Android device over WebSocket/WebRTC
 
 Usage:
-  serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode <scrcpy|grpc-screenshot>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms]
+  serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode <scrcpy|grpc-screenshot>] [--grpc-image-mode <png|mmap>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms]
   serve-emu --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
   serve-emu --avd <name> [--restart-avd]
   serve-emu --avd-list
@@ -216,8 +220,14 @@ Options:
                          Screen and input source (default: scrcpy). The gRPC
                          screenshot source captures and encodes on the emulator
                          host and is available only for Android Emulators.
+      --grpc-image-mode <png|mmap>
+                         Emulator gRPC image delivery (default: png). PNG sends
+                         compressed images in-band; MMAP uses shared memory for
+                         raw pixels. The selected mode is strict: capture errors
+                         do not fall back to the other mode.
       --transport <websocket|webrtc>
-                         Browser video transport (default: websocket)
+                         Initial browser video transport (default: websocket).
+                         Each browser tab can switch transports in the UI.
       --stun-url <url[,url...]>
                          STUN URL(s); omitted = default public STUN servers
       --turn-url <url[,url...]>
@@ -281,6 +291,14 @@ async function main() {
     );
   }
   const streamMode = requestedStreamMode ?? "scrcpy";
+  const requestedGrpcImageMode =
+    stringOption("grpc-image-mode") ?? DEFAULT_GRPC_IMAGE_MODE;
+  if (!isGrpcImageMode(requestedGrpcImageMode)) {
+    throw new Error(
+      `--grpc-image-mode must be one of: ${GRPC_IMAGE_MODES.join(", ")}. Received "${requestedGrpcImageMode}".`,
+    );
+  }
+  const grpcImageMode = requestedGrpcImageMode;
 
   let emulatorLaunch: Awaited<ReturnType<typeof startEmulator>> | null = null;
   const serial = values.avd
@@ -365,6 +383,7 @@ async function main() {
     keyFrameInterval,
     repeatFrameMs,
     streamMode,
+    grpcImageMode,
     streamSettings,
     maxApkUploadBytes,
     maxMediaUploadBytes,

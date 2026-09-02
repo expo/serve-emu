@@ -6,21 +6,63 @@ export type WebRtcIceServer = {
   credential?: string;
 };
 
+export const STREAM_TRANSPORTS = ["websocket", "webrtc"] as const;
+export type StreamTransport = (typeof STREAM_TRANSPORTS)[number];
+
+export type WebRtcStreamSettings = {
+  transport: "webrtc";
+  codec: "h264";
+  iceServers: WebRtcIceServer[];
+  iceTransportPolicy: WebRtcIceTransportPolicy;
+};
+
 export type StreamSettings =
   | { transport: "websocket" }
-  | {
-      transport: "webrtc";
-      codec: "h264";
-      iceServers: WebRtcIceServer[];
-      iceTransportPolicy: WebRtcIceTransportPolicy;
-    };
+  | WebRtcStreamSettings;
+
+export type ViewerTransports = {
+  /** Initial transport selected by clients that have no viewer-local preference. */
+  default: StreamTransport;
+  /** Video transports supported by the currently active encoded source. */
+  available: StreamTransport[];
+  /** Signaling profile for WebRTC, or null when the active source is incompatible. */
+  webrtc: WebRtcStreamSettings | null;
+};
 
 export const DEFAULT_WEBRTC_ICE_SERVERS: WebRtcIceServer[] = [
   { urls: ["stun:stun.l.google.com:19302"] },
   { urls: ["stun:stun1.l.google.com:19302"] },
 ];
 
+export const DEFAULT_WEBRTC_STREAM_SETTINGS: WebRtcStreamSettings = {
+  transport: "webrtc",
+  codec: "h264",
+  iceServers: DEFAULT_WEBRTC_ICE_SERVERS,
+  iceTransportPolicy: "all",
+};
+
 export const DEFAULT_STREAM_SETTINGS: StreamSettings = { transport: "websocket" };
+
+/**
+ * Describe viewer-local transport choices without turning transport into a
+ * device-session mutation. The configured transport remains the default only;
+ * both video paths may coexist for different viewers.
+ */
+export function viewerTransportsFor(
+  settings: StreamSettings,
+  activeCodec: string,
+): ViewerTransports {
+  const supportsWebRtc = activeCodec === "h264";
+  return {
+    default: supportsWebRtc ? settings.transport : "websocket",
+    available: supportsWebRtc ? [...STREAM_TRANSPORTS] : ["websocket"],
+    webrtc: supportsWebRtc
+      ? settings.transport === "webrtc"
+        ? settings
+        : DEFAULT_WEBRTC_STREAM_SETTINGS
+      : null,
+  };
+}
 
 export type StreamEncoderSettings = {
   maxDimension: number;

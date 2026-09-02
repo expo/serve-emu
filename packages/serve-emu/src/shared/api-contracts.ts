@@ -1,14 +1,17 @@
-import { parseGesture, type Gesture } from "./control-contracts";
+import { parseGesture, type Gesture } from "./control-contracts.ts";
 import {
   MAX_H264_BITRATE,
   MAX_H264_FPS,
   MAX_STREAM_DIMENSION,
   MIN_H264_BITRATE,
+  STREAM_TRANSPORTS,
   type StreamEncoderSettings,
   type StreamEncoderSettingsPatch,
   type StreamSettings,
   type WebRtcIceServer,
-} from "../stream-settings";
+  type WebRtcStreamSettings,
+  type ViewerTransports,
+} from "../stream-settings.ts";
 
 /** Stable error codes sent by every JSON API failure. */
 export const API_ERROR_CODES = [
@@ -77,16 +80,97 @@ export type DeviceSelectionResponse = ApiSuccess<{
 
 export const STREAM_MODES = ["scrcpy", "grpc-screenshot"] as const;
 export type StreamMode = (typeof STREAM_MODES)[number];
-export type StreamModeRequest = { mode: StreamMode };
 export function isStreamMode(value: unknown): value is StreamMode {
   return (
     typeof value === "string" &&
     STREAM_MODES.some((mode) => mode === value)
   );
 }
+
+/** Exact image delivery mode used by the emulator gRPC screenshot source. */
+export const GRPC_IMAGE_MODES = ["png", "mmap"] as const;
+export type GrpcImageMode = (typeof GRPC_IMAGE_MODES)[number];
+export const DEFAULT_GRPC_IMAGE_MODE: GrpcImageMode = "png";
+export function isGrpcImageMode(value: unknown): value is GrpcImageMode {
+  return (
+    typeof value === "string" &&
+    GRPC_IMAGE_MODES.some((mode) => mode === value)
+  );
+}
+
+export type RollingTimingSummary = {
+  /** Number of samples retained in the rolling window. */
+  windowSamples: number;
+  latest: number;
+  p50: number;
+  p95: number;
+  max: number;
+};
+
+/** Cumulative and rolling diagnostics for emulator gRPC screenshot capture. */
+export type GrpcCaptureDiagnostics = {
+  /** Exact screenshot image/delivery strategy selected by the caller. */
+  imageMode: GrpcImageMode;
+  /** Raw framed protobuf messages received before either pacing stage. */
+  rawGrpcMessagesReceived: number;
+  /** PNG messages decoded by the raw pacer, or MMAP notifications selected for a snapshot. */
+  rawGrpcMessagesEmitted: number;
+  /** PNG messages replaced by a newer one, or MMAP notifications dropped/replaced by pacing. */
+  rawGrpcMessagesCoalesced: number;
+  /** Complete PNG or RGB images made available to the encoder. */
+  usableImages: number;
+  /** Emulator production cadence derived from source timestamps. */
+  sourceTimestampFps: number | null;
+  /** Raw framed message cadence before pacing/coalescing. */
+  rawMessageReceiveFps: number | null;
+  /** Complete source images made available to the encoder. */
+  usableImageFps: number | null;
+  /** Accepted fresh ffmpeg writes, excluding intentional repeats. */
+  freshEncoderWriteFps: number | null;
+  /** Missing emulator-produced sequence numbers observed between usable images. */
+  sequenceGaps: number;
+  /** Latest PNG or RGB source payload presented to ffmpeg. */
+  imagePayloadBytes: number;
+  /** Cumulative logical PNG or RGB bytes accepted from the selected transport. */
+  transportBytes: number;
+  /** Cumulative protobuf body bytes received, excluding gRPC frame prefixes. */
+  grpcMessageBytesReceived: number;
+  /** Cumulative positional file-read bytes, including verification and retries. */
+  mmapFileBytesRead: number;
+  /** Additional MMAP read pairs needed after a changing region was observed. */
+  mmapReadRetries: number;
+  /** MMAP notifications dropped after every bounded read attempt differed. */
+  mmapTornFramesDropped: number;
+  /** Rolling sequence-weighted per-produced-frame intervals. */
+  sourceTimestampIntervalMs: RollingTimingSummary | null;
+  /** Rolling raw framed-message arrival intervals. */
+  rawMessageReceiveIntervalMs: RollingTimingSummary | null;
+  /** Rolling emulator-production-to-host-receive latency. */
+  productionToReceiveLatencyMs: RollingTimingSummary | null;
+  /** Rolling notification-timestamp-to-complete-source-image latency estimate. */
+  productionToUsableLatencyMs: RollingTimingSummary | null;
+  /** Time to decode each Image protobuf processed by the selected transport. */
+  protobufDecodeTimeMs: RollingTimingSummary | null;
+  /** Time to obtain and compare a best-effort coherent MMAP snapshot. */
+  sharedReadCopyTimeMs: RollingTimingSummary | null;
+  freshEncoderWriteAttempts: number;
+  repeatEncoderWriteAttempts: number;
+  acceptedEncoderWrites: number;
+  /** Encoder writes rejected while ffmpeg input was backpressured. */
+  encoderBackpressureRejections: number;
+};
+
+export type StreamModeRequest =
+  | { mode: "scrcpy" }
+  | {
+      mode: "grpc-screenshot";
+      /** Optional for backwards compatibility; omitted means keep the configured mode. */
+      grpcImageMode?: GrpcImageMode;
+    };
 export type StreamModeResponse = ApiSuccess<{
   serial: string;
   mode: StreamMode;
+  grpcImageMode: GrpcImageMode;
   availableModes: StreamMode[];
   sessionGeneration: number;
 }>;
@@ -304,6 +388,8 @@ export type HealthResponse = {
   serial: string;
   device: string;
   streamMode?: StreamMode;
+  grpcImageMode?: GrpcImageMode;
+  grpcCapture?: GrpcCaptureDiagnostics | null;
   codec: string;
   size: DeviceSize;
   clients: number;
@@ -341,6 +427,8 @@ export type ApiInfoResponse = {
   status: SessionStatus;
   clients: number;
   stream: StreamSettings;
+  /** Viewer-local transport choices. Optional while older servers remain supported. */
+  viewerTransports?: ViewerTransports;
 };
 
 export type EmptyResponse = ApiSuccess;
@@ -567,8 +655,12 @@ function parseDeviceSize(value: unknown, name = "size"): DeviceSize {
   return { width, height };
 }
 
-function parseIceServer(value: unknown, index: number): WebRtcIceServer {
-  const name = `API info response.stream.iceServers[${index}]`;
+function parseIceServer(
+  value: unknown,
+  index: number,
+  settingsName = "API info response.stream",
+): WebRtcIceServer {
+  const name = `${settingsName}.iceServers[${index}]`;
   const item = record(value, name);
   if (!Array.isArray(item.urls) || item.urls.length === 0) {
     fail(`${name}.urls must be a non-empty array`);
@@ -588,30 +680,85 @@ function parseIceServer(value: unknown, index: number): WebRtcIceServer {
   };
 }
 
-export function parseStreamSettings(value: unknown): StreamSettings {
-  const item = record(value, "API info response.stream");
+function parseWebRtcStreamSettings(
+  value: unknown,
+  name: string,
+): WebRtcStreamSettings {
+  const item = record(value, name);
   const transport = oneOf(
     item.transport,
-    ["websocket", "webrtc"] as const,
-    "API info response.stream.transport",
+    STREAM_TRANSPORTS,
+    `${name}.transport`,
   );
-  if (transport === "websocket") return { transport };
+  if (transport !== "webrtc") {
+    fail(`${name}.transport must be webrtc`);
+  }
   if (!Array.isArray(item.iceServers)) {
-    fail("API info response.stream.iceServers must be an array");
+    fail(`${name}.iceServers must be an array`);
   }
   return {
     transport,
     codec: oneOf(
       item.codec,
       ["h264"] as const,
-      "API info response.stream.codec",
+      `${name}.codec`,
     ),
-    iceServers: item.iceServers.map(parseIceServer),
+    iceServers: item.iceServers.map((server, index) =>
+      parseIceServer(server, index, name),
+    ),
     iceTransportPolicy: oneOf(
       item.iceTransportPolicy,
       ["all", "relay"] as const,
-      "API info response.stream.iceTransportPolicy",
+      `${name}.iceTransportPolicy`,
     ),
+  };
+}
+
+export function parseStreamSettings(value: unknown): StreamSettings {
+  const item = record(value, "API info response.stream");
+  const transport = oneOf(
+    item.transport,
+    STREAM_TRANSPORTS,
+    "API info response.stream.transport",
+  );
+  return transport === "websocket"
+    ? { transport }
+    : parseWebRtcStreamSettings(value, "API info response.stream");
+}
+
+function parseViewerTransports(value: unknown): ViewerTransports {
+  const name = "API info response.viewerTransports";
+  const item = record(value, name);
+  const defaultTransport = oneOf(
+    item.default,
+    STREAM_TRANSPORTS,
+    `${name}.default`,
+  );
+  if (!Array.isArray(item.available) || item.available.length === 0) {
+    fail(`${name}.available must be a non-empty array`);
+  }
+  const available = item.available.map((transport, index) =>
+    oneOf(transport, STREAM_TRANSPORTS, `${name}.available[${index}]`),
+  );
+  if (new Set(available).size !== available.length) {
+    fail(`${name}.available must not contain duplicates`);
+  }
+  if (!available.includes(defaultTransport)) {
+    fail(`${name}.default must be available`);
+  }
+  const webRtcAvailable = available.includes("webrtc");
+  if (webRtcAvailable !== (item.webrtc !== null)) {
+    fail(
+      `${name}.webrtc must be present exactly when webrtc is available`,
+    );
+  }
+  return {
+    default: defaultTransport,
+    available,
+    webrtc:
+      item.webrtc === null
+        ? null
+        : parseWebRtcStreamSettings(item.webrtc, `${name}.webrtc`),
   };
 }
 
@@ -643,6 +790,9 @@ export function parseApiInfoResponse(value: unknown): ApiInfoResponse {
     ),
     clients: number(root.clients, "API info response.clients"),
     stream: parseStreamSettings(root.stream),
+    ...(root.viewerTransports === undefined
+      ? {}
+      : { viewerTransports: parseViewerTransports(root.viewerTransports) }),
   };
 }
 
@@ -686,8 +836,25 @@ export function parseDeviceSelectionResponse(value: unknown): DeviceSelectionRes
 
 export function parseStreamModeRequest(value: unknown): StreamModeRequest {
   const root = record(value, "stream mode request");
+  const mode = oneOf(root.mode, STREAM_MODES, "stream mode request.mode");
+  if (mode === "scrcpy") {
+    if (root.grpcImageMode !== undefined) {
+      fail(
+        "stream mode request.grpcImageMode is available only with mode grpc-screenshot",
+      );
+    }
+    return { mode };
+  }
+  if (root.grpcImageMode === undefined) {
+    return { mode };
+  }
   return {
-    mode: oneOf(root.mode, STREAM_MODES, "stream mode request.mode"),
+    mode,
+    grpcImageMode: oneOf(
+      root.grpcImageMode,
+      GRPC_IMAGE_MODES,
+      "stream mode request.grpcImageMode",
+    ),
   };
 }
 
@@ -697,6 +864,11 @@ export function parseStreamModeResponse(value: unknown): StreamModeResponse {
   const serial = string(root.serial, "stream mode response.serial");
   if (!serial) fail("stream mode response.serial must not be empty");
   const mode = oneOf(root.mode, STREAM_MODES, "stream mode response.mode");
+  const grpcImageMode = oneOf(
+    root.grpcImageMode,
+    GRPC_IMAGE_MODES,
+    "stream mode response.grpcImageMode",
+  );
   if (!Array.isArray(root.availableModes)) {
     fail("stream mode response.availableModes must be an array");
   }
@@ -729,6 +901,7 @@ export function parseStreamModeResponse(value: unknown): StreamModeResponse {
     ok: true,
     serial,
     mode,
+    grpcImageMode,
     availableModes,
     sessionGeneration,
   };
@@ -1171,6 +1344,66 @@ function parseFrameStatsSummary(value: unknown): FrameStatsSummary | null {
   };
 }
 
+function parseRollingTimingSummary(
+  value: unknown,
+  name: string,
+): RollingTimingSummary | null {
+  if (value === null) return null;
+  const item = record(value, name);
+  return {
+    windowSamples: number(item.windowSamples, `${name}.windowSamples`),
+    latest: number(item.latest, `${name}.latest`),
+    p50: number(item.p50, `${name}.p50`),
+    p95: number(item.p95, `${name}.p95`),
+    max: number(item.max, `${name}.max`),
+  };
+}
+
+function parseGrpcCaptureDiagnostics(value: unknown): GrpcCaptureDiagnostics {
+  const item = record(value, "health response.grpcCapture");
+  const timing = (field: keyof GrpcCaptureDiagnostics) =>
+    parseRollingTimingSummary(
+      item[field],
+      `health response.grpcCapture.${field}`,
+    );
+  const numeric = (field: keyof GrpcCaptureDiagnostics) =>
+    number(item[field], `health response.grpcCapture.${field}`);
+  const nullableNumeric = (field: keyof GrpcCaptureDiagnostics) =>
+    item[field] === null ? null : numeric(field);
+  return {
+    imageMode: oneOf(
+      item.imageMode,
+      GRPC_IMAGE_MODES,
+      "health response.grpcCapture.imageMode",
+    ),
+    rawGrpcMessagesReceived: numeric("rawGrpcMessagesReceived"),
+    rawGrpcMessagesEmitted: numeric("rawGrpcMessagesEmitted"),
+    rawGrpcMessagesCoalesced: numeric("rawGrpcMessagesCoalesced"),
+    usableImages: numeric("usableImages"),
+    sourceTimestampFps: nullableNumeric("sourceTimestampFps"),
+    rawMessageReceiveFps: nullableNumeric("rawMessageReceiveFps"),
+    usableImageFps: nullableNumeric("usableImageFps"),
+    freshEncoderWriteFps: nullableNumeric("freshEncoderWriteFps"),
+    sequenceGaps: numeric("sequenceGaps"),
+    imagePayloadBytes: numeric("imagePayloadBytes"),
+    transportBytes: numeric("transportBytes"),
+    grpcMessageBytesReceived: numeric("grpcMessageBytesReceived"),
+    mmapFileBytesRead: numeric("mmapFileBytesRead"),
+    mmapReadRetries: numeric("mmapReadRetries"),
+    mmapTornFramesDropped: numeric("mmapTornFramesDropped"),
+    sourceTimestampIntervalMs: timing("sourceTimestampIntervalMs"),
+    rawMessageReceiveIntervalMs: timing("rawMessageReceiveIntervalMs"),
+    productionToReceiveLatencyMs: timing("productionToReceiveLatencyMs"),
+    productionToUsableLatencyMs: timing("productionToUsableLatencyMs"),
+    protobufDecodeTimeMs: timing("protobufDecodeTimeMs"),
+    sharedReadCopyTimeMs: timing("sharedReadCopyTimeMs"),
+    freshEncoderWriteAttempts: numeric("freshEncoderWriteAttempts"),
+    repeatEncoderWriteAttempts: numeric("repeatEncoderWriteAttempts"),
+    acceptedEncoderWrites: numeric("acceptedEncoderWrites"),
+    encoderBackpressureRejections: numeric("encoderBackpressureRejections"),
+  };
+}
+
 function parseHealthClient(value: unknown, index: number): HealthClient {
   const item = record(value, `health response.clientsDetail[${index}]`);
   return {
@@ -1229,6 +1462,22 @@ export function parseHealthResponse(value: unknown): HealthResponse {
             STREAM_MODES,
             "health response.streamMode",
           ),
+        }),
+    ...(root.grpcImageMode === undefined
+      ? {}
+      : {
+          grpcImageMode: oneOf(
+            root.grpcImageMode,
+            GRPC_IMAGE_MODES,
+            "health response.grpcImageMode",
+          ),
+        }),
+    ...(root.grpcCapture === undefined
+      ? {}
+      : {
+          grpcCapture: root.grpcCapture === null
+            ? null
+            : parseGrpcCaptureDiagnostics(root.grpcCapture),
         }),
     codec: string(root.codec, "health response.codec"),
     size: parseDeviceSize(root.size, "health response.size"),

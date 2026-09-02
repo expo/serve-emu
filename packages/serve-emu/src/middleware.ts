@@ -26,6 +26,7 @@ import {
   isEmulatorSerial,
 } from "./device-capabilities.ts";
 import { loadDeviceGrid } from "./device-grid.ts";
+import { FrameStatWindow } from "./frame-stat-window.ts";
 import {
   listAvds,
   listRunningAvds,
@@ -40,15 +41,18 @@ import { parseGeoFix, setEmulatorLocationAsync, type GeoFix } from "./location.t
 import { parseRoutePlaybackRequest } from "./route-playback.ts";
 import type { StreamSocket } from "./stream-socket.ts";
 import {
+  DEFAULT_WEBRTC_STREAM_SETTINGS,
   DEFAULT_STREAM_SETTINGS,
   isJsonRequest,
   parseStreamEncoderSettingsPatch,
   redactedStreamSettings,
   StreamSettingsUnavailableError,
   streamEncoderSettingsEqual,
+  viewerTransportsFor,
   type StreamEncoderSettings,
   type StreamEncoderSettingsPatch,
   type StreamSettings,
+  type WebRtcStreamSettings,
 } from "./stream-settings.ts";
 import {
   corsHeadersForRequest,
@@ -86,8 +90,12 @@ import {
   type ScrcpySession,
 } from "./scrcpy.ts";
 import {
+  DEFAULT_GRPC_IMAGE_MODE,
+  GRPC_IMAGE_MODES,
+  isGrpcImageMode,
   parseFontScale,
   parseStreamModeRequest,
+  type GrpcImageMode,
   type StreamMode,
   type StreamModeResponse,
 } from "./shared/api-contracts.ts";
@@ -101,12 +109,28 @@ export { fromBunSocket, fromWsSocket } from "./stream-socket.ts";
 export type { StreamSocket, WsWebSocketLike } from "./stream-socket.ts";
 export { pickDevice } from "./adb.ts";
 export type { ScrcpySession } from "./scrcpy.ts";
-export type { EmuSession } from "./stream-session.ts";
 export type {
+  EmuSession,
+  EmuSessionDiagnostics,
+  GrpcCaptureDiagnostics,
+  RollingTimingSummary,
+} from "./stream-session.ts";
+export {
+  DEFAULT_GRPC_IMAGE_MODE,
+  GRPC_IMAGE_MODES,
+  isGrpcImageMode,
+} from "./shared/api-contracts.ts";
+export type { GrpcImageMode } from "./shared/api-contracts.ts";
+export type {
+  StreamEncoderSettings,
   StreamSettings,
   WebRtcIceServer,
   WebRtcIceTransportPolicy,
+  WebRtcStreamSettings,
+  ViewerTransports,
 } from "./stream-settings.ts";
+export { STREAM_TRANSPORTS } from "./stream-settings.ts";
+export type { StreamTransport } from "./stream-settings.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // `src/middleware.ts` and `dist/middleware.mjs` both resolve to `<pkg>/dist/ui`.
@@ -125,9 +149,12 @@ export type AppOptions = {
   maxActiveUploads?: number;
   maxQueuedUploads?: number;
   uploadQueueTimeoutMs?: number;
+  /** Default viewer transport. Each browser viewer may select either available path. */
   streamSettings?: StreamSettings;
   /** Screen capture and input source. Defaults to scrcpy. */
   streamMode?: StreamMode;
+  /** Emulator gRPC image delivery mode. Defaults to PNG. */
+  grpcImageMode?: GrpcImageMode;
   /** @internal Shared by router-managed source generations for one device. */
   deviceState?: DeviceSessionState;
 } & BrowserOriginPolicy;
@@ -163,6 +190,7 @@ const MAX_JSON_BODY_BYTES = 8 * 1024;
 const MAX_ROUTE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_WEBRTC_CLOSE_BODY_BYTES = 4 * 1024;
 const MAX_LOGCAT_QUERY_BYTES = 200;
+const FRAME_STAT_WINDOW = 240;
 // After a device's scrcpy start fails, wait this long before retrying so a
 // flapping device doesn't get hammered on every request.
 const SPAWN_RETRY_COOLDOWN_MS = 5_000;
@@ -175,7 +203,6 @@ const SYSTEM_APP_CLOCK: AppClock = {
 };
 
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
-
 function abortError(signal: AbortSignal, fallback: string): Error {
   return signal.reason instanceof Error
     ? signal.reason
@@ -272,6 +299,14 @@ async function createAppInternal(
   dependencies: CreateAppDependencies = {},
 ) {
   throwIfAborted(opts.signal, "serve-emu app startup aborted");
+  const requestedGrpcImageMode: unknown =
+    opts.grpcImageMode ?? DEFAULT_GRPC_IMAGE_MODE;
+  if (!isGrpcImageMode(requestedGrpcImageMode)) {
+    throw new Error(
+      `grpcImageMode must be one of: ${GRPC_IMAGE_MODES.join(", ")}`,
+    );
+  }
+  const grpcImageMode = requestedGrpcImageMode;
   const openWebRtcPublisher =
     dependencies.createWebRtcPublisher ?? createWebRtcPublisher;
   const clock = dependencies.clock ?? SYSTEM_APP_CLOCK;
@@ -286,7 +321,7 @@ async function createAppInternal(
   let streamEncoderSettings: StreamEncoderSettings = {
     maxDimension: opts.maxSize ?? SCRCPY_DEFAULTS.maxSize,
     h264Bitrate: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
-    h264Fps: opts.maxFps ?? SCRCPY_DEFAULTS.maxFps,
+    h264Fps: opts.maxFps ?? 30,
   };
   const openSession: typeof startEmuSession =
     dependencies.startSession ??
@@ -304,6 +339,7 @@ async function createAppInternal(
       maxSize: streamEncoderSettings.maxDimension,
       keyFrameInterval: opts.keyFrameInterval,
       mode: opts.streamMode ?? "scrcpy",
+      grpcImageMode,
     });
     throwIfAborted(opts.signal, "serve-emu app startup aborted");
   } catch (error) {
@@ -321,6 +357,10 @@ async function createAppInternal(
   const clients = new Set<Client>();
   const screen: Screen = { width: session.meta.width, height: session.meta.height };
   const streamSettings = opts.streamSettings ?? DEFAULT_STREAM_SETTINGS;
+  const webRtcStreamSettings: WebRtcStreamSettings =
+    streamSettings.transport === "webrtc"
+      ? streamSettings
+      : DEFAULT_WEBRTC_STREAM_SETTINGS;
   const startedMs = Date.now();
   const startedAt = new Date(startedMs).toISOString();
   let status: SessionStatus = "streaming";
@@ -333,6 +373,7 @@ async function createAppInternal(
   let captureRestartController: AbortController | null = null;
   let sessionGeneration = 1;
   let frameCount = 0;
+  const frameStats = new FrameStatWindow(FRAME_STAT_WINDOW);
   let configPacketCount = 0;
   let lastFrameMs = 0;
   let totalDroppedFrames = 0;
@@ -348,6 +389,7 @@ async function createAppInternal(
   let watchdog: unknown | null = null;
   let nextClientId = 1;
   let webRtcPublisher: WebRtcPublisher | null = null;
+  let webRtcPublisherTask: Promise<WebRtcPublisher> | null = null;
   const webRtcStatsCollector = new WebRtcStatsCollector(() => clock.now());
   let removeFatalListener: (() => void) | null = null;
   const deviceStateOwner = {};
@@ -379,12 +421,15 @@ async function createAppInternal(
     serial: opts.serial,
     device: session.meta.deviceName,
     streamMode: session.mode,
+    grpcImageMode,
+    grpcCapture: session.diagnostics?.().grpcCapture ?? null,
     codec: session.meta.codecId,
     size: { width: screen.width, height: screen.height },
     clients: clients.size,
     videoClients: Array.from(clients).filter((client) => client.video).length,
     frames: frameCount,
     sourceFps,
+    frameStats: frameStats.summary(),
     configPackets: configPacketCount,
     droppedFrames: totalDroppedFrames,
     backpressureEvents: totalBackpressureEvents,
@@ -418,18 +463,22 @@ async function createAppInternal(
   });
 
   const webRtcStats = (sessionId: string) => {
-    if (streamSettings.transport !== "webrtc" || !webRtcPublisher) return null;
+    if (!webRtcPublisher) return null;
     return webRtcStatsCollector.report(
       {
+        streamMode: session.mode,
         codec: session.meta.codecId,
         width: screen.width,
         height: screen.height,
         frames: frameCount,
         fps: sourceFps,
+        configuredFps: streamEncoderSettings.h264Fps,
         configuredBitrateBps: streamEncoderSettings.h264Bitrate,
+        frameStats: frameStats.summary(),
       },
       webRtcPublisher,
       sessionId,
+      session.diagnostics?.().grpcCapture ?? null,
     );
   };
 
@@ -702,31 +751,56 @@ async function createAppInternal(
     }, remainingCooldownMs);
   };
 
-  if (streamSettings.transport === "webrtc") {
-    if (session.meta.codecId !== "h264") {
-      await session.close();
-      await deviceState.release(
-        deviceStateOwner,
-        "WebRTC codec validation failed",
-      );
-      throw new Error(
-        `WebRTC transport currently supports only H.264, but the selected stream source uses ${session.meta.codecId}.`,
+  const publisherFor = (): Promise<WebRtcPublisher> => {
+    if (session.meta.codecId !== webRtcStreamSettings.codec) {
+      return Promise.reject(
+        new WebRtcSignalingError(
+          `WebRTC requires ${webRtcStreamSettings.codec.toUpperCase()} video, but ${session.mode} negotiated ${session.meta.codecId}.`,
+          409,
+          "webrtc_codec_unavailable",
+        ),
       );
     }
-    try {
-      webRtcPublisher = await openWebRtcPublisher({
-        settings: streamSettings,
-        onKeyframeRequest: requestVideoReset,
+    if (stopRequested || status !== "streaming") {
+      return Promise.reject(
+        new WebRtcSignalingError(
+          `WebRTC is unavailable while the stream is ${status}.`,
+          503,
+          "webrtc_unavailable",
+        ),
+      );
+    }
+    if (webRtcPublisher) return Promise.resolve(webRtcPublisher);
+    if (webRtcPublisherTask) return webRtcPublisherTask;
+
+    const generation = sessionGeneration;
+    const task = openWebRtcPublisher({
+      settings: webRtcStreamSettings,
+      onKeyframeRequest: requestVideoReset,
+    })
+      .then((publisher) => {
+        if (
+          stopRequested ||
+          status !== "streaming" ||
+          generation !== sessionGeneration ||
+          session.meta.codecId !== webRtcStreamSettings.codec
+        ) {
+          publisher.close();
+          throw new WebRtcSignalingError(
+            "The stream changed while WebRTC was starting.",
+            409,
+            "webrtc_stream_changed",
+          );
+        }
+        webRtcPublisher = publisher;
+        return publisher;
+      })
+      .finally(() => {
+        if (webRtcPublisherTask === task) webRtcPublisherTask = null;
       });
-    } catch (err) {
-      await session.close();
-      await deviceState.release(
-        deviceStateOwner,
-        "WebRTC publisher startup failed",
-      );
-      throw err;
-    }
-  }
+    webRtcPublisherTask = task;
+    return task;
+  };
 
   const dropUntilKeyFrame = (client: Client) => {
     client.droppedFrames++;
@@ -808,10 +882,13 @@ async function createAppInternal(
             continue;
           }
           frameCount++;
+          frameStats.record(f.data.length, f.isKey, clock.now());
           lastFrameMs = Date.now();
           const config = f.isKey ? cachedConfig : null;
           webRtcStatsCollector.recordDelivery(
-            webRtcPublisher?.sendFrame(f, config),
+            activeSession.meta.codecId === webRtcStreamSettings.codec
+              ? webRtcPublisher?.sendFrame(f, config)
+              : undefined,
           );
           let rawOut: Buffer | null = null;
           let framedOut: Buffer | null = null;
@@ -853,20 +930,11 @@ async function createAppInternal(
     });
   };
 
-  const validateCapture = (candidate: EmuSession) => {
-    if (streamSettings.transport === "webrtc" && candidate.meta.codecId !== "h264") {
-      throw new Error(
-        `WebRTC transport currently supports only H.264, but the selected stream source uses ${candidate.meta.codecId}.`,
-      );
-    }
-  };
-
   const activateCapture = async (
     nextSession: EmuSession,
     settings: StreamEncoderSettings,
   ): Promise<void> => {
     try {
-      validateCapture(nextSession);
       if (stopRequested || status !== "streaming") {
         throw new StreamSettingsUnavailableError(`session is ${status}`);
       }
@@ -881,6 +949,7 @@ async function createAppInternal(
     const generation = ++sessionGeneration;
     screen.width = nextSession.meta.width;
     screen.height = nextSession.meta.height;
+    frameStats.reset();
     cachedConfig = null;
     if (pendingVideoResetTimer) clearTimeout(pendingVideoResetTimer);
     pendingVideoResetTimer = null;
@@ -894,7 +963,12 @@ async function createAppInternal(
         size: { width: screen.width, height: screen.height },
       });
     }
-    webRtcPublisher?.resetVideoSource();
+    if (nextSession.meta.codecId === webRtcStreamSettings.codec) {
+      webRtcPublisher?.resetVideoSource();
+    } else {
+      webRtcPublisher?.close();
+      webRtcPublisher = null;
+    }
     startCaptureReader(nextSession, generation);
     requestVideoReset("stream settings changed");
   };
@@ -912,6 +986,7 @@ async function createAppInternal(
       maxSize: settings.maxDimension,
       keyFrameInterval: opts.keyFrameInterval,
       mode,
+      grpcImageMode,
     });
 
   const replaceCapture = async (
@@ -1104,6 +1179,10 @@ async function createAppInternal(
           lastError,
           clients: clients.size,
           stream: streamSettings,
+          viewerTransports: viewerTransportsFor(
+            streamSettings,
+            session.meta.codecId,
+          ),
         },
         { headers: { "Cache-Control": "no-store" } },
       );
@@ -1198,13 +1277,6 @@ async function createAppInternal(
       if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: webRtcCorsHeaders(req) });
       if (req.method !== "POST") return new Response("method not allowed", { status: 405, headers: webRtcCorsHeaders(req) });
       try {
-        if (streamSettings.transport !== "webrtc" || !webRtcPublisher) {
-          throw new WebRtcSignalingError(
-            "WebRTC transport is not enabled. Start serve-emu with --transport webrtc.",
-            400,
-            "webrtc_not_enabled",
-          );
-        }
         if (!isJsonRequest(req)) {
           throw new WebRtcSignalingError(
             "WebRTC offers require application/json",
@@ -1215,9 +1287,10 @@ async function createAppInternal(
         const offer = parseWebRtcOffer(
           parseJsonBody(await readBodyText(req, MAX_WEBRTC_SIGNALING_BODY_BYTES), "invalid_offer"),
         );
-        const answer = await webRtcPublisher.handleOffer(offer);
+        const publisher = await publisherFor();
+        const answer = await publisher.handleOffer(offer);
         if (req.signal.aborted) {
-          webRtcPublisher.closeSession(offer.sessionId);
+          publisher.closeSession(offer.sessionId);
           return new Response(null, { status: 499, headers: webRtcCorsHeaders(req) });
         }
         return Response.json(answer, { headers: webRtcJsonHeaders(req) });
@@ -1239,7 +1312,10 @@ async function createAppInternal(
         const request = parseWebRtcCloseRequest(
           parseJsonBody(await readBodyText(req, MAX_WEBRTC_CLOSE_BODY_BYTES), "invalid_close_request"),
         );
-        webRtcPublisher?.closeSession(request.sessionId);
+        const publisher =
+          webRtcPublisher ??
+          (await webRtcPublisherTask?.catch(() => null));
+        publisher?.closeSession(request.sessionId);
         return new Response(null, { status: 204, headers: webRtcCorsHeaders(req) });
       } catch (err) {
         const status = err instanceof WebRtcSignalingError ? err.status : 400;
@@ -1661,6 +1737,12 @@ async function createAppInternal(
     deviceState,
     activateDeviceState,
     isStreaming: () => status === "streaming",
+    /** Authoritative settings for the currently active capture generation. */
+    getStreamEncoderSettings: (): StreamEncoderSettings => ({
+      ...streamEncoderSettings,
+    }),
+    /** Exact gRPC image mode configured for this app generation. */
+    getGrpcImageMode: (): GrpcImageMode => grpcImageMode,
     health,
     webRtcStats,
     handleRequest,
@@ -1703,6 +1785,29 @@ function activateDeviceStateForApp(app: EmuApp): void {
   (
     app as EmuApp & { activateDeviceState?: () => void }
   ).activateDeviceState?.();
+}
+
+function streamEncoderSettingsForApp(
+  app: EmuApp,
+): StreamEncoderSettings | undefined {
+  const readSettings = (
+    app as EmuApp & {
+      getStreamEncoderSettings?: () => StreamEncoderSettings;
+    }
+  ).getStreamEncoderSettings;
+  return readSettings?.();
+}
+
+function grpcImageModeForApp(
+  app: EmuApp,
+  fallback = DEFAULT_GRPC_IMAGE_MODE,
+): GrpcImageMode {
+  const readMode = (
+    app as EmuApp & {
+      getGrpcImageMode?: () => GrpcImageMode;
+    }
+  ).getGrpcImageMode;
+  return readMode?.() ?? fallback;
 }
 
 export function createApp(
@@ -1757,6 +1862,7 @@ export function createRouter(
   const pending = new Map<string, Promise<EmuApp>>();
   const failureAt = new Map<string, number>();
   const streamModeOverrides = new Map<string, StreamMode>();
+  const grpcImageModeOverrides = new Map<string, GrpcImageMode>();
   const streamModeQueues = new Map<string, Promise<void>>();
   const sessionGenerations = new Map<string, number>();
   const operationControllers = new Map<string, Set<AbortController>>();
@@ -1872,6 +1978,11 @@ export function createRouter(
       streamModeOverrides.get(serial) ?? defaults.streamMode ?? "scrcpy",
     parentSignal?: AbortSignal,
     deviceState?: DeviceSessionState,
+    encoderSettings?: StreamEncoderSettings,
+    grpcImageMode =
+      grpcImageModeOverrides.get(serial) ??
+      defaults.grpcImageMode ??
+      DEFAULT_GRPC_IMAGE_MODE,
   ): Promise<EmuApp> => {
     const operation = beginOperation(serial, parentSignal);
     let created: EmuApp | null = null;
@@ -1879,8 +1990,16 @@ export function createRouter(
       throwIfAborted(operation.signal, `app startup for ${serial} was aborted`);
       created = await createDeviceApp({
         ...defaults,
+        ...(encoderSettings
+          ? {
+              maxSize: encoderSettings.maxDimension,
+              bitRate: encoderSettings.h264Bitrate,
+              maxFps: encoderSettings.h264Fps,
+            }
+          : {}),
         serial,
         streamMode,
+        grpcImageMode,
         deviceState,
         signal: combineAbortSignals(defaults.signal, operation.signal),
       });
@@ -2006,6 +2125,7 @@ export function createRouter(
   const performStreamModeSwitch = async (
     serial: string,
     streamMode: StreamMode,
+    requestedGrpcImageMode: GrpcImageMode | undefined,
     signal: AbortSignal,
   ): Promise<EmuApp> => {
     if (stopped) throw new Error("serve-emu router is stopped");
@@ -2020,11 +2140,22 @@ export function createRouter(
     }
 
     const current = apps.get(serial);
+    const configuredGrpcImageMode =
+      grpcImageModeOverrides.get(serial) ??
+      defaults.grpcImageMode ??
+      DEFAULT_GRPC_IMAGE_MODE;
+    const currentGrpcImageMode = current
+      ? grpcImageModeForApp(current, configuredGrpcImageMode)
+      : configuredGrpcImageMode;
+    const grpcImageMode =
+      requestedGrpcImageMode ?? currentGrpcImageMode;
     if (
       current?.isStreaming() &&
-      streamSessionForApp(current).mode === streamMode
+      streamSessionForApp(current).mode === streamMode &&
+      currentGrpcImageMode === grpcImageMode
     ) {
       streamModeOverrides.set(serial, streamMode);
+      grpcImageModeOverrides.set(serial, grpcImageMode);
       return current;
     }
 
@@ -2052,6 +2183,8 @@ export function createRouter(
         streamMode,
         signal,
         retainedDeviceState,
+        current ? streamEncoderSettingsForApp(current) : undefined,
+        grpcImageMode,
       );
     } finally {
       await retainedDeviceState?.release(
@@ -2081,6 +2214,7 @@ export function createRouter(
       throw error;
     }
     streamModeOverrides.set(serial, streamMode);
+    grpcImageModeOverrides.set(serial, grpcImageMode);
     failureAt.delete(serial);
     sessionGenerations.set(
       serial,
@@ -2100,9 +2234,10 @@ export function createRouter(
   const switchStreamMode = (
     serial: string,
     streamMode: StreamMode,
+    grpcImageMode?: GrpcImageMode,
   ): Promise<EmuApp> =>
     enqueueStreamModeOperation(serial, (signal) =>
-      performStreamModeSwitch(serial, streamMode, signal),
+      performStreamModeSwitch(serial, streamMode, grpcImageMode, signal),
     );
 
   // Resolve + start in one step.
@@ -2135,6 +2270,12 @@ export function createRouter(
     ok: true,
     serial,
     mode: streamSessionForApp(app).mode,
+    grpcImageMode: grpcImageModeForApp(
+      app,
+      grpcImageModeOverrides.get(serial) ??
+        defaults.grpcImageMode ??
+        DEFAULT_GRPC_IMAGE_MODE,
+    ),
     availableModes: availableStreamModesForSerial(serial),
     sessionGeneration: sessionGenerations.get(serial) ?? 0,
   });
@@ -2190,6 +2331,7 @@ export function createRouter(
     pending.delete(serial);
     failureAt.delete(serial);
     streamModeOverrides.delete(serial);
+    grpcImageModeOverrides.delete(serial);
     streamModeQueues.delete(serial);
     sessionGenerations.delete(serial);
   };
@@ -2277,24 +2419,55 @@ export function createRouter(
       }
 
       let streamMode: StreamMode;
+      let grpcImageMode: GrpcImageMode | undefined;
       try {
         const payload = await readRouterPayload(req);
-        const { mode } = parseStreamModeRequest(payload);
+        const streamModeRequest = parseStreamModeRequest(payload);
+        const { mode } = streamModeRequest;
         if (mode === "grpc-screenshot" && !isEmulatorSerial(serial)) {
           throw new Error(
             "grpc-screenshot is only available for Android Emulator devices",
           );
         }
         streamMode = mode;
+        grpcImageMode =
+          streamModeRequest.mode === "grpc-screenshot"
+            ? streamModeRequest.grpcImageMode
+            : undefined;
       } catch (err) {
         return streamModeRequestErrorResponse(err);
       }
 
       try {
-        const app = await switchStreamMode(serial, streamMode);
+        const app = await switchStreamMode(
+          serial,
+          streamMode,
+          grpcImageMode,
+        );
         return Response.json(streamModeResponse(serial, app));
       } catch (err) {
         return streamModeUnavailableResponse(err);
+      }
+    }
+
+    // Settings updates restart the active capture just like source changes do.
+    // Put both mutations on the same per-device queue so a source replacement
+    // cannot snapshot stale settings while a PATCH is still in flight.
+    if (
+      url.pathname === "/api/stream-settings" &&
+      req.method === "PATCH"
+    ) {
+      try {
+        const serial = await resolveSerial(url.searchParams.get("device"));
+        return await enqueueStreamModeOperation(serial, async (signal) => {
+          const app = await getAppUnqueued(serial, signal);
+          return app.handleRequest(req);
+        });
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: errMsg(err) },
+          { status: 503 },
+        );
       }
     }
 
@@ -2488,6 +2661,7 @@ export function createRouter(
       pending.clear();
       failureAt.clear();
       streamModeOverrides.clear();
+      grpcImageModeOverrides.clear();
       streamModeQueues.clear();
       sessionGenerations.clear();
       operationControllers.clear();

@@ -122,15 +122,18 @@ import {
   type UploadManagerOptions,
 } from "./upload-manager.ts";
 import {
+  DEFAULT_WEBRTC_STREAM_SETTINGS,
   DEFAULT_STREAM_SETTINGS,
   isJsonRequest,
   parseStreamEncoderSettingsPatch,
   redactedStreamSettings,
   streamEncoderSettingsEqual,
   StreamSettingsUnavailableError,
+  viewerTransportsFor,
   type StreamEncoderSettings,
   type StreamEncoderSettingsPatch,
   type StreamSettings,
+  type WebRtcStreamSettings,
 } from "./stream-settings.ts";
 import {
   MAX_WEBRTC_SIGNALING_BODY_BYTES,
@@ -144,10 +147,14 @@ import {
   type WebRtcPublisherOptions,
 } from "./webrtc-publisher.ts";
 import {
+  DEFAULT_GRPC_IMAGE_MODE,
+  GRPC_IMAGE_MODES,
+  isGrpcImageMode,
   isStreamMode,
   parseFontScale,
   parseStreamModeRequest,
   STREAM_MODES,
+  type GrpcImageMode,
   type StreamMode,
 } from "./shared/api-contracts.ts";
 import {
@@ -177,12 +184,14 @@ export type ServerOpts = {
   repeatFrameMs?: number;
   /** Screen/input source. Defaults to scrcpy. */
   streamMode?: StreamMode;
+  /** Emulator gRPC image delivery mode. Defaults to PNG. */
+  grpcImageMode?: GrpcImageMode;
   maxApkUploadBytes?: number;
   maxMediaUploadBytes?: number;
   maxActiveUploads?: number;
   maxQueuedUploads?: number;
   uploadQueueTimeoutMs?: number;
-  /** Video transport exposed by the browser UI. Defaults to WebSocket/WebCodecs. */
+  /** Default viewer transport. Each browser viewer may select either available path. */
   streamSettings?: StreamSettings;
 };
 
@@ -357,6 +366,14 @@ export async function startServer(
     );
   }
   const defaultStreamMode = requestedDefaultStreamMode;
+  const requestedDefaultGrpcImageMode: unknown =
+    opts.grpcImageMode ?? DEFAULT_GRPC_IMAGE_MODE;
+  if (!isGrpcImageMode(requestedDefaultGrpcImageMode)) {
+    throw new Error(
+      `grpcImageMode must be one of: ${GRPC_IMAGE_MODES.join(", ")}`,
+    );
+  }
+  const defaultGrpcImageMode = requestedDefaultGrpcImageMode;
   const serve = dependencies.serve ?? Bun.serve;
   const listDevices =
     dependencies.listDevices ?? dependencies.listAllDevices ?? listAllDevices;
@@ -465,7 +482,13 @@ export async function startServer(
   const host = opts.host ?? DEFAULT_HOST;
   const authToken = opts.token && opts.token.length > 0 ? opts.token : null;
   const streamSettings = opts.streamSettings ?? DEFAULT_STREAM_SETTINGS;
-  const preferredStreamModes = new Map<string, StreamMode>();
+  const webRtcStreamSettings: WebRtcStreamSettings =
+    streamSettings.transport === "webrtc"
+      ? streamSettings
+      : DEFAULT_WEBRTC_STREAM_SETTINGS;
+  const streamModes = new Map<string, StreamMode>();
+  const grpcImageModes = new Map<string, GrpcImageMode>();
+  const contextGrpcImageModes = new WeakMap<DeviceContext, GrpcImageMode>();
   const defaultStreamEncoderSettings: StreamEncoderSettings = {
     maxDimension: opts.maxSize ?? SCRCPY_DEFAULTS.maxSize,
     h264Bitrate: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
@@ -477,18 +500,22 @@ export async function startServer(
     streamEncoderSettings.get(serial) ?? defaultStreamEncoderSettings;
 
   const modeForSerial = (serial: string): StreamMode =>
-    preferredStreamModes.get(serial) ??
+    streamModes.get(serial) ??
     (isEmulatorSerial(serial) ? defaultStreamMode : "scrcpy");
+  const grpcImageModeForSerial = (serial: string): GrpcImageMode =>
+    grpcImageModes.get(serial) ?? defaultGrpcImageMode;
 
   const openStream = (
     serial: string,
     mode: StreamMode,
     signal?: AbortSignal,
     encoderSettings = encoderSettingsForSerial(serial),
+    grpcImageMode = grpcImageModeForSerial(serial),
   ) =>
     openSession({
       serial,
       mode,
+      grpcImageMode,
       signal,
       maxFps: encoderSettings.h264Fps,
       bitRate: encoderSettings.h264Bitrate,
@@ -536,15 +563,8 @@ export async function startServer(
     generation: number,
     stream: EmuSession,
     deviceState?: DeviceSessionState,
+    grpcImageMode = grpcImageModeForSerial(serial),
   ): DeviceContext => {
-    if (
-      streamSettings.transport === "webrtc" &&
-      stream.meta.codecId !== streamSettings.codec
-    ) {
-      throw new Error(
-        `WebRTC requires ${streamSettings.codec.toUpperCase()} video, but ${stream.mode} negotiated ${stream.meta.codecId}`,
-      );
-    }
     const context = new ActiveDeviceSession<Client>({
       serial,
       generation,
@@ -562,6 +582,7 @@ export async function startServer(
         ),
       ),
     );
+    contextGrpcImageModes.set(context, grpcImageMode);
     return context;
   };
 
@@ -574,7 +595,8 @@ export async function startServer(
     await initialStream.close().catch(() => {});
     throw err;
   }
-  preferredStreamModes.set(opts.serial, initialMode);
+  streamModes.set(opts.serial, initialMode);
+  grpcImageModes.set(opts.serial, defaultGrpcImageMode);
   const sessions = new DeviceSessionManager(initialContext);
   const recoveries = new WeakMap<
     DeviceContext,
@@ -628,6 +650,8 @@ export async function startServer(
     device: context.stream.meta.deviceName,
     codec: context.stream.meta.codecId,
     streamMode: context.stream.mode,
+    grpcImageMode: grpcImageModeForContext(context),
+    grpcCapture: context.stream.diagnostics?.().grpcCapture ?? null,
     size: { width: context.screen.width, height: context.screen.height },
     clients: context.clients.size,
     videoClients: Array.from(context.clients).filter((client) => client.video)
@@ -696,25 +720,26 @@ export async function startServer(
 
   const webRtcStats = (context: DeviceContext, sessionId: string) => {
     const publisher = publishers.get(context);
-    if (
-      context.status !== "streaming" ||
-      streamSettings.transport !== "webrtc" ||
-      !publisher
-    ) {
+    if (context.status !== "streaming" || !publisher) {
       return null;
     }
     const sourceFps = recoveries.get(context)?.snapshot(recoveryClock.now()).sourceFps ?? 0;
+    const encoderSettings = encoderSettingsForSerial(context.serial);
     return webRtcStatsCollectorFor(context).report(
       {
+        streamMode: context.stream.mode,
         codec: context.stream.meta.codecId,
         width: context.screen.width,
         height: context.screen.height,
         frames: context.frameCount,
         fps: sourceFps,
-        configuredBitrateBps: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
+        configuredFps: encoderSettings.h264Fps,
+        configuredBitrateBps: encoderSettings.h264Bitrate,
+        frameStats: context.frameStats.summary(),
       },
       publisher,
       sessionId,
+      context.stream.diagnostics?.().grpcCapture ?? null,
     );
   };
 
@@ -1272,12 +1297,12 @@ export async function startServer(
   const publisherFor = (
     context: DeviceContext,
   ): Promise<WebRtcPublisherLike> => {
-    if (streamSettings.transport !== "webrtc") {
+    if (context.stream.meta.codecId !== webRtcStreamSettings.codec) {
       return Promise.reject(
         new WebRtcSignalingError(
-          "WebRTC streaming is not enabled",
-          404,
-          "webrtc_disabled",
+          `WebRTC requires ${webRtcStreamSettings.codec.toUpperCase()} video, but ${context.stream.mode} negotiated ${context.stream.meta.codecId}`,
+          409,
+          "webrtc_codec_unavailable",
         ),
       );
     }
@@ -1287,7 +1312,7 @@ export async function startServer(
     if (pending) return pending;
 
     const task = openWebRtcPublisher({
-      settings: streamSettings,
+      settings: webRtcStreamSettings,
       onKeyframeRequest: (reason) => {
         const recovery = recoveries.get(context);
         const webRtcState = webRtcRecoveryStates.get(context);
@@ -1558,6 +1583,7 @@ export async function startServer(
     signal: AbortSignal,
     deviceState?: DeviceSessionState,
     encoderSettings = encoderSettingsForSerial(serial),
+    grpcImageMode = grpcImageModeForSerial(serial),
   ): Promise<DeviceContext> => {
     const stagingOwner = {};
     let retainedDeviceState =
@@ -1572,13 +1598,20 @@ export async function startServer(
       }
     }
     try {
-      const stream = await openStream(serial, mode, signal, encoderSettings);
+      const stream = await openStream(
+        serial,
+        mode,
+        signal,
+        encoderSettings,
+        grpcImageMode,
+      );
       try {
         return createContext(
           serial,
           generation,
           stream,
           retainedDeviceState,
+          grpcImageMode,
         );
       } catch (error) {
         await stream.close().catch(() => {});
@@ -1592,10 +1625,15 @@ export async function startServer(
     }
   };
 
+  const grpcImageModeForContext = (context: DeviceContext): GrpcImageMode =>
+    contextGrpcImageModes.get(context) ??
+    grpcImageModeForSerial(context.serial);
+
   const streamModeResponse = (context: DeviceContext) => ({
     ok: true as const,
     serial: context.serial,
     mode: context.stream.mode,
+    grpcImageMode: grpcImageModeForContext(context),
     availableModes: availableStreamModesForSerial(context.serial),
     sessionGeneration: context.generation,
   });
@@ -1639,6 +1677,8 @@ export async function startServer(
     console.log(
       `${context.stream.mode} ready: ${context.stream.meta.deviceName} • ${context.stream.meta.codecId} • ${context.stream.meta.width}×${context.stream.meta.height}`,
     );
+    streamModes.set(context.serial, context.stream.mode);
+    grpcImageModes.set(context.serial, grpcImageModeForContext(context));
     return {
       ok: true,
       serial: context.serial,
@@ -1648,6 +1688,7 @@ export async function startServer(
 
   const switchStreamMode = async (
     mode: StreamMode,
+    requestedGrpcImageMode: GrpcImageMode | undefined,
     expected?: DeviceContext,
   ) => {
     const active = sessions.current;
@@ -1660,15 +1701,24 @@ export async function startServer(
         "grpc-screenshot is available only for Android Emulator devices",
       );
     }
+    let grpcImageMode: GrpcImageMode | undefined;
     const context = await sessions.replace(
-      (current, generation, signal) =>
-        prepareContext(
+      (current, generation, signal) => {
+        const selectedGrpcImageMode =
+          grpcImageMode ??
+          requestedGrpcImageMode ??
+          grpcImageModeForContext(current);
+        grpcImageMode = selectedGrpcImageMode;
+        return prepareContext(
           current.serial,
           generation,
           mode,
           signal,
           current.signal.aborted ? undefined : current.deviceState,
-        ),
+          encoderSettingsForSerial(current.serial),
+          selectedGrpcImageMode,
+        );
+      },
       activateContext,
       "stream source switched",
       (current) => {
@@ -1678,10 +1728,18 @@ export async function startServer(
             current.generation,
           );
         }
-        return current.stream.mode !== mode;
+        grpcImageMode =
+          requestedGrpcImageMode ?? grpcImageModeForContext(current);
+        return (
+          current.stream.mode !== mode ||
+          grpcImageModeForContext(current) !== grpcImageMode
+        );
       },
     );
-    preferredStreamModes.set(context.serial, mode);
+    const appliedGrpcImageMode =
+      grpcImageMode ?? grpcImageModeForContext(context);
+    streamModes.set(context.serial, mode);
+    grpcImageModes.set(context.serial, appliedGrpcImageMode);
     if (context.generation !== active.generation) {
       console.log(
         `${context.stream.mode} ready: ${context.stream.meta.deviceName} • ${context.stream.meta.codecId} • ${context.stream.meta.width}×${context.stream.meta.height}`,
@@ -1866,6 +1924,10 @@ export async function startServer(
             status: requestContext.status,
             clients: requestContext.clients.size,
             stream: streamSettings,
+            viewerTransports: viewerTransportsFor(
+              streamSettings,
+              requestContext.stream.meta.codecId,
+            ),
           },
           { headers: { "Cache-Control": "no-store" } },
         );
@@ -1881,9 +1943,11 @@ export async function startServer(
           return streamModeMethodNotAllowedResponse();
         }
         let mode: StreamMode;
+        let grpcImageMode: GrpcImageMode | undefined;
         try {
           const payload = await readJsonBody(req, MAX_JSON_BODY_BYTES);
-          const { mode: requestedMode } = parseStreamModeRequest(payload);
+          const streamModeRequest = parseStreamModeRequest(payload);
+          const { mode: requestedMode } = streamModeRequest;
           if (
             requestedMode === "grpc-screenshot" &&
             !isEmulatorSerial(requestContext.serial)
@@ -1893,11 +1957,17 @@ export async function startServer(
             );
           }
           mode = requestedMode;
+          grpcImageMode =
+            streamModeRequest.mode === "grpc-screenshot"
+              ? streamModeRequest.grpcImageMode
+              : undefined;
         } catch (error) {
           return streamModeRequestErrorResponse(error);
         }
         try {
-          return Response.json(await switchStreamMode(mode, requestContext));
+          return Response.json(
+            await switchStreamMode(mode, grpcImageMode, requestContext),
+          );
         } catch (error) {
           return error instanceof SessionChangedError
             ? streamModeConflictResponse(error)
@@ -2037,9 +2107,11 @@ export async function startServer(
             ),
           );
           sessions.assertCurrent(requestContext);
-          const publisher = await publisherFor(requestContext);
+          const publisher =
+            publishers.get(requestContext) ??
+            (await publisherTasks.get(requestContext)?.catch(() => null));
           sessions.assertCurrent(requestContext);
-          publisher.closeSession(payload.sessionId);
+          publisher?.closeSession(payload.sessionId);
           return Response.json({ ok: true });
         } catch (error) {
           return errorResponse(error);

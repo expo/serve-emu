@@ -8,7 +8,11 @@ import {
   type StartOpts,
   type VideoPacket,
 } from "./scrcpy.ts";
-import type { StreamMode } from "./shared/api-contracts.ts";
+import type {
+  GrpcCaptureDiagnostics,
+  GrpcImageMode,
+  StreamMode,
+} from "./shared/api-contracts.ts";
 import { isAbnormalExit, procExitDetail } from "./session-status.ts";
 
 const SCRCPY_READINESS_TIMEOUT_MS = 10_000;
@@ -17,6 +21,11 @@ const MAX_SCRCPY_STARTUP_BYTES = 64 * 1024 * 1024;
 const STARTUP_READY: unique symbol = Symbol("scrcpy-startup-ready");
 const NEVER_ABORTED = new AbortController().signal;
 
+export type {
+  GrpcCaptureDiagnostics,
+  RollingTimingSummary,
+} from "./shared/api-contracts.ts";
+
 export type StreamFailure = {
   message: string;
   code?: string;
@@ -24,6 +33,11 @@ export type StreamFailure = {
 };
 
 export type StreamMeta = ScrcpySession["meta"];
+
+export type EmuSessionDiagnostics = {
+  /** Present only for the grpc-screenshot capture implementation. */
+  grpcCapture?: GrpcCaptureDiagnostics;
+};
 
 /**
  * A stream source hides capture, encoding, input transport, keyframe recovery,
@@ -34,6 +48,8 @@ export type EmuSession = {
   readonly serial: string;
   readonly meta: StreamMeta;
   readonly controls: ControlInputQueue;
+  /** Optional source-specific live diagnostics, sampled without mutating capture. */
+  readonly diagnostics?: () => EmuSessionDiagnostics;
   /** Present only on the scrcpy adapter during the server migration. */
   readonly rawScrcpy?: ScrcpySession;
   readFrame(): Promise<VideoPacket | null>;
@@ -45,6 +61,8 @@ export type EmuSession = {
 export type StartEmuSessionOptions = StartOpts & {
   /** Exact source selection. This factory never silently falls back. */
   mode: StreamMode;
+  /** Exact emulator screenshot image mode. Capture never silently falls back. */
+  grpcImageMode: GrpcImageMode;
 };
 
 export async function startEmuSession(
@@ -138,10 +156,7 @@ export function adaptScrcpySession(
     fatalFailure = failure;
     for (const listener of listeners) listener(failure);
   };
-  const onExit = (
-    code: number | null,
-    signal: NodeJS.Signals | null,
-  ) => {
+  const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
     if (!isAbnormalExit(code, signal)) return;
     const { reason, ...detail } = procExitDetail(code, signal);
     emitFatal({ message: reason, ...detail });

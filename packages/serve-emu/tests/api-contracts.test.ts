@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   API_ERROR_CODES,
   API_SUCCESS_PARSERS,
+  isGrpcImageMode,
   isApiFailure,
   isStreamMode,
   parseApiFailure,
@@ -45,12 +46,31 @@ describe("API contracts", () => {
     expect(parseStreamModeRequest({ mode: "grpc-screenshot" })).toEqual({
       mode: "grpc-screenshot",
     });
+    expect(
+      parseStreamModeRequest({
+        mode: "grpc-screenshot",
+        grpcImageMode: "mmap",
+      }),
+    ).toEqual({ mode: "grpc-screenshot", grpcImageMode: "mmap" });
     expect(() => parseStreamModeRequest(null)).toThrow(
       "stream mode request must be an object",
     );
     expect(() => parseStreamModeRequest({ mode: "screen-copy" })).toThrow(
       "stream mode request.mode is invalid",
     );
+    expect(() =>
+      parseStreamModeRequest({ mode: "grpc-screenshot", grpcImageMode: "auto" })
+    ).toThrow("stream mode request.grpcImageMode is invalid");
+    expect(() =>
+      parseStreamModeRequest({ mode: "scrcpy", grpcImageMode: "png" })
+    ).toThrow("available only with mode grpc-screenshot");
+  });
+
+  test("recognizes only explicit gRPC image modes", () => {
+    expect(isGrpcImageMode("png")).toBe(true);
+    expect(isGrpcImageMode("mmap")).toBe(true);
+    expect(isGrpcImageMode("auto")).toBe(false);
+    expect(isGrpcImageMode(null)).toBe(false);
   });
 
   test("accepts every stable failure code and rejects drift", () => {
@@ -93,6 +113,7 @@ describe("API contracts", () => {
       ok: true,
       serial: "emulator-5554",
       mode: "grpc-screenshot",
+      grpcImageMode: "mmap",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 7,
     });
@@ -100,6 +121,7 @@ describe("API contracts", () => {
       ok: true,
       serial: "emulator-5554",
       mode: "grpc-screenshot",
+      grpcImageMode: "mmap",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 7,
     });
@@ -109,6 +131,12 @@ describe("API contracts", () => {
         mode: "screen-copy",
       }),
     ).toThrow("mode");
+    expect(() =>
+      parseStreamModeResponse({
+        ...response,
+        grpcImageMode: "auto",
+      }),
+    ).toThrow("grpcImageMode");
     expect(() =>
       parseStreamModeResponse({
         ...response,

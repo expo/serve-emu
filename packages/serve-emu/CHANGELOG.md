@@ -14,6 +14,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
 
 - Add emulator-only gRPC screenshot streaming with host-side H.264 encoding,
   a CLI source flag, a runtime HTTP API, and a browser UI source selector.
+- Add strict PNG and shared-memory MMAP image modes for gRPC capture, selectable
+  through configuration, the CLI, runtime API, and browser UI.
 
 ### Changed
 

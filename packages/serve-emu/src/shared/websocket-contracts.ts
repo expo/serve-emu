@@ -1,5 +1,5 @@
-import { parseGesture, type Gesture } from "./control-contracts";
-import type { DeviceSize } from "./api-contracts";
+import { parseGesture, type Gesture } from "./control-contracts.ts";
+import type { DeviceSize } from "./api-contracts.ts";
 
 export type WsMessageOptions = {
   /** Set false when the sender does not need a JSON acknowledgement. */
