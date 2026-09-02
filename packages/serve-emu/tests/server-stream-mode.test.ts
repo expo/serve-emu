@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { ControlInputQueue } from "../src/control-input-queue.ts";
+import { SCRCPY_DEFAULTS } from "../src/scrcpy.ts";
 import { startServer } from "../src/server.ts";
 import type { StreamMode } from "../src/shared/api-contracts.ts";
-import type { EmuSession } from "../src/stream-session.ts";
+import type {
+  EmuSession,
+  StartEmuSessionOptions,
+} from "../src/stream-session.ts";
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -102,6 +106,173 @@ const postJson = (
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+
+const patchStreamSettings = (
+  captured: CapturedServer,
+  body: Record<string, unknown>,
+): Promise<Response> =>
+  request(captured, "/api/stream-settings", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+describe("standalone server stream settings", () => {
+  test("GET and PATCH report and apply the active encoder settings", async () => {
+    const opens: StartEmuSessionOptions[] = [];
+    const captured: CapturedServer = { options: null };
+    const started = await startServer(
+      { serial: "emulator-5554", port: 3300 },
+      {
+        openSession: async (options) => {
+          opens.push(options);
+          return fakeSession(options.serial, options.mode).session;
+        },
+        serve: capturingServe(captured),
+      },
+    );
+
+    try {
+      expect(
+        await (await request(captured, "/api/stream-settings")).json(),
+      ).toEqual({
+        ok: true,
+        maxDimension: SCRCPY_DEFAULTS.maxSize,
+        h264Bitrate: SCRCPY_DEFAULTS.bitRate,
+        h264Fps: SCRCPY_DEFAULTS.maxFps,
+      });
+
+      const response = await patchStreamSettings(captured, {
+        maxDimension: 720,
+        h264Bitrate: 3_000_000,
+        h264Fps: 24,
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        ok: true,
+        maxDimension: 720,
+        h264Bitrate: 3_000_000,
+        h264Fps: 24,
+      });
+      expect(opens[1]).toMatchObject({
+        serial: "emulator-5554",
+        mode: "scrcpy",
+        maxSize: 720,
+        bitRate: 3_000_000,
+        maxFps: 24,
+      });
+      expect(await (await request(captured, "/health")).json()).toMatchObject({
+        sessionGeneration: 1,
+        encoderSettings: {
+          maxDimension: 720,
+          h264Bitrate: 3_000_000,
+          h264Fps: 24,
+        },
+      });
+    } finally {
+      await started.stop();
+    }
+  });
+
+  test("returns structured validation, method, and replacement errors", async () => {
+    const captured: CapturedServer = { options: null };
+    const started = await startServer(
+      { serial: "emulator-5554", port: 3300 },
+      {
+        openSession: async (options) => {
+          if (options.maxSize === 720) {
+            throw new Error("encoder rejected requested size");
+          }
+          return fakeSession(options.serial, options.mode).session;
+        },
+        serve: capturingServe(captured),
+      },
+    );
+
+    try {
+      const method = await request(captured, "/api/stream-settings", {
+        method: "POST",
+      });
+      expect(method.status).toBe(405);
+      expect(method.headers.get("allow")).toBe("GET, PATCH");
+      expect(await method.json()).toEqual({
+        ok: false,
+        error: "method_not_allowed",
+      });
+
+      const mediaType = await request(captured, "/api/stream-settings", {
+        method: "PATCH",
+        body: JSON.stringify({ maxDimension: 720 }),
+      });
+      expect(mediaType.status).toBe(415);
+      expect(await mediaType.json()).toEqual({
+        ok: false,
+        error: "unsupported_media_type",
+      });
+
+      const validation = await patchStreamSettings(captured, {
+        h264Fps: 0,
+      });
+      expect(validation.status).toBe(400);
+      expect(await validation.json()).toMatchObject({
+        ok: false,
+        error: "invalid_stream_settings",
+      });
+
+      const failed = await patchStreamSettings(captured, {
+        maxDimension: 720,
+      });
+      expect(failed.status).toBe(500);
+      expect(await failed.json()).toMatchObject({
+        ok: false,
+        error: "stream_settings_failed",
+        message: "encoder rejected requested size",
+      });
+      expect(
+        await (await request(captured, "/api/stream-settings")).json(),
+      ).toMatchObject({
+        ok: true,
+        maxDimension: SCRCPY_DEFAULTS.maxSize,
+      });
+    } finally {
+      await started.stop();
+    }
+  });
+
+  test("maps shutdown during replacement to service unavailable", async () => {
+    const replacement = deferred<EmuSession>();
+    const replacementStarted = deferred<void>();
+    let opens = 0;
+    const captured: CapturedServer = { options: null };
+    const started = await startServer(
+      { serial: "emulator-5554", port: 3300 },
+      {
+        openSession: async (options) => {
+          opens += 1;
+          if (opens === 1) {
+            return fakeSession(options.serial, options.mode).session;
+          }
+          replacementStarted.resolve();
+          return replacement.promise;
+        },
+        serve: capturingServe(captured),
+      },
+    );
+
+    const patch = patchStreamSettings(captured, { maxDimension: 720 });
+    await replacementStarted.promise;
+    const stopping = started.stop();
+    replacement.resolve(fakeSession("emulator-5554", "scrcpy").session);
+
+    const response = await patch;
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      error: "stream_settings_unavailable",
+    });
+    await stopping;
+  });
+});
 
 describe("server stream source switching", () => {
   test("uses the shared stream mode request validation", async () => {

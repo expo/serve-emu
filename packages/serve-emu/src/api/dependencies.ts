@@ -27,7 +27,9 @@ import type {
   SessionSnapshot,
   StreamMode,
   StreamModeResponse,
+  StreamEncoderSettingsResponse,
 } from "../shared/api-contracts.ts";
+import type { StreamEncoderSettingsPatch } from "../stream-settings.ts";
 
 export type { NightMode, OrientationMode } from "../shared/api-contracts.ts";
 export type RouteControlAction = ApiRequest<
@@ -43,6 +45,10 @@ export type ApiDependencies = {
   getInfo: () => ApiInfoResponse;
   getStreamMode: () => StreamModeResponse;
   setStreamMode: (mode: StreamMode) => Promise<StreamModeResponse>;
+  getStreamEncoderSettings: () => StreamEncoderSettingsResponse;
+  setStreamEncoderSettings: (
+    patch: StreamEncoderSettingsPatch,
+  ) => Promise<StreamEncoderSettingsResponse>;
   listDevices: () => Promise<DeviceListResponse>;
   getDeviceGrid: () => Promise<DeviceGridResponse>;
   selectDevice: (serial: string) => Promise<DeviceSelectionResponse>;

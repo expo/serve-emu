@@ -49,7 +49,7 @@ export const SideTools = memo(function SideTools({
     <>
       <ToolSection
         id="stream-source-tool"
-        title="Stream Source"
+        title="Stream"
         defaultExpanded
       >
         <StreamModePanel />

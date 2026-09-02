@@ -765,10 +765,83 @@ input[type="checkbox"] {
   font-size: 11px;
   line-height: 1.35;
 }
+.stream-quality-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid #25252d;
+}
+.stream-quality-heading {
+  min-height: 20px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.stream-quality-heading h3 {
+  margin: 0;
+  color: #e5e5ea;
+  font-size: 13px;
+  font-weight: 600;
+}
+.stream-quality-form fieldset {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.stream-quality-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 8px;
+}
+.stream-quality-fields label {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: #b8b8c0;
+  font-size: 11px;
+}
+.stream-quality-fields input {
+  min-height: 44px;
+  padding-right: 10px;
+  appearance: textfield;
+  font-size: 16px;
+}
+.stream-quality-fields input::-webkit-inner-spin-button,
+.stream-quality-fields input::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
+}
+.stream-quality-fields input[aria-invalid="true"] {
+  border-color: #ff7b72;
+  outline-color: #ff7b72;
+}
+.stream-quality-form button {
+  min-height: 44px;
+  touch-action: manipulation;
+}
+.stream-quality-error {
+  min-height: 1.35em;
+  margin: 0;
+  color: #ff9b93;
+  font-size: 11px;
+  line-height: 1.35;
+}
 @media (hover: hover) and (pointer: fine) {
   .stream-mode-option:hover input:not(:disabled):not(:checked) + span {
     border-color: #3a3a44;
     background: #25252d;
+  }
+}
+@media (max-width: 620px) {
+  .stream-quality-fields {
+    grid-template-columns: 1fr;
   }
 }
 .network-row {

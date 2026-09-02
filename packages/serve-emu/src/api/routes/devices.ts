@@ -3,6 +3,7 @@ import type { ContractApiRoute } from "./types.ts";
 import { readJsonBody } from "../body.ts";
 import { isEmulatorSerial } from "../../device-capabilities.ts";
 import { parseStreamModeRequest } from "../../shared/api-contracts.ts";
+import { parseStreamEncoderSettingsPatch } from "../../stream-settings.ts";
 import {
   downstream,
   invalid,
@@ -31,6 +32,26 @@ export function deviceRoutes(): ContractApiRoute<ApiDependencies>[] {
         const { mode } = parseInput(() => parseStreamModeRequest(payload));
         return Response.json(
           await downstream("switch stream mode", () => deps.setStreamMode(mode)),
+        );
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/stream-settings",
+      handler: ({ deps }) => Response.json(deps.getStreamEncoderSettings()),
+    },
+    {
+      method: "PATCH",
+      path: "/api/stream-settings",
+      handler: async ({ request, deps }) => {
+        const body = await readObject(request, "stream settings payload");
+        const patch = parseInput(() =>
+          parseStreamEncoderSettingsPatch(body)
+        );
+        return Response.json(
+          await downstream("update stream settings", () =>
+            deps.setStreamEncoderSettings(patch)
+          ),
         );
       },
     },

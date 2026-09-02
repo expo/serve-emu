@@ -235,6 +235,53 @@ refreshes reuse one `adb devices` snapshot while resolving running AVD names.
 Long install/import work uses a background lane; the default executor reserves
 one active slot and eight queue positions for interactive work such as GPS.
 
+### Runtime Stream Settings
+
+The standalone CLI and exported multi-device `createRouter` middleware expose
+the same encoder-settings endpoint. The router uses `?device=<serial>` for
+device-scoped requests. The standalone server applies requests to its currently
+selected device and accepts `?device=` when it matches that device.
+
+```sh
+curl "$BASE/api/stream-settings?device=emulator-5554"
+
+curl -X PATCH "$BASE/api/stream-settings?device=emulator-5554" \
+  -H 'Content-Type: application/json' \
+  -d '{"maxDimension":960,"h264Bitrate":6000000,"h264Fps":60}'
+```
+
+`GET /api/stream-settings` returns the active encoder settings:
+
+```json
+{
+  "ok": true,
+  "maxDimension": 1280,
+  "h264Bitrate": 8000000,
+  "h264Fps": 60
+}
+```
+
+`PATCH /api/stream-settings` accepts a non-empty subset of those fields. Values
+must be integers within these bounds:
+
+| Field | Range | Meaning |
+| --- | ---: | --- |
+| `maxDimension` | 0–4096 | Longest encoded edge; `0` disables the size cap |
+| `h264Bitrate` | 100000–50000000 | Target H.264 bitrate in bits per second |
+| `h264Fps` | 1–120 | Maximum encoded frames per second |
+
+A changed setting restarts only the active capture while keeping the device's
+recorded-session state. Middleware clients remain attached and resynchronize on
+the replacement dimensions and a fresh keyframe. The standalone server
+atomically publishes the replacement session, then reconnects existing clients.
+Input is rejected while middleware capture is restarting. A failed replacement
+keeps or restores the previous settings; if replay is active, PATCH returns
+`409` without restarting capture. Shutdown and stopped-session races return
+`503`. Other failures use bounded JSON responses shaped as
+`{"ok":false,"error":"<code>"}` and include a `message` when more detail is
+available. Health includes the authoritative `encoderSettings` snapshot;
+middleware health also includes `captureRestarting`.
+
 AVD lifecycle helpers:
 
 ```sh

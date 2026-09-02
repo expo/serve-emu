@@ -27,6 +27,7 @@ import {
   parseScreenshotBase64Response,
   parseSessionMutationResponse,
   parseSessionSnapshot,
+  parseStreamEncoderSettingsResponse,
   type RoutePlaybackSnapshot,
   type SessionSnapshot,
 } from "../src/shared/api-contracts.ts";
@@ -163,6 +164,29 @@ describe("complete API success contracts", () => {
       ok: true,
       serial: "emulator-5556",
     });
+  });
+
+  test("parses stream encoder settings payloads", () => {
+    expect(
+      parseStreamEncoderSettingsResponse({
+        ok: true,
+        maxDimension: 1280,
+        h264Bitrate: 8_000_000,
+        h264Fps: 60,
+      }),
+    ).toEqual({
+      ok: true,
+      maxDimension: 1280,
+      h264Bitrate: 8_000_000,
+      h264Fps: 60,
+    });
+    expect(() =>
+      parseStreamEncoderSettingsResponse({
+        maxDimension: 1280,
+        h264Bitrate: 8_000_000,
+        h264Fps: 60,
+      }),
+    ).toThrow("response.ok must be true");
   });
 
   test("parses orientation, appearance, and network status payloads", () => {
@@ -404,6 +428,11 @@ describe("generic and detailed API contracts", () => {
       lastErrorCode: "socket",
       lastErrorMeta: { attempt: 2, phase: "connect" },
       sessionGeneration: 3,
+      encoderSettings: {
+        maxDimension: 1280,
+        h264Bitrate: 8_000_000,
+        h264Fps: 60,
+      },
     });
 
     expect(health.frameStats?.intervalMs?.p95).toBe(20.1);
@@ -411,6 +440,11 @@ describe("generic and detailed API contracts", () => {
     expect(health.clientsDetail[0]).toMatchObject({ id: 7, frameMeta: true });
     expect(health.lastErrorMeta).toEqual({ attempt: 2, phase: "connect" });
     expect(health.sessionGeneration).toBe(3);
+    expect(health.encoderSettings).toEqual({
+      maxDimension: 1280,
+      h264Bitrate: 8_000_000,
+      h264Fps: 60,
+    });
   });
 
   test("supports binary screenshots and rejects streaming JSON through the registry", () => {
