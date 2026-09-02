@@ -106,7 +106,7 @@ serve-emu --running-avds
 | --- | --- | --- |
 | `-p, --port` | `3300` | HTTP port for the preview server |
 | `--host` | `127.0.0.1` | Address to bind. Defaults to loopback so the device is not exposed. Set `0.0.0.0` to serve over the LAN — see [Access control](#access-control) |
-| `--token` | none | Shared secret required on every request. Auto-generated for non-loopback binds if omitted |
+| `--token` | none | Shared secret required on every data-bearing request. Auto-generated for non-loopback binds if omitted |
 | `--unsafe-no-auth` | false | Allow a non-loopback bind with **no** authentication (dangerous) |
 | `-s, --serial` | auto | adb device serial; required when multiple devices are online |
 | `--stream-mode` | `scrcpy` | Screen and input source: `scrcpy`, or emulator-only host capture through `grpc-screenshot` |
@@ -144,7 +144,7 @@ By default, `serve-emu` attaches to the only online device. If more than one dev
 
 **Exposing over the LAN or a tunnel.** Pass `--host 0.0.0.0` (or a specific interface address). A non-loopback bind **requires authentication**:
 
-- If you pass `--token <secret>`, that secret is required on every request.
+- If you pass `--token <secret>`, that secret is required on every data-bearing request. The origin-checked `OPTIONS /webrtc/stats` CORS preflight is the only exception: it returns no statistics and lets browsers issue the bearer-authenticated cross-origin `GET`.
 - If you omit `--token`, a random token is generated and printed once at startup.
 
 The startup line prints a ready-to-use URL with the token, for example:
@@ -158,7 +158,7 @@ How clients authenticate:
 - **Browser (bundled UI):** open the printed `?token=` URL once. The server exchanges the token for a `HttpOnly; SameSite=Strict` session cookie and redirects to a clean URL, so the secret is not kept in local storage or the address bar. Same-origin API, SSE, and WebSocket calls then carry the cookie automatically.
 - **Agents / CLI (`curl`, HTTP clients):** send `Authorization: Bearer <token>`, or append `?token=<token>` to the URL.
 
-Requests without a valid token get `401`; WebSocket upgrades and state-changing requests from a mismatched `Origin` get `403` before any work is done.
+Data-bearing requests without a valid token get `401`; WebSocket upgrades and state-changing requests from a mismatched `Origin` get `403` before any work is done.
 
 **Unauthenticated LAN exposure.** `--host 0.0.0.0 --unsafe-no-auth` binds to all interfaces with no authentication. Anyone who can reach the port can control the device. Only use this on a trusted, isolated network; the CLI prints a warning at startup.
 

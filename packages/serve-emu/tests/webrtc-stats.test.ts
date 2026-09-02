@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 
 import type { WebRtcPublisherSessionStats } from "../src/webrtc-publisher.ts";
 import {
-  buildWebRtcStatsReport,
   handleWebRtcStatsRequest,
+  WebRtcStatsCollector,
   type WebRtcStatsReport,
 } from "../src/webrtc-stats.ts";
 
@@ -25,40 +25,42 @@ const publisherSession: WebRtcPublisherSessionStats = {
 };
 
 describe("serve-emu WebRTC stats report", () => {
-  test("keeps shared scrcpy output separate from viewer publisher counters", () => {
-    expect(
-      buildWebRtcStatsReport(
-        {
-          codec: "h264",
-          width: 1080,
-          height: 2400,
-          frames: 1_200,
-          fps: 29,
-          configuredBitrateBps: 8_000_000,
-        },
-        publisherSession,
-        { offeredFrames: 1_200, forwardedFrames: 1_190 },
-        42,
-      ),
-    ).toEqual({
-      sampledAt: 42,
-      source: {
-        codec: "h264",
-        width: 1080,
-        height: 2400,
-        frames: 1_200,
-        fps: 29,
-        configuredBitrateBps: 8_000_000,
-      },
-      sessions: [publisherSession],
-      capture: { offeredFrames: 1_200, forwardedFrames: 1_190 },
-    });
-  });
+  test("owns capture accounting and viewer-scoped report assembly", () => {
+    const collector = new WebRtcStatsCollector(() => 42);
+    collector.recordDelivery(undefined);
+    collector.recordDelivery({ accepted: true, awaitingKeyFrame: false });
+    collector.recordDelivery({ accepted: false, awaitingKeyFrame: true });
+    const publisher = {
+      statsForSession: (sessionId: string) =>
+        sessionId === SESSION_ID ? publisherSession : null,
+    };
+    const source = {
+      codec: "h264",
+      width: 1080,
+      height: 2400,
+      frames: 1_200,
+      fps: 29,
+      configuredBitrateBps: 8_000_000,
+    };
 
+    expect(collector.report(source, publisher, SESSION_ID)).toEqual({
+      sampledAt: 42,
+      source,
+      sessions: [publisherSession],
+      capture: { offeredFrames: 2, forwardedFrames: 1 },
+    });
+    expect(
+      collector.report(
+        source,
+        publisher,
+        "11111111-1111-4111-8111-111111111111",
+      ),
+    ).toBeNull();
+  });
 });
 
 describe("GET /webrtc/stats", () => {
-  const report = buildWebRtcStatsReport(
+  const report = new WebRtcStatsCollector(() => 42).report(
     {
       codec: "h264",
       width: 1080,
@@ -67,10 +69,9 @@ describe("GET /webrtc/stats", () => {
       fps: 29,
       configuredBitrateBps: 8_000_000,
     },
-    publisherSession,
-    { offeredFrames: 1_200, forwardedFrames: 1_190 },
-    42,
-  );
+    { statsForSession: () => publisherSession },
+    SESSION_ID,
+  )!;
 
   function request(
     path = `/webrtc/stats?sessionId=${SESSION_ID}`,

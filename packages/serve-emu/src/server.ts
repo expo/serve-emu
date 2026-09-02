@@ -149,7 +149,10 @@ import {
   STREAM_MODES,
   type StreamMode,
 } from "./shared/api-contracts.ts";
-import { buildWebRtcStatsReport, handleWebRtcStatsRequest } from "./webrtc-stats.ts";
+import {
+  handleWebRtcStatsRequest,
+  WebRtcStatsCollector,
+} from "./webrtc-stats.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "dist", "ui");
@@ -577,6 +580,17 @@ export async function startServer(
     SessionRecoveryWatchdog<RecoveryClientState>
   >();
   const publishers = new WeakMap<DeviceContext, WebRtcPublisherLike>();
+  const webRtcStatsCollectors = new WeakMap<
+    DeviceContext,
+    WebRtcStatsCollector
+  >();
+  const webRtcStatsCollectorFor = (context: DeviceContext) => {
+    const existing = webRtcStatsCollectors.get(context);
+    if (existing) return existing;
+    const created = new WebRtcStatsCollector(() => recoveryClock.now());
+    webRtcStatsCollectors.set(context, created);
+    return created;
+  };
   const publisherTasks = new WeakMap<
     DeviceContext,
     Promise<WebRtcPublisherLike>
@@ -688,16 +702,8 @@ export async function startServer(
     ) {
       return null;
     }
-    const publisherSessions = publisher.statsForSession(sessionId);
-    const publisherSession = publisherSessions[0];
-    if (
-      publisherSessions.length !== 1 ||
-      publisherSession?.sessionId !== sessionId
-    ) {
-      return null;
-    }
     const sourceFps = recoveries.get(context)?.snapshot(recoveryClock.now()).sourceFps ?? 0;
-    return buildWebRtcStatsReport(
+    return webRtcStatsCollectorFor(context).report(
       {
         codec: context.stream.meta.codecId,
         width: context.screen.width,
@@ -706,11 +712,8 @@ export async function startServer(
         fps: sourceFps,
         configuredBitrateBps: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
       },
-      publisherSession,
-      {
-        offeredFrames: context.webRtcOfferedFrames,
-        forwardedFrames: context.webRtcForwardedFrames,
-      },
+      publisher,
+      sessionId,
     );
   };
 
@@ -1455,9 +1458,8 @@ export async function startServer(
           context.frameStats.record(f.data.length, f.isKey);
           const config = f.isKey ? context.cachedConfig : null;
           const publisher = publishers.get(context);
-          if (publisher) context.webRtcOfferedFrames++;
           const webRtcDelivery = publisher?.sendFrame(f, config);
-          if (webRtcDelivery?.accepted) context.webRtcForwardedFrames++;
+          webRtcStatsCollectorFor(context).recordDelivery(webRtcDelivery);
           if (
             f.isKey &&
             webRtcDelivery?.accepted &&

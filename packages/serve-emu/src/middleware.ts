@@ -91,8 +91,8 @@ import {
   type StreamModeResponse,
 } from "./shared/api-contracts.ts";
 import {
-  buildWebRtcStatsReport,
   handleWebRtcStatsRequest,
+  WebRtcStatsCollector,
   WebRtcStatsRequestError,
 } from "./webrtc-stats.ts";
 
@@ -333,8 +333,6 @@ async function createAppInternal(
   let totalBackpressureEvents = 0;
   let sourceFps = 0;
   let lastFpsFrameCount = 0;
-  let webRtcOfferedFrames = 0;
-  let webRtcForwardedFrames = 0;
   let videoResetRequests = 0;
   let lastVideoResetAt: string | null = null;
   let lastVideoResetReason: string | null = null;
@@ -344,6 +342,7 @@ async function createAppInternal(
   let watchdog: unknown | null = null;
   let nextClientId = 1;
   let webRtcPublisher: WebRtcPublisher | null = null;
+  const webRtcStatsCollector = new WebRtcStatsCollector(() => clock.now());
   let removeFatalListener: (() => void) | null = null;
   const deviceStateOwner = {};
   const deviceState =
@@ -414,15 +413,7 @@ async function createAppInternal(
 
   const webRtcStats = (sessionId: string) => {
     if (streamSettings.transport !== "webrtc" || !webRtcPublisher) return null;
-    const publisherSessions = webRtcPublisher.statsForSession(sessionId);
-    const publisherSession = publisherSessions[0];
-    if (
-      publisherSessions.length !== 1 ||
-      publisherSession?.sessionId !== sessionId
-    ) {
-      return null;
-    }
-    return buildWebRtcStatsReport(
+    return webRtcStatsCollector.report(
       {
         codec: session.meta.codecId,
         width: screen.width,
@@ -431,11 +422,8 @@ async function createAppInternal(
         fps: sourceFps,
         configuredBitrateBps: streamEncoderSettings.h264Bitrate,
       },
-      publisherSession,
-      {
-        offeredFrames: webRtcOfferedFrames,
-        forwardedFrames: webRtcForwardedFrames,
-      },
+      webRtcPublisher,
+      sessionId,
     );
   };
 
@@ -816,12 +804,9 @@ async function createAppInternal(
           frameCount++;
           lastFrameMs = Date.now();
           const config = f.isKey ? cachedConfig : null;
-          if (webRtcPublisher) {
-            webRtcOfferedFrames++;
-            if (webRtcPublisher.sendFrame(f, config).accepted) {
-              webRtcForwardedFrames++;
-            }
-          }
+          webRtcStatsCollector.recordDelivery(
+            webRtcPublisher?.sendFrame(f, config),
+          );
           let rawOut: Buffer | null = null;
           let framedOut: Buffer | null = null;
           for (const c of clients) {

@@ -1,4 +1,8 @@
-import type { WebRtcPublisherSessionStats } from "./webrtc-publisher.ts";
+import type {
+  WebRtcFrameDelivery,
+  WebRtcPublisher,
+  WebRtcPublisherSessionStats,
+} from "./webrtc-publisher.ts";
 import {
   corsHeadersForRequest,
   isAllowedBrowserOrigin,
@@ -51,19 +55,40 @@ export class WebRtcStatsRequestError extends Error {
   }
 }
 
-/** Build a narrow report without exposing serve-emu's broad health/session diagnostics. */
-export function buildWebRtcStatsReport(
-  source: WebRtcSourceStats,
-  publisherSession: WebRtcPublisherSessionStats,
-  capture: WebRtcStatsReport["capture"],
-  sampledAt = Date.now(),
-): WebRtcStatsReport {
-  return {
-    sampledAt,
-    source: { ...source },
-    sessions: [{ ...publisherSession }],
-    capture: { ...capture },
-  };
+/**
+ * Own capture accounting and viewer-scoped report assembly for one source.
+ * A missing delivery means no publisher was offered the source frame.
+ */
+export class WebRtcStatsCollector {
+  #offeredFrames = 0;
+  #forwardedFrames = 0;
+
+  constructor(private readonly now: () => number = Date.now) {}
+
+  recordDelivery(delivery: WebRtcFrameDelivery | null | undefined): void {
+    if (!delivery) return;
+    this.#offeredFrames++;
+    if (delivery.accepted) this.#forwardedFrames++;
+  }
+
+  /** Build a narrow report without exposing broad health/session diagnostics. */
+  report(
+    source: WebRtcSourceStats,
+    publisher: Pick<WebRtcPublisher, "statsForSession">,
+    sessionId: string,
+  ): WebRtcStatsReport | null {
+    const publisherSession = publisher.statsForSession(sessionId);
+    if (!publisherSession) return null;
+    return {
+      sampledAt: this.now(),
+      source: { ...source },
+      sessions: [{ ...publisherSession }],
+      capture: {
+        offeredFrames: this.#offeredFrames,
+        forwardedFrames: this.#forwardedFrames,
+      },
+    };
+  }
 }
 
 const errorMessage = (error: unknown): string =>

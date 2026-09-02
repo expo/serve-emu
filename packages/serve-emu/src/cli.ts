@@ -187,8 +187,9 @@ Options:
       --host <addr>      Address to bind (default: 127.0.0.1, loopback only).
                          Use 0.0.0.0 to expose over the LAN — this requires
                          authentication (see --token) unless --unsafe-no-auth.
-      --token <secret>   Require this shared secret on every request. Browsers
-                         authenticate by opening the printed ?token= URL once
+      --token <secret>   Require this secret on every data-bearing request.
+                         Browsers authenticate by opening the printed
+                         ?token= URL once
                          (exchanged for an HttpOnly cookie); agents send
                          'Authorization: Bearer <secret>'. On a non-loopback
                          bind a token is generated automatically if omitted.

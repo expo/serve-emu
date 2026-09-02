@@ -122,8 +122,8 @@ function fakeWebRtcPublisher(): WebRtcPublisher {
     path: "direct",
   };
   return {
-    statsForSession: (sessionId?: string | null) =>
-      sessionId === SESSION_ID ? [stats] : [],
+    statsForSession: (sessionId: string) =>
+      sessionId === SESSION_ID ? stats : null,
     sendFrame: () => ({ accepted: true, awaitingKeyFrame: false }),
     snapshot: () => ({
       peers: 1,

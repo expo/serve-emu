@@ -572,30 +572,30 @@ describe("WebRTC publisher signaling", () => {
     publisher.sendFrame(frame([4, 5], false), null);
     publisher.sendFrame(frame([6], false), null);
 
-    expect(publisher.statsForSession(sessionId)).toEqual([
-      {
-        sessionId,
-        state: "connected",
-        iceState: "completed",
-        connected: true,
-        submittedFrames: 2,
-        publisherDroppedFrames: 1,
-        payloadBytesSubmitted: 7,
-        localCandidateType: "host",
-        remoteCandidateType: "relay",
-        localCandidateTransport: "udp",
-        remoteCandidateTransport: "tcp",
-        path: "relay",
-      },
-    ]);
-    expect(publisher.statsForSession("11111111-1111-4111-8111-111111111111")).toEqual([]);
+    expect(publisher.statsForSession(sessionId)).toEqual({
+      sessionId,
+      state: "connected",
+      iceState: "completed",
+      connected: true,
+      submittedFrames: 2,
+      publisherDroppedFrames: 1,
+      payloadBytesSubmitted: 7,
+      localCandidateType: "host",
+      remoteCandidateType: "relay",
+      localCandidateTransport: "udp",
+      remoteCandidateTransport: "tcp",
+      path: "relay",
+    });
+    expect(
+      publisher.statsForSession("11111111-1111-4111-8111-111111111111"),
+    ).toBeNull();
 
     connection.selectedCandidatePair.local.type = "unknown";
     connection.selectedCandidatePair.remote.type = "host";
-    expect(publisher.statsForSession(sessionId)[0]?.path).toBe("unknown");
+    expect(publisher.statsForSession(sessionId)?.path).toBe("unknown");
 
     connection.selectedCandidatePair.local.type = "srflx";
-    expect(publisher.statsForSession(sessionId)[0]?.path).toBe("direct");
+    expect(publisher.statsForSession(sessionId)?.path).toBe("direct");
     publisher.close();
   });
 

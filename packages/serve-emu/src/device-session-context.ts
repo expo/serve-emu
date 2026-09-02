@@ -83,8 +83,6 @@ export class ActiveDeviceSession<
   totalBackpressureEvents = 0;
   sourceFps = 0;
   lastFpsFrameCount = 0;
-  webRtcOfferedFrames = 0;
-  webRtcForwardedFrames = 0;
   videoResetRequests = 0;
   lastVideoResetAt: string | null = null;
   lastVideoResetReason: string | null = null;

@@ -404,12 +404,8 @@ export class WebRtcPublisher {
     for (const peer of this.peers.values()) peer.resetVideoSource();
   }
 
-  statsForSession(sessionId?: string | null): WebRtcPublisherSessionStats[] {
-    if (sessionId != null) {
-      const peer = this.peers.get(sessionId);
-      return peer ? [peer.statsSnapshot()] : [];
-    }
-    return Array.from(this.peers.values(), (peer) => peer.statsSnapshot());
+  statsForSession(sessionId: string): WebRtcPublisherSessionStats | null {
+    return this.peers.get(sessionId)?.statsSnapshot() ?? null;
   }
 
   snapshot() {

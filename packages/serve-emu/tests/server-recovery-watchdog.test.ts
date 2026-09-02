@@ -218,14 +218,14 @@ class FakeWebRtcPublisher {
 
   resetVideoSource(): void {}
 
-  statsForSession(sessionId?: string | null) {
+  statsForSession(sessionId: string) {
     if (
       this.sessionId === null ||
-      (sessionId != null && sessionId !== this.sessionId)
+      sessionId !== this.sessionId
     ) {
-      return [];
+      return null;
     }
-    return [{
+    return {
       sessionId: this.sessionId,
       state: "connected",
       iceState: "connected",
@@ -241,7 +241,7 @@ class FakeWebRtcPublisher {
       localCandidateTransport: null,
       remoteCandidateTransport: null,
       path: "unknown" as const,
-    }];
+    };
   }
 
   snapshot() {
