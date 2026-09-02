@@ -1,6 +1,10 @@
 import type { ApiDependencies } from "../dependencies.ts";
 import type { ContractApiRoute } from "./types.ts";
-import { isStreamMode } from "../../shared/api-contracts.ts";
+import {
+  GRPC_IMAGE_MODES,
+  isGrpcImageMode,
+  isStreamMode,
+} from "../../shared/api-contracts.ts";
 import {
   downstream,
   invalid,
@@ -29,8 +33,26 @@ export function deviceRoutes(): ContractApiRoute<ApiDependencies>[] {
         if (!isStreamMode(mode)) {
           invalid("mode must be scrcpy or grpc-screenshot");
         }
+        const grpcImageMode = body.grpcImageMode;
+        if (
+          grpcImageMode !== undefined &&
+          !isGrpcImageMode(grpcImageMode)
+        ) {
+          invalid(
+            `grpcImageMode must be one of: ${GRPC_IMAGE_MODES.join(", ")}`,
+          );
+        }
+        if (grpcImageMode !== undefined && mode !== "grpc-screenshot") {
+          invalid("grpcImageMode is available only with mode grpc-screenshot");
+        }
         return Response.json(
-          await downstream("switch stream mode", () => deps.setStreamMode(mode)),
+          await downstream("switch stream mode", () =>
+            deps.setStreamMode(
+              mode === "grpc-screenshot"
+                ? { mode, grpcImageMode }
+                : { mode },
+            )
+          ),
         );
       },
     },

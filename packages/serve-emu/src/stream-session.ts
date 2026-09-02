@@ -6,7 +6,7 @@ import {
   type StartOpts,
   type VideoPacket,
 } from "./scrcpy.ts";
-import type { StreamMode } from "./shared/api-contracts.ts";
+import type { GrpcImageMode, StreamMode } from "./shared/api-contracts.ts";
 import { isAbnormalExit, procExitDetail } from "./session-status.ts";
 
 export type StreamFailure = {
@@ -28,20 +28,50 @@ export type RollingTimingSummary = {
 
 /** Cumulative and rolling diagnostics for emulator gRPC screenshot capture. */
 export type GrpcCaptureDiagnostics = {
-  /** Raw framed protobuf messages parsed before the pacing/coalescing stage. */
+  /** Exact screenshot image/delivery strategy selected by the caller. */
+  imageMode: GrpcImageMode;
+  /** Raw framed protobuf messages received before either pacing stage. */
   rawGrpcMessagesReceived: number;
-  /** Raw messages released by the pacer for protobuf decoding. */
+  /** PNG messages decoded by the raw pacer, or MMAP notifications selected for a snapshot. */
   rawGrpcMessagesEmitted: number;
-  /** Pending raw messages replaced by a newer message in the same pacing window. */
+  /** PNG messages replaced by a newer one, or MMAP notifications dropped/replaced by pacing. */
   rawGrpcMessagesCoalesced: number;
-  /** Decoded RGB images with complete, encoder-usable payloads. */
+  /** Complete PNG or RGB images made available to the encoder. */
   usableImages: number;
+  /** Emulator production cadence derived from source timestamps. */
+  sourceTimestampFps: number | null;
+  /** Raw framed message cadence before pacing/coalescing. */
+  rawMessageReceiveFps: number | null;
+  /** Complete source images made available to the encoder. */
+  usableImageFps: number | null;
+  /** Accepted fresh ffmpeg writes, excluding intentional repeats. */
+  freshEncoderWriteFps: number | null;
   /** Missing emulator-produced sequence numbers observed between usable images. */
   sequenceGaps: number;
-  /** Rolling intervals derived from the emulator's production timestamps. */
+  /** Latest PNG or RGB source payload presented to ffmpeg. */
+  imagePayloadBytes: number;
+  /** Cumulative logical PNG or RGB bytes accepted from the selected transport. */
+  transportBytes: number;
+  /** Cumulative protobuf body bytes received, excluding gRPC frame prefixes. */
+  grpcMessageBytesReceived: number;
+  /** Cumulative positional file-read bytes, including verification and retries. */
+  mmapFileBytesRead: number;
+  /** Additional MMAP read pairs needed after a changing region was observed. */
+  mmapReadRetries: number;
+  /** MMAP notifications dropped after every bounded read attempt differed. */
+  mmapTornFramesDropped: number;
+  /** Rolling sequence-weighted per-produced-frame intervals. */
   sourceTimestampIntervalMs: RollingTimingSummary | null;
+  /** Rolling raw framed-message arrival intervals. */
+  rawMessageReceiveIntervalMs: RollingTimingSummary | null;
   /** Rolling emulator-production-to-host-receive latency. */
   productionToReceiveLatencyMs: RollingTimingSummary | null;
+  /** Rolling notification-timestamp-to-complete-source-image latency estimate. */
+  productionToUsableLatencyMs: RollingTimingSummary | null;
+  /** Time to decode each Image protobuf processed by the selected transport. */
+  protobufDecodeTimeMs: RollingTimingSummary | null;
+  /** Time to obtain and compare a best-effort coherent MMAP snapshot. */
+  sharedReadCopyTimeMs: RollingTimingSummary | null;
   freshEncoderWriteAttempts: number;
   repeatEncoderWriteAttempts: number;
   acceptedEncoderWrites: number;
@@ -75,6 +105,8 @@ export type EmuSession = {
 export type StartEmuSessionOptions = StartOpts & {
   /** Exact source selection. This factory never silently falls back. */
   mode: StreamMode;
+  /** Exact emulator screenshot image mode. Capture never silently falls back. */
+  grpcImageMode: GrpcImageMode;
 };
 
 export async function startEmuSession(
@@ -107,10 +139,7 @@ export function adaptScrcpySession(
     if (closed) return;
     for (const listener of listeners) listener(failure);
   };
-  const onExit = (
-    code: number | null,
-    signal: NodeJS.Signals | null,
-  ) => {
+  const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
     if (!isAbnormalExit(code, signal)) return;
     const { reason, ...detail } = procExitDetail(code, signal);
     emitFatal({ message: reason, ...detail });

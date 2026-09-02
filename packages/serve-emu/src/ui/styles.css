@@ -669,6 +669,16 @@ input[type="checkbox"] {
   padding: 0;
   border: 0;
 }
+.grpc-image-mode-fieldset {
+  margin-top: 12px;
+}
+.grpc-image-mode-fieldset legend {
+  margin-bottom: 6px;
+  padding: 0;
+  color: #c7c7cc;
+  font-size: 11px;
+  font-weight: 600;
+}
 .stream-mode-options {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

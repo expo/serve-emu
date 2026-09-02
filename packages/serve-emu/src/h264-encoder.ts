@@ -12,15 +12,19 @@ import type { VideoFrame } from "./scrcpy.ts";
 /**
  * Host-side H.264 encoder used by the emulator gRPC screenshot source.
  *
- * Raw RGB frames enter through stdin and ffmpeg/libx264 writes Annex-B H.264
- * to stdout. `aud=1` gives the parser an explicit access-unit boundary, while
- * zerolatency and disabled B-frames keep input timestamps paired with output
- * access units in submission order.
+ * RGB frames or complete PNG images enter through stdin and ffmpeg/libx264
+ * writes Annex-B H.264 to stdout. `aud=1` gives the parser an explicit
+ * access-unit boundary, while zerolatency and disabled B-frames keep input
+ * timestamps paired with output access units in submission order.
  */
+
+export type H264EncoderInputFormat = "rgb24" | "png";
 
 export type H264EncoderOpts = {
   width: number;
   height: number;
+  /** Input written to ffmpeg. Defaults to fixed-size raw RGB frames. */
+  inputFormat?: H264EncoderInputFormat;
   /** Android display rotation quarter turns applied before encoding. */
   quarterTurn?: QuarterTurn;
   fps: number;
@@ -41,6 +45,7 @@ const NAL_AUD = 9;
 const START_CODE = Buffer.from([0, 0, 0, 1]);
 const MAX_PENDING_OUTPUT_BYTES = 64 * 1024 * 1024;
 const MAX_RAW_FRAME_BYTES = 512 * 1024 * 1024;
+const MAX_PNG_FRAME_BYTES = 64 * 1024 * 1024;
 const MAX_DIMENSION = 16_384;
 const MAX_FPS = 1_000;
 const MAX_BIT_RATE = 0x7fff_ffff;
@@ -72,7 +77,7 @@ function positiveInteger(value: number, name: string, max: number): number {
   return value;
 }
 
-function validateOptions(opts: H264EncoderOpts): number {
+function validateOptions(opts: H264EncoderOpts): number | null {
   const width = positiveInteger(opts.width, "width", MAX_DIMENSION);
   const height = positiveInteger(opts.height, "height", MAX_DIMENSION);
   if (width < 2 || height < 2) {
@@ -98,13 +103,59 @@ function validateOptions(opts: H264EncoderOpts): number {
     throw new RangeError("quarterTurn must be an integer from 0 through 3");
   }
 
+  const inputFormat = opts.inputFormat ?? "rgb24";
+  if (inputFormat !== "rgb24" && inputFormat !== "png") {
+    throw new RangeError(`unsupported H.264 encoder input format ${inputFormat}`);
+  }
+
   const bytes = width * height * 3;
   if (!Number.isSafeInteger(bytes) || bytes > MAX_RAW_FRAME_BYTES) {
     throw new RangeError(
       `raw RGB frame must not exceed ${MAX_RAW_FRAME_BYTES} bytes`,
     );
   }
-  return bytes;
+  return inputFormat === "rgb24" ? bytes : null;
+}
+
+export function ffmpegInputArgs(
+  inputFormat: H264EncoderInputFormat,
+  width: number,
+  height: number,
+  fps: number,
+): string[] {
+  if (inputFormat === "png") {
+    return [
+      "-probesize",
+      "32",
+      "-analyzeduration",
+      "0",
+      "-max_probe_packets",
+      "1",
+      "-f",
+      "image2pipe",
+      "-framerate",
+      String(fps),
+      "-c:v",
+      "png",
+      "-i",
+      "pipe:0",
+    ];
+  }
+  if (inputFormat !== "rgb24") {
+    throw new RangeError(`unsupported H.264 encoder input format ${inputFormat}`);
+  }
+  return [
+    "-f",
+    "rawvideo",
+    "-pix_fmt",
+    "rgb24",
+    "-video_size",
+    `${width}x${height}`,
+    "-framerate",
+    String(fps),
+    "-i",
+    "pipe:0",
+  ];
 }
 
 export function videoFilter(quarterTurn: QuarterTurn): string {
@@ -351,10 +402,11 @@ export class H264Encoder {
   readonly quarterTurn: QuarterTurn;
   readonly encodedWidth: number;
   readonly encodedHeight: number;
+  readonly inputFormat: H264EncoderInputFormat;
   readonly #opts: H264EncoderOpts;
   readonly #proc: ChildProcessWithoutNullStreams;
   readonly #parser: H264OutputParser;
-  readonly #inputFrameBytes: number;
+  readonly #inputFrameBytes: number | null;
   readonly #processDone: Promise<void>;
   #resolveProcessDone!: () => void;
   #closed = false;
@@ -366,6 +418,7 @@ export class H264Encoder {
     this.#opts = opts;
     this.width = opts.width;
     this.height = opts.height;
+    this.inputFormat = opts.inputFormat ?? "rgb24";
     this.quarterTurn = opts.quarterTurn ?? 0;
     const croppedWidth = opts.width - (opts.width % 2);
     const croppedHeight = opts.height - (opts.height % 2);
@@ -397,16 +450,12 @@ export class H264Encoder {
         "-hide_banner",
         "-loglevel",
         "error",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-video_size",
-        `${opts.width}x${opts.height}`,
-        "-framerate",
-        String(opts.fps),
-        "-i",
-        "pipe:0",
+        ...ffmpegInputArgs(
+          this.inputFormat,
+          opts.width,
+          opts.height,
+          opts.fps,
+        ),
         "-an",
         "-vf",
         videoFilter(this.quarterTurn),
@@ -462,11 +511,29 @@ export class H264Encoder {
     });
   }
 
-  /** Feed one rgb24 frame; false means it was not submitted due to backpressure. */
-  write(rgb: Buffer, ptsUs: bigint): boolean {
-    if (!Buffer.isBuffer(rgb) || rgb.length !== this.#inputFrameBytes) {
+  /** Feed one complete source image; false means backpressure rejected it. */
+  write(image: Buffer, ptsUs: bigint): boolean {
+    if (!Buffer.isBuffer(image)) {
+      throw new TypeError("encoder input must be a Buffer");
+    }
+    if (
+      this.inputFormat === "rgb24" &&
+      image.length !== this.#inputFrameBytes
+    ) {
       throw new RangeError(
         `rgb frame must be a ${this.#inputFrameBytes}-byte Buffer (${this.width}x${this.height} rgb24)`,
+      );
+    }
+    if (
+      this.inputFormat === "png" &&
+      (image.length < 8 ||
+        image.length > MAX_PNG_FRAME_BYTES ||
+        !image.subarray(0, 8).equals(
+          Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+        ))
+    ) {
+      throw new RangeError(
+        `png frame must be a complete PNG Buffer of at most ${MAX_PNG_FRAME_BYTES} bytes`,
       );
     }
     if (typeof ptsUs !== "bigint" || ptsUs < 0n) {
@@ -482,7 +549,7 @@ export class H264Encoder {
     try {
       // A false return from Writable.write means "accepted, wait for drain",
       // not "rejected", so every successful call receives a PTS entry.
-      this.#proc.stdin.write(rgb);
+      this.#proc.stdin.write(image);
       this.#parser.enqueuePts(ptsUs);
       return true;
     } catch (error) {

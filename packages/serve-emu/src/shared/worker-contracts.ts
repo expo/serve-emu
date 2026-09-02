@@ -1,4 +1,4 @@
-import type { DeviceSize } from "./api-contracts";
+import type { DeviceSize } from "./api-contracts.ts";
 
 export type StreamStats = {
   fps: number;

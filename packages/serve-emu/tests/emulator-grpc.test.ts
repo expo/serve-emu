@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
   decodeEmulatorImage,
+  encodeImageFormat,
   encodeKeyboardEvent,
   GrpcMessagePacer,
   GrpcMessageParser,
+  IMAGE_TRANSPORT_MMAP,
+  IMG_FORMAT_RGB888,
   parseEmulatorGrpcPort,
 } from "../src/emulator-grpc.ts";
 
@@ -181,6 +184,68 @@ describe("emulator gRPC discovery", () => {
 });
 
 describe("emulator image protobuf", () => {
+  test("encodes ImageFormat.transport field 6 with an MMAP file handle", () => {
+    expect(
+      encodeImageFormat({
+        format: IMG_FORMAT_RGB888,
+        width: 3,
+        height: 4,
+        transport: {
+          channel: IMAGE_TRANSPORT_MMAP,
+          handle: "file:///tmp/x",
+        },
+      }),
+    ).toEqual(
+      Buffer.from([
+        0x08, 0x02,
+        0x18, 0x03,
+        0x20, 0x04,
+        0x32, 0x11,
+        0x08, 0x01,
+        0x12, 0x0d,
+        ...Buffer.from("file:///tmp/x"),
+      ]),
+    );
+  });
+
+  test("requires a client-owned file URL for MMAP", () => {
+    expect(() =>
+      encodeImageFormat({
+        format: IMG_FORMAT_RGB888,
+        transport: { channel: IMAGE_TRANSPORT_MMAP, handle: "/tmp/x" },
+      }),
+    ).toThrow("requires a file:/// handle");
+  });
+
+  test("decodes metadata-only MMAP image notifications with empty bytes", () => {
+    const format = Buffer.from([
+      0x08, 0x02,
+      0x18, 0x03,
+      0x20, 0x04,
+      0x32, 0x11,
+      0x08, 0x01,
+      0x12, 0x0d,
+      ...Buffer.from("file:///tmp/x"),
+    ]);
+    const image = decodeEmulatorImage(
+      Buffer.from([
+        0x0a, format.length,
+        ...format,
+        0x28, 0x07,
+        0x30, 0x7b,
+      ]),
+    );
+
+    expect(image).toMatchObject({
+      format: IMG_FORMAT_RGB888,
+      width: 3,
+      height: 4,
+      seq: 7,
+      timestampUs: 123n,
+    });
+    expect(image.image).toHaveLength(0);
+  });
+
   test("rejects truncated length-delimited fields", () => {
     expect(() => decodeEmulatorImage(Buffer.from([0x0a, 0x05, 0x08]))).toThrow(
       "truncated protobuf length-delimited field",

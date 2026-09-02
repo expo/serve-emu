@@ -25,7 +25,7 @@ import type {
   RoutePlaybackRequest,
   RoutePlaybackSnapshot,
   SessionSnapshot,
-  StreamMode,
+  StreamModeRequest,
   StreamModeResponse,
 } from "../shared/api-contracts.ts";
 
@@ -42,7 +42,7 @@ export type RouteControlAction = ApiRequest<
 export type ApiDependencies = {
   getInfo: () => ApiInfoResponse;
   getStreamMode: () => StreamModeResponse;
-  setStreamMode: (mode: StreamMode) => Promise<StreamModeResponse>;
+  setStreamMode: (request: StreamModeRequest) => Promise<StreamModeResponse>;
   listDevices: () => Promise<DeviceListResponse>;
   getDeviceGrid: () => Promise<DeviceGridResponse>;
   selectDevice: (serial: string) => Promise<DeviceSelectionResponse>;

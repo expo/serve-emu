@@ -372,18 +372,47 @@ function* protoFields(buffer: Buffer): Generator<ProtoField> {
 export const IMG_FORMAT_PNG = 0;
 export const IMG_FORMAT_RGBA8888 = 1;
 export const IMG_FORMAT_RGB888 = 2;
+export const IMAGE_TRANSPORT_UNSPECIFIED = 0;
+export const IMAGE_TRANSPORT_MMAP = 1;
+
+export type ImageTransportRequest = {
+  channel: typeof IMAGE_TRANSPORT_UNSPECIFIED | typeof IMAGE_TRANSPORT_MMAP;
+  handle?: string;
+};
 
 export type ImageFormatRequest = {
   format: number;
   width?: number;
   height?: number;
+  transport?: ImageTransportRequest;
 };
 
-function encodeImageFormat(request: ImageFormatRequest): Buffer {
+function encodeImageTransport(request: ImageTransportRequest): Buffer {
+  if (
+    request.channel !== IMAGE_TRANSPORT_UNSPECIFIED &&
+    request.channel !== IMAGE_TRANSPORT_MMAP
+  ) {
+    throw new RangeError(`unsupported image transport channel ${request.channel}`);
+  }
+  if (request.channel === IMAGE_TRANSPORT_MMAP) {
+    if (!request.handle?.startsWith("file:///")) {
+      throw new Error("MMAP image transport requires a file:/// handle");
+    }
+  }
+  const output: number[] = [];
+  varintField(output, 1, request.channel);
+  stringField(output, 2, request.handle ?? "");
+  return Buffer.from(output);
+}
+
+export function encodeImageFormat(request: ImageFormatRequest): Buffer {
   const output: number[] = [];
   varintField(output, 1, request.format);
   varintField(output, 3, request.width ?? 0);
   varintField(output, 4, request.height ?? 0);
+  if (request.transport) {
+    lenField(output, 6, encodeImageTransport(request.transport));
+  }
   return Buffer.from(output);
 }
 
@@ -611,6 +640,18 @@ export type GrpcMessagePacingEvent =
   | "emitted"
   | "coalesced";
 
+export type GrpcMessagePacingDetail = {
+  /** Protobuf body size, excluding the five-byte gRPC frame prefix. */
+  messageBytes: number;
+  /** Time retained by the client pacer before emission or replacement. */
+  pacingDelayMs: number;
+};
+
+export type GrpcImageDecodeEvent = {
+  messageBytes: number;
+  decodeMs: number;
+};
+
 const SYSTEM_PACING_CLOCK: GrpcMessagePacingClock = {
   now: () => performance.now(),
   setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
@@ -628,12 +669,18 @@ export class GrpcMessagePacer {
   readonly #parser: GrpcMessageParser;
   readonly #messageIntervalMs: number;
   readonly #onMessage: (message: Buffer, receivedAtMs: number) => void;
-  readonly #onPacingEvent: ((event: GrpcMessagePacingEvent) => void) | undefined;
+  readonly #onPacingEvent:
+    | ((event: GrpcMessagePacingEvent, detail: GrpcMessagePacingDetail) => void)
+    | undefined;
   readonly #onError: (error: Error) => void;
   readonly #clock: GrpcMessagePacingClock;
   readonly #signal: AbortSignal | undefined;
   readonly #onAbort = () => this.close();
-  #pendingMessage: { message: Buffer; receivedAtMs: number } | null = null;
+  #pendingMessage: {
+    message: Buffer;
+    receivedAtMs: number;
+    receivedAtMonotonicMs: number;
+  } | null = null;
   #timer: unknown = null;
   #nextMessageAt: number | null = null;
   #paused = false;
@@ -644,7 +691,10 @@ export class GrpcMessagePacer {
     maxMessageBytes: number;
     messageIntervalMs: number;
     onMessage: (message: Buffer, receivedAtMs: number) => void;
-    onPacingEvent?: (event: GrpcMessagePacingEvent) => void;
+    onPacingEvent?: (
+      event: GrpcMessagePacingEvent,
+      detail: GrpcMessagePacingDetail,
+    ) => void;
     onError: (error: Error) => void;
     signal?: AbortSignal;
     clock?: GrpcMessagePacingClock;
@@ -690,19 +740,38 @@ export class GrpcMessagePacer {
 
   #handleMessage(message: Buffer): void {
     if (this.#closed) return;
-    const received = { message, receivedAtMs: Date.now() };
-    this.#onPacingEvent?.("received");
+    const received = {
+      message,
+      receivedAtMs: Date.now(),
+      receivedAtMonotonicMs: this.#clock.now(),
+    };
+    this.#onPacingEvent?.("received", {
+      messageBytes: message.length,
+      pacingDelayMs: 0,
+    });
     if (this.#paused) {
       // A data chunk may already contain several frames when pause() takes
       // effect. Keep only the newest raw protobuf and decode it next slot.
-      if (this.#pendingMessage) this.#onPacingEvent?.("coalesced");
+      if (this.#pendingMessage) {
+        this.#onPacingEvent?.("coalesced", {
+          messageBytes: this.#pendingMessage.message.length,
+          pacingDelayMs: Math.max(
+            0,
+            this.#clock.now() - this.#pendingMessage.receivedAtMonotonicMs,
+          ),
+        });
+      }
       this.#pendingMessage = received;
       return;
     }
     this.#emitMessage(received);
   }
 
-  #emitMessage(received: { message: Buffer; receivedAtMs: number }): void {
+  #emitMessage(received: {
+    message: Buffer;
+    receivedAtMs: number;
+    receivedAtMonotonicMs: number;
+  }): void {
     if (!this.#paused) {
       this.#paused = true;
       this.#stream.pause();
@@ -712,7 +781,10 @@ export class GrpcMessagePacer {
       (this.#nextMessageAt ?? now) + this.#messageIntervalMs,
       now + this.#messageIntervalMs,
     );
-    this.#onPacingEvent?.("emitted");
+    this.#onPacingEvent?.("emitted", {
+      messageBytes: received.message.length,
+      pacingDelayMs: Math.max(0, now - received.receivedAtMonotonicMs),
+    });
     this.#onMessage(received.message, received.receivedAtMs);
     this.#scheduleNextSlot();
   }
@@ -758,7 +830,10 @@ export class GrpcMessagePacer {
 
 type RequestOptions = {
   onMessage?: (message: Buffer, receivedAtMs: number) => void;
-  onPacingEvent?: (event: GrpcMessagePacingEvent) => void;
+  onPacingEvent?: (
+    event: GrpcMessagePacingEvent,
+    detail: GrpcMessagePacingDetail,
+  ) => void;
   signal?: AbortSignal;
   timeoutMs?: number;
   maxMessageBytes?: number;
@@ -826,7 +901,13 @@ export class EmulatorGrpcClient {
       };
       const parser = options.messageIntervalMs
         ? null
-        : new GrpcMessageParser(maxMessageBytes, onMessage);
+        : new GrpcMessageParser(maxMessageBytes, (body) => {
+          const receivedAtMs = Date.now();
+          const detail = { messageBytes: body.length, pacingDelayMs: 0 };
+          options.onPacingEvent?.("received", detail);
+          options.onPacingEvent?.("emitted", detail);
+          onMessage(body, receivedAtMs);
+        });
 
       const settle = (error?: Error) => {
         if (settled) return;
@@ -934,7 +1015,11 @@ export class EmulatorGrpcClient {
     signal: AbortSignal,
     options: {
       maxFps?: number;
-      onPacingEvent?: (event: GrpcMessagePacingEvent) => void;
+      onPacingEvent?: (
+        event: GrpcMessagePacingEvent,
+        detail: GrpcMessagePacingDetail,
+      ) => void;
+      onDecode?: (event: GrpcImageDecodeEvent) => void;
     } = {},
   ): Promise<void> {
     const messageIntervalMs = options.maxFps === undefined
@@ -951,8 +1036,15 @@ export class EmulatorGrpcClient {
         signal,
         messageIntervalMs,
         onPacingEvent: options.onPacingEvent,
-        onMessage: (message, receivedAtMs) =>
-          onImage(decodeEmulatorImage(message), receivedAtMs),
+        onMessage: (message, receivedAtMs) => {
+          const startedAt = performance.now();
+          const image = decodeEmulatorImage(message);
+          options.onDecode?.({
+            messageBytes: message.length,
+            decodeMs: Math.max(0, performance.now() - startedAt),
+          });
+          onImage(image, receivedAtMs);
+        },
       });
     } catch (error) {
       if (!signal.aborted) throw error;

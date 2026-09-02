@@ -4,7 +4,10 @@ import { createApp } from "../src/middleware.ts";
 import type { ScrcpySession, StartOpts } from "../src/scrcpy.ts";
 import type { StreamSocket } from "../src/stream-socket.ts";
 
-type CapturedStartOpts = StartOpts & { mode?: "scrcpy" };
+type CapturedStartOpts = StartOpts & {
+  mode?: "scrcpy";
+  grpcImageMode?: "png" | "mmap";
+};
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -116,6 +119,7 @@ describe("stream settings HTTP API", () => {
         maxFps: 24,
         keyFrameInterval: undefined,
         mode: "scrcpy",
+        grpcImageMode: "png",
       });
     } finally {
       app.stop();
@@ -171,6 +175,7 @@ describe("stream settings HTTP API", () => {
         maxFps: 20,
         keyFrameInterval: undefined,
         mode: "scrcpy",
+        grpcImageMode: "png",
       });
     } finally {
       app.stop();

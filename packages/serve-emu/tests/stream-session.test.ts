@@ -39,6 +39,7 @@ describe("stream session", () => {
     await expect(
       startEmuSession({
         mode: "grpc-screenshot",
+        grpcImageMode: "png",
         serial: "physical-device",
       }),
     ).rejects.toThrow("requires an Android Emulator serial");

@@ -3,27 +3,34 @@ import {
   GrpcFrameWritePacer,
   GrpcCaptureDiagnosticsTracker,
   GrpcInputState,
+  GrpcMmapNotificationScheduler,
   GrpcNativeTouchGeometryMonitor,
   H264StartupGate,
   androidKeyGestureToKeyboardEvents,
   androidKeycodeToW3c,
+  grpcPredecodeMaxFps,
+  isUsablePngFrame,
   isUsableRgbFrame,
   normalizeGrpcGestureText,
   normalizeGrpcText,
+  nativeTouchSizeFromEmulatorImage,
   parseDisplaySizeSignal,
+  readMmapImageNotification,
   readInitialDisplayRotation,
   resolveGrpcDisplayGeometry,
+  type GrpcMmapNotificationSchedulerClock,
 } from "../src/grpc-session.ts";
-import { IMG_FORMAT_RGB888 } from "../src/emulator-grpc.ts";
+import {
+  IMG_FORMAT_PNG,
+  IMG_FORMAT_RGB888,
+  type EmuImage,
+} from "../src/emulator-grpc.ts";
 import { compileGesture, parseGesture } from "../src/input.ts";
 import type { VideoFrame } from "../src/scrcpy.ts";
 
 const CONFIG_FRAME: VideoFrame = {
   type: "frame",
-  data: Buffer.from([
-    0, 0, 0, 1, 0x67, 0x01,
-    0, 0, 0, 1, 0x68, 0x01,
-  ]),
+  data: Buffer.from([0, 0, 0, 1, 0x67, 0x01, 0, 0, 0, 1, 0x68, 0x01]),
   pts: 0n,
   isConfig: true,
   isKey: false,
@@ -46,6 +53,63 @@ const KEY_FRAME: VideoFrame = {
   isConfig: false,
   isKey: true,
 };
+
+class FakeMmapSchedulerClock implements GrpcMmapNotificationSchedulerClock {
+  nowMs = 0;
+  #nextTimer = 1;
+  readonly #timers = new Map<number, { at: number; callback: () => void }>();
+  readonly #microtasks: Array<() => void> = [];
+
+  now(): number {
+    return this.nowMs;
+  }
+
+  queueMicrotask(callback: () => void): void {
+    this.#microtasks.push(callback);
+  }
+
+  setTimeout(callback: () => void, delayMs: number): unknown {
+    const id = this.#nextTimer++;
+    this.#timers.set(id, { at: this.nowMs + delayMs, callback });
+    return id;
+  }
+
+  clearTimeout(handle: unknown): void {
+    this.#timers.delete(handle as number);
+  }
+
+  flushMicrotasks(): void {
+    while (this.#microtasks.length > 0) this.#microtasks.shift()!();
+  }
+
+  advance(delayMs: number): void {
+    const target = this.nowMs + delayMs;
+    while (true) {
+      const due = [...this.#timers.entries()]
+        .filter(([, timer]) => timer.at <= target)
+        .sort(
+          (left, right) => left[1].at - right[1].at || left[0] - right[0],
+        )[0];
+      if (!due) break;
+      this.#timers.delete(due[0]);
+      this.nowMs = due[1].at;
+      due[1].callback();
+    }
+    this.nowMs = target;
+  }
+}
+
+function mmapNotification(seq: number, timestampUs: bigint): EmuImage {
+  return {
+    width: 1,
+    height: 1,
+    format: IMG_FORMAT_RGB888,
+    rotation: 0,
+    image: Buffer.alloc(0),
+    seq,
+    timestampUs,
+  };
+}
 
 describe("gRPC screenshot session helpers", () => {
   test("maps printable Android keycodes", () => {
@@ -138,9 +202,9 @@ describe("gRPC screenshot session helpers", () => {
       seq: 1,
       timestampUs: 1n,
     };
-    expect(
-      isUsableRgbFrame({ ...base, image: Buffer.alloc(2 * 3 * 3) }),
-    ).toBe(true);
+    expect(isUsableRgbFrame({ ...base, image: Buffer.alloc(2 * 3 * 3) })).toBe(
+      true,
+    );
     expect(
       isUsableRgbFrame({ ...base, image: Buffer.alloc(2 * 3 * 3 - 1) }),
     ).toBe(false);
@@ -149,13 +213,54 @@ describe("gRPC screenshot session helpers", () => {
     ).toBe(false);
   });
 
-  test("derives rotated encoded size and logical touch coordinates", () => {
+  test("accepts in-band PNG frames and bypasses predecode pacing only for MMAP", () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const base = {
+      width: 2,
+      height: 3,
+      format: IMG_FORMAT_PNG,
+      rotation: 0,
+      seq: 1,
+      timestampUs: 1n,
+    };
+    expect(isUsablePngFrame({ ...base, image: png })).toBe(true);
+    expect(isUsablePngFrame({ ...base, image: Buffer.from("not png") })).toBe(
+      false,
+    );
+    expect(grpcPredecodeMaxFps("png", 60)).toBe(60);
+    expect(grpcPredecodeMaxFps("mmap", 60)).toBeUndefined();
+  });
+
+  test("treats an empty 0x0 MMAP notification as an inactive-display marker", () => {
+    let readCalls = 0;
+    const result = readMmapImageNotification(
+      {
+        width: 0,
+        height: 0,
+        format: IMG_FORMAT_RGB888,
+        rotation: 0,
+        image: Buffer.alloc(0),
+        seq: 7,
+        timestampUs: 1_000_000n,
+      },
+      () => {
+        readCalls++;
+        throw new Error("inactive display must not read the MMAP region");
+      },
+    );
+
+    expect(result).toEqual({ image: null, read: null });
+    expect(readCalls).toBe(0);
+  });
+
+  test("separates screenshot orientation from active touch rotation", () => {
     const geometry = resolveGrpcDisplayGeometry({
       inputWidth: 288,
       inputHeight: 640,
       nativeWidth: 1080,
       nativeHeight: 2400,
-      quarterTurn: 1,
+      displayQuarterTurn: 1,
+      imageQuarterTurn: 0,
     });
 
     expect(geometry.encodedSize).toEqual({ width: 640, height: 288 });
@@ -169,9 +274,140 @@ describe("gRPC screenshot session helpers", () => {
         inputHeight: 640,
         nativeWidth: 1080,
         nativeHeight: 2400,
-        quarterTurn: 3,
+        displayQuarterTurn: 3,
+        imageQuarterTurn: 3,
       }).mapTouch(0.25, 0.75),
     ).toEqual({ x: 810, y: 1800 });
+
+    // Sensor rotation is already represented in the 640x288 screenshot. Its
+    // matching rotation metadata cancels the ffmpeg transform, while touch
+    // still maps through the full active display rotation.
+    const sensorRotated = resolveGrpcDisplayGeometry({
+      inputWidth: 640,
+      inputHeight: 288,
+      nativeWidth: 1080,
+      nativeHeight: 2400,
+      displayQuarterTurn: 3,
+      imageQuarterTurn: 3,
+    });
+    expect(sensorRotated.quarterTurn).toBe(0);
+    expect(sensorRotated.encodedSize).toEqual({ width: 640, height: 288 });
+    expect(sensorRotated.mapTouch(0.25, 0.75)).toEqual({
+      x: 810,
+      y: 1800,
+    });
+
+    expect(
+      nativeTouchSizeFromEmulatorImage({
+        width: 640,
+        height: 288,
+        rotation: 3,
+      }),
+    ).toEqual({ width: 288, height: 640 });
+  });
+
+  test("drops MMAP notifications during cooldown without a trailing snapshot", () => {
+    const clock = new FakeMmapSchedulerClock();
+    const diagnostics = new GrpcCaptureDiagnosticsTracker("mmap", 8);
+    const consumed: Array<{ seq: number; receivedAtMs: number }> = [];
+    const scheduler = new GrpcMmapNotificationScheduler({
+      maxFps: 20,
+      clock,
+      onPacingEvent: (event) => diagnostics.recordGrpcMessage(event),
+      consume(image, receivedAtMs) {
+        consumed.push({ seq: image.seq, receivedAtMs });
+        diagnostics.recordUsableImage(
+          { ...image, image: Buffer.alloc(3) },
+          receivedAtMs,
+          receivedAtMs,
+        );
+      },
+    });
+    const push = (image: EmuImage, receivedAtMs: number) => {
+      diagnostics.recordGrpcMessage(
+        "received",
+        { messageBytes: 10, pacingDelayMs: 0 },
+        clock.now(),
+      );
+      scheduler.push(image, receivedAtMs);
+    };
+
+    push(mmapNotification(1, 1_000_000n), 1_000);
+    expect(consumed).toHaveLength(0);
+    clock.flushMicrotasks();
+    expect(consumed).toEqual([{ seq: 1, receivedAtMs: 1_000 }]);
+
+    clock.advance(10);
+    push(mmapNotification(2, 1_050_000n), 1_010);
+    clock.advance(10);
+    push(mmapNotification(3, 1_100_000n), 1_020);
+    expect(consumed).toHaveLength(1);
+
+    clock.advance(29);
+    expect(consumed).toHaveLength(1);
+    clock.advance(1);
+    expect(consumed).toHaveLength(1);
+
+    push(mmapNotification(4, 1_150_000n), 1_050);
+    clock.flushMicrotasks();
+    expect(consumed).toEqual([
+      { seq: 1, receivedAtMs: 1_000 },
+      { seq: 4, receivedAtMs: 1_050 },
+    ]);
+    expect(diagnostics.snapshot()).toMatchObject({
+      rawGrpcMessagesReceived: 4,
+      rawGrpcMessagesEmitted: 2,
+      rawGrpcMessagesCoalesced: 2,
+      usableImages: 2,
+      sequenceGaps: 2,
+      grpcMessageBytesReceived: 40,
+      transportBytes: 6,
+    });
+    scheduler.close();
+  });
+
+  test("selects newest metadata from a synchronous MMAP decode backlog", () => {
+    const clock = new FakeMmapSchedulerClock();
+    const consumed: number[] = [];
+    const events: string[] = [];
+    const scheduler = new GrpcMmapNotificationScheduler({
+      maxFps: 60,
+      clock,
+      consume: (image) => consumed.push(image.seq),
+      onPacingEvent: (event) => events.push(event),
+    });
+
+    scheduler.push(mmapNotification(1, 1n), 1);
+    scheduler.push(mmapNotification(2, 2n), 2);
+    scheduler.push(mmapNotification(3, 3n), 3);
+    expect(consumed).toEqual([]);
+
+    clock.flushMicrotasks();
+    expect(consumed).toEqual([3]);
+    expect(events).toEqual(["coalesced", "coalesced", "emitted"]);
+  });
+
+  test("cancels a pending MMAP snapshot on abort", () => {
+    const clock = new FakeMmapSchedulerClock();
+    const abort = new AbortController();
+    const consumed: number[] = [];
+    const scheduler = new GrpcMmapNotificationScheduler({
+      maxFps: 10,
+      clock,
+      signal: abort.signal,
+      consume: (image) => consumed.push(image.seq),
+    });
+
+    scheduler.push(mmapNotification(1, 1n), 1);
+    clock.flushMicrotasks();
+    clock.advance(10);
+    scheduler.push(mmapNotification(2, 2n), 2);
+    abort.abort();
+    clock.advance(200);
+    scheduler.push(mmapNotification(3, 3n), 3);
+
+    expect(consumed).toEqual([1]);
+    expect(() => scheduler.close()).not.toThrow();
   });
 
   test("does not let a boundary repeat delay the next fresh frame", () => {
@@ -192,8 +428,8 @@ describe("gRPC screenshot session helpers", () => {
   });
 
   test("reports cumulative gRPC capture loss, source timing, and encoder writes", () => {
-    const diagnostics = new GrpcCaptureDiagnosticsTracker(4);
-    for (const event of [
+    const diagnostics = new GrpcCaptureDiagnosticsTracker("mmap", 4);
+    const pacingEvents = [
       "received",
       "emitted",
       "received",
@@ -204,38 +440,79 @@ describe("gRPC screenshot session helpers", () => {
       "coalesced",
       "received",
       "emitted",
-    ] as const) {
-      diagnostics.recordGrpcMessage(event);
+    ] as const;
+    for (const [index, event] of pacingEvents.entries()) {
+      diagnostics.recordGrpcMessage(
+        event,
+        { messageBytes: 10, pacingDelayMs: 0 },
+        100 + index * 10,
+      );
     }
 
     diagnostics.recordUsableImage(
-      { seq: 10, timestampUs: 1_000_000n },
+      { seq: 10, timestampUs: 1_000_000n, image: Buffer.alloc(20) },
+      1_002,
       1_002,
     );
     diagnostics.recordUsableImage(
-      { seq: 12, timestampUs: 1_020_000n },
+      { seq: 12, timestampUs: 1_020_000n, image: Buffer.alloc(22) },
       1_025,
+      1_026,
     );
     diagnostics.recordUsableImage(
-      { seq: 13, timestampUs: 1_050_000n },
+      { seq: 13, timestampUs: 1_050_000n, image: Buffer.alloc(24) },
       1_057,
+      1_058,
     );
-    diagnostics.recordEncoderWrite(false, true);
-    diagnostics.recordEncoderWrite(false, false);
-    diagnostics.recordEncoderWrite(true, true);
+    diagnostics.recordImageDecode({ messageBytes: 10, decodeMs: 0.2 });
+    diagnostics.recordImageDecode({ messageBytes: 10, decodeMs: 0.4 });
+    diagnostics.recordMmapRead({
+      image: Buffer.alloc(20),
+      attempts: 2,
+      bytesRead: 80,
+      readMs: 1.5,
+    });
+    diagnostics.recordMmapRead({
+      image: null,
+      attempts: 3,
+      bytesRead: 144,
+      readMs: 2.5,
+    });
+    diagnostics.recordEncoderWrite(false, true, 24, 2_000);
+    diagnostics.recordEncoderWrite(false, false, 24, 2_010);
+    diagnostics.recordEncoderWrite(true, true, 24, 2_015);
+    diagnostics.recordEncoderWrite(false, true, 24, 2_020);
 
     expect(diagnostics.snapshot()).toEqual({
+      imageMode: "mmap",
       rawGrpcMessagesReceived: 5,
       rawGrpcMessagesEmitted: 3,
       rawGrpcMessagesCoalesced: 2,
       usableImages: 3,
+      sourceTimestampFps: 60,
+      rawMessageReceiveFps: 50,
+      usableImageFps: 35.7,
+      freshEncoderWriteFps: 50,
       sequenceGaps: 1,
+      imagePayloadBytes: 24,
+      transportBytes: 66,
+      grpcMessageBytesReceived: 50,
+      mmapFileBytesRead: 224,
+      mmapReadRetries: 3,
+      mmapTornFramesDropped: 1,
       sourceTimestampIntervalMs: {
         windowSamples: 2,
         latest: 30,
-        p50: 30,
+        p50: 10,
         p95: 30,
         max: 30,
+      },
+      rawMessageReceiveIntervalMs: {
+        windowSamples: 4,
+        latest: 20,
+        p50: 20,
+        p95: 20,
+        max: 20,
       },
       productionToReceiveLatencyMs: {
         windowSamples: 3,
@@ -244,10 +521,84 @@ describe("gRPC screenshot session helpers", () => {
         p95: 7,
         max: 7,
       },
-      freshEncoderWriteAttempts: 2,
+      productionToUsableLatencyMs: {
+        windowSamples: 3,
+        latest: 8,
+        p50: 6,
+        p95: 8,
+        max: 8,
+      },
+      protobufDecodeTimeMs: {
+        windowSamples: 2,
+        latest: 0.4,
+        p50: 0.4,
+        p95: 0.4,
+        max: 0.4,
+      },
+      sharedReadCopyTimeMs: {
+        windowSamples: 2,
+        latest: 2.5,
+        p50: 2.5,
+        p95: 2.5,
+        max: 2.5,
+      },
+      freshEncoderWriteAttempts: 3,
       repeatEncoderWriteAttempts: 1,
-      acceptedEncoderWrites: 2,
+      acceptedEncoderWrites: 3,
       encoderBackpressureRejections: 1,
+    });
+  });
+
+  test("resets active cadence after a long idle without clearing latency history", () => {
+    const diagnostics = new GrpcCaptureDiagnosticsTracker("mmap", 8);
+    const image = Buffer.alloc(1);
+    const record = (seq: number, timestampUs: bigint, atMs: number) => {
+      diagnostics.recordGrpcMessage("received", undefined, atMs);
+      diagnostics.recordUsableImage({ seq, timestampUs, image }, atMs, atMs);
+      diagnostics.recordEncoderWrite(false, true, image.length, atMs);
+    };
+
+    record(1, 1_000_000n, 1_000);
+    record(2, 1_020_000n, 1_020);
+    expect(diagnostics.snapshot()).toMatchObject({
+      sourceTimestampFps: 50,
+      rawMessageReceiveFps: 50,
+      usableImageFps: 50,
+      freshEncoderWriteFps: 50,
+    });
+
+    // Three seconds with no source image begins a new active burst. The idle
+    // interval itself is not averaged into any cadence window.
+    record(3, 4_020_000n, 4_020);
+    expect(diagnostics.snapshot()).toMatchObject({
+      sourceTimestampFps: null,
+      rawMessageReceiveFps: null,
+      usableImageFps: null,
+      freshEncoderWriteFps: null,
+    });
+    record(4, 4_045_000n, 4_045);
+
+    expect(diagnostics.snapshot()).toMatchObject({
+      sourceTimestampFps: 40,
+      rawMessageReceiveFps: 40,
+      usableImageFps: 40,
+      freshEncoderWriteFps: 40,
+      sourceTimestampIntervalMs: {
+        windowSamples: 1,
+        latest: 25,
+        p50: 25,
+        p95: 25,
+        max: 25,
+      },
+      rawMessageReceiveIntervalMs: {
+        windowSamples: 1,
+        latest: 25,
+        p50: 25,
+        p95: 25,
+        max: 25,
+      },
+      productionToReceiveLatencyMs: { windowSamples: 4 },
+      productionToUsableLatencyMs: { windowSamples: 4 },
     });
   });
 
@@ -274,8 +625,7 @@ describe("gRPC screenshot session helpers", () => {
     await monitor.poll(signal);
     expect(probeCalls).toBe(0);
 
-    displaySizeOutput =
-      "Physical size: 1440x2960\nOverride size: 900x1850\n";
+    displaySizeOutput = "Physical size: 1440x2960\nOverride size: 900x1850\n";
     await monitor.poll(signal);
     expect(probeCalls).toBe(1);
     expect(updates).toEqual([{ width: 1200, height: 2400 }]);
@@ -340,10 +690,7 @@ describe("gRPC screenshot session helpers", () => {
       ),
     ).rejects.toThrow("touch interrupted");
     await expect(
-      input.sendKey(
-        { evdev: 29, eventType: "down" },
-        interrupted.signal,
-      ),
+      input.sendKey({ evdev: 29, eventType: "down" }, interrupted.signal),
     ).rejects.toThrow("key interrupted");
 
     await input.releaseAll(cleanup.signal);
@@ -379,9 +726,7 @@ describe("gRPC screenshot session helpers", () => {
     }).gesture;
     if (compiled.type !== "text") throw new Error("expected text gesture");
     expect(compiled.text).toBe("a".repeat(300));
-    expect(() => normalizeGrpcGestureText(compiled)).toThrow(
-      "ASCII text only",
-    );
+    expect(() => normalizeGrpcGestureText(compiled)).toThrow("ASCII text only");
   });
 
   test("keeps startup recoverable when the initial rotation read fails", async () => {

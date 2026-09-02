@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { describe, expect, test } from "bun:test";
 import {
   createFfmpegAvailabilityProbe,
+  ffmpegInputArgs,
   H264Encoder,
   H264OutputParser,
   resolveFfmpeg,
@@ -309,6 +310,108 @@ describe("H264Encoder validation", () => {
     expect(videoFilter(1)).toBe(`${crop},transpose=cclock`);
     expect(videoFilter(2)).toBe(`${crop},hflip,vflip`);
     expect(videoFilter(3)).toBe(`${crop},transpose=clock`);
+  });
+
+  test("selects fixed rawvideo or framed PNG input without changing output timing", () => {
+    expect(ffmpegInputArgs("rgb24", 360, 640, 30)).toEqual([
+      "-f",
+      "rawvideo",
+      "-pix_fmt",
+      "rgb24",
+      "-video_size",
+      "360x640",
+      "-framerate",
+      "30",
+      "-i",
+      "pipe:0",
+    ]);
+    expect(ffmpegInputArgs("png", 360, 640, 30)).toEqual([
+      "-probesize",
+      "32",
+      "-analyzeduration",
+      "0",
+      "-max_probe_packets",
+      "1",
+      "-f",
+      "image2pipe",
+      "-framerate",
+      "30",
+      "-c:v",
+      "png",
+      "-i",
+      "pipe:0",
+    ]);
+  });
+
+  test("validates PNG frame boundaries before writing to ffmpeg", async () => {
+    const encoder = new H264Encoder({
+      ...valid,
+      inputFormat: "png",
+    });
+    expect(() => encoder.write(Buffer.from("not a png"), 1n)).toThrow(
+      "complete PNG Buffer",
+    );
+    await encoder.close();
+  });
+
+  realFfmpegTest("accepts concatenated PNG images through image2pipe", async () => {
+    const generated = spawnSync(
+      resolveFfmpeg(),
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=128x128",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "png",
+        "-f",
+        "image2pipe",
+        "pipe:1",
+      ],
+      { encoding: null },
+    );
+    expect(generated.status).toBe(0);
+    const png = Buffer.from(generated.stdout);
+    const frames: VideoFrame[] = [];
+    let resolveKeyFrame!: () => void;
+    let rejectKeyFrame!: (error: Error) => void;
+    const keyFrame = new Promise<void>((resolve, reject) => {
+      resolveKeyFrame = resolve;
+      rejectKeyFrame = reject;
+    });
+    const encoder = new H264Encoder({
+      ...valid,
+      width: 128,
+      height: 128,
+      inputFormat: "png",
+      onFrame(frame) {
+        frames.push(frame);
+        if (frame.isKey) resolveKeyFrame();
+      },
+      onExit(reason) {
+        rejectKeyFrame(new Error(reason));
+      },
+    });
+
+    // Keep enough framed input in the pipe for libavformat's initial stream
+    // probe; real emulator PNGs are substantially larger than this fixture.
+    for (let index = 0; index < 20; index++) {
+      expect(encoder.write(png, BigInt(index + 1))).toBe(true);
+    }
+    await Promise.race([
+      keyFrame,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("timed out waiting for ffmpeg")), 2_000),
+      ),
+    ]);
+    await encoder.close();
+    expect(frames.some((frame) => frame.isConfig)).toBe(true);
+    expect(frames.some((frame) => frame.isKey)).toBe(true);
   });
 
   realFfmpegTest("applies Android quarter-turn direction to encoded pixels", async () => {
