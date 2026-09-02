@@ -10,6 +10,7 @@ import {
   useDeviceSessionSnapshot,
 } from "../lib/device-session-store";
 import { usePoll } from "../lib/use-poll";
+import { StreamSettingsPanel } from "./stream-settings-panel";
 
 type LoadedStreamMode = StreamModeResponse & { revision: number };
 
@@ -214,6 +215,7 @@ export function StreamModePanel() {
       <p className="stream-mode-help" id="stream-mode-help">
         {help}
       </p>
+      <StreamSettingsPanel />
     </section>
   );
 }

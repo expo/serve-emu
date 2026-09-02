@@ -14,7 +14,7 @@ describe("StreamModePanel", () => {
     expect(markup).toContain('<legend class="visually-hidden">Stream source</legend>');
     expect(markup).toContain('type="radio"');
     expect(markup.match(/type="radio"/g)?.length).toBe(2);
-    expect(markup.match(/disabled=""/g)?.length).toBe(2);
+    expect(markup.match(/<input type="radio"[^>]*disabled=""/g)?.length).toBe(2);
     expect(markup).toContain('value="scrcpy"');
     expect(markup).toContain('value="grpc-screenshot"');
     expect(markup).toContain("On-device capture");
