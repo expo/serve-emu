@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { ControlInputQueue } from "../src/control-input-queue.ts";
 import { SCRCPY_DEFAULTS } from "../src/scrcpy.ts";
+import { GrpcCaptureDiagnosticsTracker } from "../src/grpc-session.ts";
 import { startServer } from "../src/server.ts";
 import type {
   GrpcImageMode,
@@ -24,7 +25,11 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve };
 }
 
-function fakeSession(serial: string, mode: StreamMode) {
+function fakeSession(
+  serial: string,
+  mode: StreamMode,
+  grpcImageMode?: GrpcImageMode,
+) {
   const end = deferred<null>();
   let closeCalls = 0;
   const fatalListeners = new Set<
@@ -43,6 +48,15 @@ function fakeSession(serial: string, mode: StreamMode) {
       height: 1280,
     },
     controls,
+    ...(grpcImageMode === undefined
+      ? {}
+      : {
+          diagnostics: () => ({
+            grpcCapture: new GrpcCaptureDiagnosticsTracker(
+              grpcImageMode,
+            ).snapshot(),
+          }),
+        }),
     readFrame: () => end.promise,
     onFatal(listener) {
       fatalListeners.add(listener);
@@ -338,7 +352,11 @@ describe("server stream source switching", () => {
       mode: StreamMode;
       grpcImageMode: GrpcImageMode;
     }> = [];
-    const capture = fakeSession("emulator-5554", "grpc-screenshot");
+    const capture = fakeSession(
+      "emulator-5554",
+      "grpc-screenshot",
+      "mmap",
+    );
     const captured: CapturedServer = { options: null };
     const started = await startServer(
       {
@@ -364,6 +382,11 @@ describe("server stream source switching", () => {
     ).toMatchObject({
       mode: "grpc-screenshot",
       grpcImageMode: "mmap",
+    });
+    expect(await (await request(captured, "/health")).json()).toMatchObject({
+      streamMode: "grpc-screenshot",
+      grpcImageMode: "mmap",
+      grpcCapture: { imageMode: "mmap", usableImages: 0 },
     });
     await started.stop();
   });

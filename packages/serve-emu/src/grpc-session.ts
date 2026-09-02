@@ -24,6 +24,7 @@ import { execText, type ExecResult } from "./exec.ts";
 import {
   H264Encoder,
   assertFfmpegAvailable,
+  type H264EncoderInputFormat,
   type H264EncoderOpts,
   type QuarterTurn,
 } from "./h264-encoder.ts";
@@ -658,12 +659,30 @@ export function isUsablePngFrame(image: EmuImage): boolean {
   );
 }
 
-/** MMAP metadata must bypass the raw-message pacer so it can be decoded promptly. */
-export function grpcPredecodeMaxFps(
+export type GrpcImageModeBehavior = {
+  encoderInputFormat: H264EncoderInputFormat;
+  predecodeMaxFps: number | undefined;
+  needsEncoderFollowUp(repeat: boolean, encoderHasOutput: boolean): boolean;
+};
+
+/** Select the immutable encoder and pacing policy for one gRPC image mode. */
+export function grpcImageModeBehavior(
   imageMode: GrpcImageMode,
   maxFps: number,
-): number | undefined {
-  return imageMode === "mmap" ? undefined : maxFps;
+): GrpcImageModeBehavior {
+  if (imageMode === "png") {
+    return {
+      encoderInputFormat: "png",
+      predecodeMaxFps: maxFps,
+      needsEncoderFollowUp: (repeat, encoderHasOutput) =>
+        !repeat || !encoderHasOutput,
+    };
+  }
+  return {
+    encoderInputFormat: "rgb24",
+    predecodeMaxFps: undefined,
+    needsEncoderFollowUp: (repeat) => !repeat,
+  };
 }
 
 export type GrpcMmapNotificationSchedulerClock = {
@@ -788,6 +807,125 @@ export class GrpcMmapNotificationScheduler {
       return;
     }
   }
+}
+
+type GrpcImageCaptureTransport = GrpcImageModeBehavior & {
+  streamFormat: ImageFormatRequest;
+  push(
+    notification: EmuImage,
+    source: GrpcScreenshotImageSource,
+    receivedAtMs: number,
+  ): void;
+  recordRawPacingEvent(
+    event: GrpcMessagePacingEvent,
+    detail: GrpcMessagePacingDetail,
+  ): void;
+  stop(): void;
+  close(): Promise<void>;
+};
+
+function createGrpcImageCaptureTransport(options: {
+  imageMode: GrpcImageMode;
+  maxFps: number;
+  maxSize: number;
+  probe: Pick<EmuImage, "width" | "height">;
+  signal: AbortSignal;
+  diagnostics: GrpcCaptureDiagnosticsTracker;
+  consume(
+    image: EmuImage,
+    source: GrpcScreenshotImageSource,
+    receivedAtMs: number,
+  ): void;
+  onError(error: unknown): void;
+}): GrpcImageCaptureTransport {
+  const behavior = grpcImageModeBehavior(options.imageMode, options.maxFps);
+  if (options.imageMode === "png") {
+    let closed = false;
+    return {
+      ...behavior,
+      streamFormat: {
+        format: IMG_FORMAT_PNG,
+        width: options.maxSize,
+        height: options.maxSize,
+      },
+      push(notification, source, receivedAtMs) {
+        if (!closed && isUsablePngFrame(notification)) {
+          options.consume(notification, source, receivedAtMs);
+        }
+      },
+      recordRawPacingEvent(event, detail) {
+        options.diagnostics.recordGrpcMessage(event, detail);
+      },
+      stop() {
+        closed = true;
+      },
+      async close() {
+        closed = true;
+      },
+    };
+  }
+
+  const captureExtent =
+    options.maxSize > 0
+      ? options.maxSize
+      : Math.max(options.probe.width, options.probe.height);
+  // A reusable MMAP file must be sized before streamScreenshot starts, so
+  // native-size mode resolves zero once from the startup probe. The square
+  // extent handles rotation, but a later display growth beyond this native
+  // startup cap requires restarting capture; it never falls back to PNG.
+  const region = GrpcMmapScreenshotRegion.create(
+    rgb888MmapRegionBytes(captureExtent, captureExtent),
+  );
+  const consumeNotification = (
+    notification: EmuImage,
+    source: GrpcScreenshotImageSource,
+    receivedAtMs: number,
+  ) => {
+    const result = readMmapImageNotification(notification, (byteLength) =>
+      region.readFrame(byteLength),
+    );
+    if (result.read) options.diagnostics.recordMmapRead(result.read);
+    if (result.image) options.consume(result.image, source, receivedAtMs);
+  };
+  const scheduler = new GrpcMmapNotificationScheduler({
+    maxFps: options.maxFps,
+    signal: options.signal,
+    consume: (notification, receivedAtMs) =>
+      consumeNotification(notification, "stream", receivedAtMs),
+    onPacingEvent: (event) => options.diagnostics.recordGrpcMessage(event),
+    onError: options.onError,
+  });
+  return {
+    ...behavior,
+    streamFormat: {
+      format: IMG_FORMAT_RGB888,
+      width: captureExtent,
+      height: captureExtent,
+      transport: {
+        channel: IMAGE_TRANSPORT_MMAP,
+        handle: region.handle,
+      },
+    },
+    push(notification, source, receivedAtMs) {
+      // Stream notifications are paced against the reused region. A bounded
+      // inactivity probe is already outside normal cadence and must retain its
+      // source identity so it does not train the stream boundary estimator.
+      if (source === "stream") scheduler.push(notification, receivedAtMs);
+      else consumeNotification(notification, source, receivedAtMs);
+    },
+    recordRawPacingEvent(event, detail) {
+      // MMAP decodes every lightweight notification. The post-decode scheduler
+      // records which notifications were selected or coalesced for snapshots.
+      if (event === "received") {
+        options.diagnostics.recordGrpcMessage(event, detail);
+      }
+    },
+    stop: () => scheduler.close(),
+    async close() {
+      scheduler.close();
+      await region.close();
+    },
+  };
 }
 
 export type GrpcDisplayGeometry = {
@@ -1585,8 +1723,7 @@ export async function startGrpcSession(
   let closeTask: Promise<void> | null = null;
   let encoderLifecycle: GrpcEncoderLifecycle<GrpcSessionEncoder> | null = null;
   let encoderHasOutput = false;
-  let mmapRegion: GrpcMmapScreenshotRegion | null = null;
-  let mmapNotificationScheduler: GrpcMmapNotificationScheduler | null = null;
+  let captureTransport: GrpcImageCaptureTransport | null = null;
   let latest: EmuImage | null = null;
   let lastWriteAt = 0;
   let writeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1644,6 +1781,7 @@ export async function startGrpcSession(
       lifetime.signal.aborted ||
       fatalFailure ||
       !encoder ||
+      !captureTransport ||
       !latest
     ) {
       return;
@@ -1658,10 +1796,14 @@ export async function startGrpcSession(
       now,
     );
     if (accepted) lastWriteAt = Date.now();
+    const needsFollowUp = captureTransport.needsEncoderFollowUp(
+      repeat,
+      encoderHasOutput,
+    );
     if (repeat) {
       if (flushTimer) clearTimeout(flushTimer);
       flushTimer = null;
-      if (!accepted || (imageMode === "png" && !encoderHasOutput)) {
+      if (!accepted || needsFollowUp) {
         flushTimer = setTimeout(
           () => {
             flushTimer = null;
@@ -1675,14 +1817,14 @@ export async function startGrpcSession(
       }
       return;
     }
-    if (accepted) {
+    if (accepted && needsFollowUp) {
       if (flushTimer) clearTimeout(flushTimer);
       flushTimer = setTimeout(() => {
         flushTimer = null;
         writeFrame(true);
       }, accessUnitBoundaryCadence.boundaryDelayMs());
       flushTimer.unref?.();
-    } else if (!writeTimer) {
+    } else if (needsFollowUp && !writeTimer) {
       writeTimer = setTimeout(
         () => {
           writeTimer = null;
@@ -1715,7 +1857,9 @@ export async function startGrpcSession(
     });
   };
   encoderLifecycle = new GrpcEncoderLifecycle<GrpcSessionEncoder>((restart) => {
-    if (closed || lifetime.signal.aborted || !latest) return null;
+    if (closed || lifetime.signal.aborted || !captureTransport || !latest) {
+      return null;
+    }
     if (restart.clearPending) packetQueue.clear();
     const geometry = currentGeometry(latest)!;
     const size = geometry.encodedSize;
@@ -1736,7 +1880,7 @@ export async function startGrpcSession(
       fps: maxFps,
       bitRate,
       keyFrameInterval,
-      inputFormat: imageMode === "png" ? "png" : "rgb24",
+      inputFormat: captureTransport.encoderInputFormat,
       onFrame: (frame: VideoFrame) => {
         if (!frame.isConfig) encoderHasOutput = true;
         pushPacket(frame);
@@ -1806,25 +1950,11 @@ export async function startGrpcSession(
   };
 
   const onImage = (
-    notification: EmuImage,
+    image: EmuImage,
     source: GrpcScreenshotImageSource = "stream",
     receivedAtMs = Date.now(),
   ) => {
     if (closed) return;
-    let image = notification;
-    if (imageMode === "mmap") {
-      const result = readMmapImageNotification(notification, (byteLength) => {
-        if (!mmapRegion) {
-          throw new Error("emulator MMAP screenshot region is unavailable");
-        }
-        return mmapRegion.readFrame(byteLength);
-      });
-      if (result.read) captureDiagnostics.recordMmapRead(result.read);
-      if (!result.image) return;
-      image = result.image;
-    } else if (!isUsablePngFrame(notification)) {
-      return;
-    }
     captureDiagnostics.recordUsableImage(image, receivedAtMs, Date.now());
     if (source === "stream") {
       accessUnitBoundaryCadence.recordFreshImage(performance.now());
@@ -2021,10 +2151,11 @@ export async function startGrpcSession(
       finishClose = resolve;
     });
     closed = true;
+    const transportToClose = captureTransport;
+    captureTransport = null;
+    transportToClose?.stop();
     options.signal?.removeEventListener("abort", abortFromParent);
     lifetime.abort(new Error("gRPC screenshot session closed"));
-    mmapNotificationScheduler?.close();
-    mmapNotificationScheduler = null;
     clearWriteTimers();
     if (idleTimer) clearInterval(idleTimer);
     idleTimer = null;
@@ -2039,13 +2170,12 @@ export async function startGrpcSession(
     void Promise.allSettled([inputRelease, encoderClose]).then(async () => {
       client.close();
       try {
-        await mmapRegion?.close();
+        await transportToClose?.close();
       } catch (error) {
         console.warn(
-          `serve-emu could not remove the gRPC screenshot mmap region: ${error instanceof Error ? error.message : String(error)}`,
+          `serve-emu could not close the gRPC screenshot transport: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
-      mmapRegion = null;
       finishClose();
     });
     return closeTask;
@@ -2113,51 +2243,23 @@ export async function startGrpcSession(
         nativeTouchSize = size;
       },
     });
-    let streamFormat: ImageFormatRequest;
-    if (imageMode === "mmap") {
-      const captureExtent =
-        maxSize > 0 ? maxSize : Math.max(probe.width, probe.height);
-      // A reusable MMAP file must be sized before streamScreenshot starts, so
-      // native-size mode resolves zero once from the startup probe. The square
-      // extent handles rotation, but a later display growth beyond this native
-      // startup cap requires restarting the capture session; it never falls
-      // back to PNG or silently reads past the client-owned region.
-      mmapRegion = GrpcMmapScreenshotRegion.create(
-        rgb888MmapRegionBytes(captureExtent, captureExtent),
-      );
-      streamFormat = {
-        format: IMG_FORMAT_RGB888,
-        width: captureExtent,
-        height: captureExtent,
-        transport: {
-          channel: IMAGE_TRANSPORT_MMAP,
-          handle: mmapRegion.handle,
-        },
-      };
-    } else {
-      streamFormat = {
-        format: IMG_FORMAT_PNG,
-        width: maxSize,
-        height: maxSize,
-      };
-    }
     const existingFailure = getFatalFailure();
     if (existingFailure) throw new Error(existingFailure.message);
-
-    if (imageMode === "mmap") {
-      mmapNotificationScheduler = new GrpcMmapNotificationScheduler({
-        maxFps,
-        signal: lifetime.signal,
-        consume: (image, receivedAtMs) =>
-          onImage(image, "stream", receivedAtMs),
-        onPacingEvent: (event) => captureDiagnostics.recordGrpcMessage(event),
-        onError: (error) =>
-          emitFatal({
-            message: `emulator MMAP screenshot failed: ${error instanceof Error ? error.message : String(error)}`,
-            code: "grpc-stream-error",
-          }),
-      });
-    }
+    captureTransport = createGrpcImageCaptureTransport({
+      imageMode,
+      maxFps,
+      maxSize,
+      probe,
+      signal: lifetime.signal,
+      diagnostics: captureDiagnostics,
+      consume: onImage,
+      onError: (error) =>
+        emitFatal({
+          message: `emulator MMAP screenshot failed: ${error instanceof Error ? error.message : String(error)}`,
+          code: "grpc-stream-error",
+        }),
+    });
+    const transport = captureTransport;
 
     let firstFrameTimer: ReturnType<typeof setTimeout> | null = null;
     let firstFrameAbort: (() => void) | null = null;
@@ -2194,24 +2296,15 @@ export async function startGrpcSession(
     });
     void client
       .streamScreenshot(
-        streamFormat,
+        transport.streamFormat,
         (image, source, receivedAtMs) => {
-          if (mmapNotificationScheduler && source === "stream") {
-            mmapNotificationScheduler.push(image, receivedAtMs);
-          } else {
-            onImage(image, source, receivedAtMs);
-          }
+          transport.push(image, source, receivedAtMs);
         },
         lifetime.signal,
         {
-          maxFps: grpcPredecodeMaxFps(imageMode, maxFps),
-          onPacingEvent: (event, detail) => {
-            // The MMAP stream decodes every lightweight notification, then the
-            // post-decode scheduler records selected/coalesced snapshots. PNG
-            // keeps the existing raw-message pacer accounting.
-            if (imageMode === "mmap" && event !== "received") return;
-            captureDiagnostics.recordGrpcMessage(event, detail);
-          },
+          maxFps: transport.predecodeMaxFps,
+          onPacingEvent: (event, detail) =>
+            transport.recordRawPacingEvent(event, detail),
           onDecode: (event) => captureDiagnostics.recordImageDecode(event),
         },
       )

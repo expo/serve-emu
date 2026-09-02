@@ -6,6 +6,7 @@ import {
   type ServerDependencies,
 } from "../src/server.ts";
 import type { RecoveryWatchdogClock } from "../src/session-recovery-watchdog.ts";
+import type { StreamSettings } from "../src/stream-settings.ts";
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -329,6 +330,8 @@ async function createHarness(options: {
   serials?: string[];
   delayedSerials?: string[];
   webRtcPublisher?: FakeWebRtcPublisher;
+  webRtcPublisherGate?: Deferred<void>;
+  streamSettings?: StreamSettings;
 } = {}) {
   const serials = options.serials ?? ["A"];
   const sessions = new Map(
@@ -343,6 +346,8 @@ async function createHarness(options: {
   const startCalls: string[] = [];
   const clock = new ManualClock();
   const captured = captureServe();
+  let webRtcPublisherCreateCalls = 0;
+  let openedWebRtcSettings: unknown;
   const dependencies: ServerDependencies = {
     startScrcpy: async ({ serial }) => {
       startCalls.push(serial);
@@ -359,8 +364,11 @@ async function createHarness(options: {
   };
   if (options.webRtcPublisher) {
     dependencies.createWebRtcPublisher = async (publisherOptions) => {
+      webRtcPublisherCreateCalls++;
+      openedWebRtcSettings = publisherOptions.settings;
       options.webRtcPublisher!.onKeyframeRequest =
         publisherOptions.onKeyframeRequest;
+      await options.webRtcPublisherGate?.promise;
       return options.webRtcPublisher!;
     };
   }
@@ -368,7 +376,9 @@ async function createHarness(options: {
     {
       serial: serials[0]!,
       port: 33_030,
-      ...(options.webRtcPublisher
+      ...(options.streamSettings
+        ? { streamSettings: options.streamSettings }
+        : options.webRtcPublisher
         ? {
             streamSettings: {
               transport: "webrtc" as const,
@@ -445,6 +455,12 @@ async function createHarness(options: {
     startCalls,
     clock,
     captured,
+    get webRtcPublisherCreateCalls() {
+      return webRtcPublisherCreateCalls;
+    },
+    get openedWebRtcSettings() {
+      return openedWebRtcSettings;
+    },
     request,
     post,
     upgrade,
@@ -467,12 +483,59 @@ async function pushFrame(
 }
 
 describe("server recovery watchdog", () => {
+  test("a close racing lazy publisher startup cancels the pending viewer", async () => {
+    const publisher = new FakeWebRtcPublisher();
+    const publisherGate = deferred<void>();
+    const harness = await createHarness({
+      webRtcPublisher: publisher,
+      webRtcPublisherGate: publisherGate,
+      streamSettings: { transport: "websocket" },
+    });
+    const sessionId = "00000000-0000-4000-8000-000000000008";
+    try {
+      const offer = harness.post("/webrtc/offer", {
+        type: "offer",
+        sdp: "v=0\r\n",
+        sessionId,
+        codec: "h264",
+      });
+      await waitFor(() => harness.webRtcPublisherCreateCalls === 1);
+      const close = harness.post("/webrtc/close", { sessionId });
+
+      publisherGate.resolve();
+      expect((await offer).status).toBe(200);
+      expect((await close).status).toBe(200);
+      expect(publisher.sessionId).toBeNull();
+    } finally {
+      publisherGate.resolve();
+      await harness.started.stop();
+    }
+  });
+
   test("serves viewer-scoped WebRTC stats without creating an idle publisher", async () => {
     const publisher = new FakeWebRtcPublisher();
     publisher.delivery = { accepted: true, awaitingKeyFrame: false };
-    const harness = await createHarness({ webRtcPublisher: publisher });
+    const harness = await createHarness({
+      webRtcPublisher: publisher,
+      streamSettings: { transport: "websocket" },
+    });
     const sessionId = "00000000-0000-4000-8000-000000000009";
     try {
+      expect(harness.webRtcPublisherCreateCalls).toBe(0);
+      const api = await harness.request("/api");
+      expect(await api.json()).toMatchObject({
+        stream: { transport: "websocket" },
+        viewerTransports: {
+          default: "websocket",
+          available: ["websocket", "webrtc"],
+          webrtc: {
+            transport: "webrtc",
+            codec: "h264",
+            iceTransportPolicy: "all",
+          },
+        },
+      });
+
       const missingSession = await harness.request("/webrtc/stats");
       expect(missingSession.status).toBe(400);
       expect(await missingSession.json()).toMatchObject({
@@ -483,6 +546,7 @@ describe("server recovery watchdog", () => {
       const idle = await harness.request(`/webrtc/stats?sessionId=${sessionId}`);
       expect(idle.status).toBe(503);
       expect(publisher.sessionId).toBeNull();
+      expect(harness.webRtcPublisherCreateCalls).toBe(0);
 
       const offer = await harness.post("/webrtc/offer", {
         type: "offer",
@@ -491,6 +555,12 @@ describe("server recovery watchdog", () => {
         codec: "h264",
       });
       expect(offer.status).toBe(200);
+      expect(harness.webRtcPublisherCreateCalls).toBe(1);
+      expect(harness.openedWebRtcSettings).toMatchObject({
+        transport: "webrtc",
+        codec: "h264",
+        iceTransportPolicy: "all",
+      });
       await pushFrame(harness, "A", keyFrame(), 1);
 
       const response = await harness.request(

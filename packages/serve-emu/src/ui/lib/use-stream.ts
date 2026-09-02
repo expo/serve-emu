@@ -10,6 +10,8 @@ import { parseFramePacket } from "../../shared/frame-meta";
 import {
   DEFAULT_WEBRTC_ICE_SERVERS,
   type StreamSettings,
+  type StreamTransport,
+  type ViewerTransports,
   type WebRtcIceServer,
 } from "../../stream-settings";
 import {
@@ -25,6 +27,7 @@ import {
   isStreamFatalStatus,
   reduceStreamLifecycle,
 } from "./stream-lifecycle";
+import { downloadStreamStats } from "./stream-stats-download";
 import type {
   StreamEventGenerationGate,
   StreamFatalStatus,
@@ -47,7 +50,7 @@ export type StreamState = {
 };
 
 export type Sender = (msg: Record<string, unknown>, ack?: boolean) => void;
-export type StreamTransport = "websocket" | "webrtc";
+export type { StreamTransport } from "../../stream-settings";
 
 type ApiInfo = {
   generation: number;
@@ -55,6 +58,7 @@ type ApiInfo = {
   status?: "streaming" | "stopped" | "error";
   lastError?: string | null;
   stream?: StreamSettings;
+  viewerTransports?: ViewerTransports;
 };
 
 type BrowserRtpCodecCapability = {
@@ -79,6 +83,39 @@ const WEBRTC_TRANSPORT_RETRY_BASE_MS = 500;
 const WEBRTC_TRANSPORT_RETRY_MAX_MS = 5_000;
 const WEBRTC_DISCONNECTED_GRACE_MS = 10_000;
 const CONTROL_ERROR_VISIBLE_MS = 5_000;
+const VIEWER_TRANSPORT_SESSION_KEY = "serve-emu.viewer-transport";
+
+function viewerTransportsKey(value: ViewerTransports | null): string | null {
+  return value ? JSON.stringify(value) : null;
+}
+
+function legacyViewerTransports(
+  settings: StreamSettings | undefined,
+): ViewerTransports | null {
+  if (!settings) return null;
+  return {
+    default: settings.transport,
+    available: [settings.transport],
+    webrtc: settings.transport === "webrtc" ? settings : null,
+  };
+}
+
+function storedViewerTransport(): StreamTransport | null {
+  try {
+    const value = sessionStorage.getItem(VIEWER_TRANSPORT_SESSION_KEY);
+    return value === "websocket" || value === "webrtc" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeViewerTransport(transport: StreamTransport): void {
+  try {
+    sessionStorage.setItem(VIEWER_TRANSPORT_SESSION_KEY, transport);
+  } catch {
+    // A blocked storage API must not prevent a viewer-local transport switch.
+  }
+}
 
 function createWebRtcSessionId(): string {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
@@ -163,14 +200,125 @@ export function useStream(
   const workerRef = useRef<Worker | null>(null);
   const directWsRef = useRef<WebSocket | null>(null);
   const clientEpochRef = useRef(0);
-  const [streamSettings, setStreamSettings] =
-    useState<StreamSettings | null>(null);
+  const [viewerTransports, setViewerTransports] =
+    useState<ViewerTransports | null>(null);
+  const viewerTransportsRef = useRef<ViewerTransports | null>(null);
+  const [transport, setTransport] = useState<StreamTransport | null>(null);
+  const transportRef = useRef<StreamTransport | null>(null);
+  const [switchingTo, setSwitchingTo] =
+    useState<StreamTransport | null>(null);
+  const [transportError, setTransportError] = useState<string | null>(null);
+  const [statsDownloadStatus, setStatsDownloadStatus] = useState<
+    "idle" | "downloading" | "complete" | "error"
+  >("idle");
+  const [statsDownloadMessage, setStatsDownloadMessage] = useState<
+    string | null
+  >(null);
   const [webRtcRetryGeneration, setWebRtcRetryGeneration] = useState(0);
   const [serverGeneration, setServerGeneration] = useState<number | null>(null);
+  const serverGenerationRef = useRef<number | null>(null);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const liveTransportRef = useRef<StreamTransport | null>(null);
+  const currentWebRtcSessionIdRef = useRef<string | null>(null);
+  const statsDownloadPendingRef = useRef(false);
   const webRtcTransportRetryAttemptRef = useRef(0);
   const controlErrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const transport = streamSettings?.transport ?? null;
+  const streamSettings: StreamSettings | null =
+    transport === "websocket"
+      ? { transport: "websocket" }
+      : transport === "webrtc"
+        ? viewerTransports?.webrtc ?? null
+        : null;
   const currentStreamSettingsKey = streamSettingsKey(streamSettings);
+
+  const markTransportLive = useCallback((live: StreamTransport) => {
+    if (transportRef.current !== live) return;
+    liveTransportRef.current = live;
+    setSwitchingTo((current) => (current === live ? null : current));
+    setTransportError(null);
+  }, []);
+
+  const markTransportSwitching = useCallback((next: StreamTransport) => {
+    if (transportRef.current !== next) return;
+    liveTransportRef.current = null;
+    setSwitchingTo(next);
+  }, []);
+
+  const reportTransportError = useCallback(
+    (failed: StreamTransport, message: string) => {
+      if (transportRef.current !== failed) return;
+      liveTransportRef.current = null;
+      setSwitchingTo(null);
+      setTransportError(message);
+    },
+    [],
+  );
+
+  const selectTransport = useCallback((next: StreamTransport) => {
+    const catalog = viewerTransportsRef.current;
+    if (!catalog?.available.includes(next)) {
+      setTransportError(
+        `${next === "webrtc" ? "WebRTC" : "WebSocket"} is unavailable for this stream.`,
+      );
+      return;
+    }
+    if (transportRef.current === next) return;
+    storeViewerTransport(next);
+    transportRef.current = next;
+    liveTransportRef.current = null;
+    setTransportError(null);
+    if (!statsDownloadPendingRef.current) {
+      setStatsDownloadStatus("idle");
+      setStatsDownloadMessage(null);
+    }
+    setSwitchingTo(next);
+    setState((current) => ({
+      ...current,
+      status: `switching to ${next === "webrtc" ? "WebRTC" : "WebSocket"}`,
+      lastRenderedAt: null,
+      fps: 0,
+      stats: null,
+    }));
+    setTransport(next);
+  }, []);
+
+  const downloadStats = useCallback(async () => {
+    const currentTransport = transportRef.current;
+    if (currentTransport === null || statsDownloadPendingRef.current) return;
+    if (liveTransportRef.current !== currentTransport) {
+      setStatsDownloadStatus("error");
+      setStatsDownloadMessage(
+        "Wait for the selected viewer transport to become live.",
+      );
+      return;
+    }
+
+    statsDownloadPendingRef.current = true;
+    setStatsDownloadStatus("downloading");
+    setStatsDownloadMessage("Collecting viewer and server statistics…");
+    try {
+      const result = await downloadStreamStats({
+        transport: currentTransport,
+        viewerState: stateRef.current,
+        webRtcSessionId:
+          currentTransport === "webrtc"
+            ? currentWebRtcSessionIdRef.current
+            : null,
+      });
+      setStatsDownloadStatus("complete");
+      setStatsDownloadMessage(
+        result.document.errors.length > 0
+          ? "Stats downloaded with partial server data."
+          : "Stats downloaded.",
+      );
+    } catch {
+      setStatsDownloadStatus("error");
+      setStatsDownloadMessage("Could not download stream stats.");
+    } finally {
+      statsDownloadPendingRef.current = false;
+    }
+  }, []);
 
   const showControlError = useCallback((message: string) => {
     if (controlErrorTimerRef.current) {
@@ -241,17 +389,59 @@ export function useStream(
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = (await response.json()) as ApiInfo;
         if (cancelled) return;
-        if (data.stream) {
-          setStreamSettings((current) =>
-            streamSettingsKey(current) === streamSettingsKey(data.stream ?? null)
-              ? current
-              : data.stream!,
-          );
+        const nextViewerTransports =
+          data.viewerTransports ?? legacyViewerTransports(data.stream);
+        if (nextViewerTransports) {
+          const previousCatalog = viewerTransportsRef.current;
+          if (
+            viewerTransportsKey(previousCatalog) !==
+            viewerTransportsKey(nextViewerTransports)
+          ) {
+            viewerTransportsRef.current = nextViewerTransports;
+            setViewerTransports(nextViewerTransports);
+          }
+          const currentTransport = transportRef.current;
+          if (currentTransport === null) {
+            const stored = storedViewerTransport();
+            const initial =
+              stored && nextViewerTransports.available.includes(stored)
+                ? stored
+                : nextViewerTransports.available.includes(
+                    nextViewerTransports.default,
+                  )
+                  ? nextViewerTransports.default
+                  : nextViewerTransports.available[0]!;
+            transportRef.current = initial;
+            liveTransportRef.current = null;
+            setSwitchingTo(initial);
+            setTransport(initial);
+          } else if (!nextViewerTransports.available.includes(currentTransport)) {
+            liveTransportRef.current = null;
+            setSwitchingTo(null);
+            setTransportError(
+              `${currentTransport === "webrtc" ? "WebRTC" : "WebSocket"} is no longer available. Choose another transport.`,
+            );
+          } else if (
+            currentTransport === "webrtc" &&
+            viewerTransportsKey(previousCatalog) !==
+              viewerTransportsKey(nextViewerTransports)
+          ) {
+            setTransportError(null);
+            markTransportSwitching("webrtc");
+          }
         }
         if (
           Number.isSafeInteger(data.generation) &&
           data.generation >= 0
         ) {
+          const previousGeneration = serverGenerationRef.current;
+          if (
+            previousGeneration !== null &&
+            previousGeneration !== data.generation
+          ) {
+            markTransportSwitching("webrtc");
+          }
+          serverGenerationRef.current = data.generation;
           setServerGeneration((current) =>
             current === data.generation ? current : data.generation,
           );
@@ -286,7 +476,7 @@ export function useStream(
       controller?.abort();
       if (timer !== null) clearTimeout(timer);
     };
-  }, []);
+  }, [markTransportSwitching]);
 
   useEffect(() => {
     if (transport !== "websocket") return;
@@ -357,6 +547,7 @@ export function useStream(
 
       const isNewGeneration = generationDisposition === "new-generation";
       if (isNewGeneration) {
+        markTransportSwitching("websocket");
         currentGeneration = generationGate.currentGeneration;
         workerGenerationByCanvas.set(canvas, currentGeneration);
         currentLifecycle = null;
@@ -377,6 +568,7 @@ export function useStream(
           lastRenderedAt = msg.state.lastRenderedAt;
         }
       } else if (msg.type === "rendered") {
+        markTransportLive("websocket");
         if (lastRenderedAt === null || msg.at > lastRenderedAt) lastRenderedAt = msg.at;
         if (currentLifecycle) {
           currentLifecycle = reduceStreamLifecycle(currentLifecycle, {
@@ -388,6 +580,7 @@ export function useStream(
       }
       if (msg.type === "status" && isStreamFatalStatus(msg.status)) {
         workerFatalStatus = msg.status;
+        reportTransportError("websocket", msg.status);
       }
       if (msg.type === "control-error") showControlError(msg.message);
 
@@ -549,7 +742,14 @@ export function useStream(
       if (clientEpochRef.current === clientEpoch) clientEpochRef.current = 0;
       workerRef.current = null;
     };
-  }, [canvasRef, showControlError, transport]);
+  }, [
+    canvasRef,
+    markTransportLive,
+    markTransportSwitching,
+    reportTransportError,
+    showControlError,
+    transport,
+  ]);
 
   // WebCodecs is unavailable on some plain-HTTP LAN origins. Keep the fork's
   // Media Source Extensions fallback for those browsers while the normal path
@@ -565,6 +765,7 @@ export function useStream(
       typeof canvas.transferControlToOffscreen === "function";
     if (canUseWorker) return;
     if (!MsePlayer.isSupported()) {
+      reportTransportError("websocket", "WebCodecs and MSE unsupported");
       setState((current) => ({
         ...current,
         status: "WebCodecs and MSE unsupported",
@@ -630,12 +831,14 @@ export function useStream(
         const isKey = packet.isKey ?? scanAU(packet.data).isKey;
         if (!player) {
           player = new MsePlayer(canvas, {
-            onFirstFrame: () =>
+            onFirstFrame: () => {
+              markTransportLive("websocket");
               setState((current) => ({
                 ...current,
                 status: "streaming",
                 lastRenderedAt: Date.now(),
-              })),
+              }));
+            },
             onResize: (width, height) =>
               setState((current) => ({
                 ...current,
@@ -645,7 +848,10 @@ export function useStream(
               setState((current) =>
                 current.fps === fps ? current : { ...current, fps },
               ),
-            onError: setStatus,
+            onError: (message) => {
+              reportTransportError("websocket", message);
+              setStatus(message);
+            },
             requestKeyframe,
           });
         }
@@ -654,6 +860,7 @@ export function useStream(
       ws.onclose = () => {
         if (directWsRef.current === ws) directWsRef.current = null;
         if (cancelled) return;
+        markTransportSwitching("websocket");
         resetPlayer();
         const retryIn = reconnectDelay;
         setStatus(
@@ -674,7 +881,14 @@ export function useStream(
       if (directWsRef.current === ws) directWsRef.current = null;
       resetPlayer();
     };
-  }, [canvasRef, handleControlAcknowledgement, transport]);
+  }, [
+    canvasRef,
+    handleControlAcknowledgement,
+    markTransportLive,
+    markTransportSwitching,
+    reportTransportError,
+    transport,
+  ]);
 
   useEffect(() => {
     webRtcTransportRetryAttemptRef.current = 0;
@@ -732,10 +946,12 @@ export function useStream(
 
   useEffect(() => {
     if (transport !== "webrtc" || streamSettings?.transport !== "webrtc") {
+      currentWebRtcSessionIdRef.current = null;
       return;
     }
     const video = videoRef.current;
     if (!video) {
+      currentWebRtcSessionIdRef.current = null;
       setState((current) => ({
         ...current,
         status: "video element unavailable",
@@ -746,6 +962,8 @@ export function useStream(
       typeof RTCPeerConnection === "undefined" ||
       typeof RTCRtpReceiver === "undefined"
     ) {
+      currentWebRtcSessionIdRef.current = null;
+      reportTransportError("webrtc", "WebRTC unsupported");
       setState((current) => ({ ...current, status: "WebRTC unsupported" }));
       return;
     }
@@ -767,6 +985,8 @@ export function useStream(
     let lastVideoTime = -1;
     const lifecycleController = new AbortController();
     const sessionId = createWebRtcSessionId();
+    markTransportSwitching("webrtc");
+    currentWebRtcSessionIdRef.current = sessionId;
     const iceServers = iceServersForBrowser(streamSettings);
 
     setState((current) => ({
@@ -820,6 +1040,7 @@ export function useStream(
       const width = video.videoWidth;
       const height = video.videoHeight;
       if (isFirstFrame) {
+        markTransportLive("webrtc");
         setState((current) => ({
           ...current,
           status: "streaming",
@@ -889,6 +1110,7 @@ export function useStream(
     const failPermanently = (message: string) => {
       if (stopped || failing) return;
       failing = true;
+      reportTransportError("webrtc", message);
       setStatus(message);
       closePeer();
       void closeRemoteSession();
@@ -896,6 +1118,7 @@ export function useStream(
     const retryTransport = (message: string) => {
       if (stopped || failing) return;
       failing = true;
+      markTransportSwitching("webrtc");
       const attempt = webRtcTransportRetryAttemptRef.current++;
       const delay = Math.min(
         WEBRTC_TRANSPORT_RETRY_BASE_MS * 2 ** Math.min(attempt, 4),
@@ -1052,6 +1275,9 @@ export function useStream(
 
     return () => {
       stopped = true;
+      if (currentWebRtcSessionIdRef.current === sessionId) {
+        currentWebRtcSessionIdRef.current = null;
+      }
       window.removeEventListener("pagehide", releaseOnPageHide);
       window.removeEventListener("beforeunload", releaseOnPageHide);
       lifecycleController.abort();
@@ -1067,6 +1293,9 @@ export function useStream(
     };
   }, [
     currentStreamSettingsKey,
+    markTransportLive,
+    markTransportSwitching,
+    reportTransportError,
     serverGeneration,
     streamSettings,
     transport,
@@ -1074,5 +1303,16 @@ export function useStream(
     webRtcRetryGeneration,
   ]);
 
-  return { state, send, transport };
+  return {
+    state,
+    send,
+    transport,
+    availableTransports: viewerTransports?.available ?? [],
+    switchingTo,
+    transportError,
+    selectTransport,
+    statsDownloadStatus,
+    statsDownloadMessage,
+    downloadStats,
+  };
 }

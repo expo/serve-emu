@@ -5,7 +5,6 @@ import {
   type AppClock,
 } from "../src/middleware.ts";
 import {
-  SCRCPY_DEFAULTS,
   type ScrcpySession,
   type VideoFrame,
 } from "../src/scrcpy.ts";
@@ -200,6 +199,9 @@ function fakeWebRtcPublisher(): WebRtcPublisher {
     path: "direct",
   };
   return {
+    activePeerCount: 1,
+    handleOffer: async () => ({ type: "answer", sdp: "v=0\r\n" }),
+    closeSession: () => {},
     statsForSession: (sessionId: string) =>
       sessionId === SESSION_ID ? stats : null,
     sendFrame: () => ({ accepted: true, awaitingKeyFrame: false }),
@@ -213,6 +215,133 @@ function fakeWebRtcPublisher(): WebRtcPublisher {
     close: () => {},
   } as unknown as WebRtcPublisher;
 }
+
+async function openWebRtcViewer(app: {
+  handleRequest(request: Request): Promise<Response>;
+}): Promise<void> {
+  const response = await app.handleRequest(
+    new Request("http://middleware.test/webrtc/offer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "offer",
+        sdp: "v=0\r\n",
+        sessionId: SESSION_ID,
+        codec: "h264",
+      }),
+    }),
+  );
+  expect(response.status).toBe(200);
+}
+
+test("advertises viewer transports and lazily creates WebRTC for a websocket default", async () => {
+  const { session } = fakeScrcpySession(0);
+  let createCalls = 0;
+  let publisherSettings: unknown;
+  const app = await createApp(
+    { serial: session.serial },
+    {
+      startSession: async () => adaptScrcpySession(session),
+      createWebRtcPublisher: async (options) => {
+        createCalls++;
+        publisherSettings = options.settings;
+        return fakeWebRtcPublisher();
+      },
+    },
+  );
+
+  try {
+    expect(createCalls).toBe(0);
+    const response = await app.handleRequest(
+      new Request("http://middleware.test/api"),
+    );
+    expect(await response.json()).toMatchObject({
+      stream: { transport: "websocket" },
+      viewerTransports: {
+        default: "websocket",
+        available: ["websocket", "webrtc"],
+        webrtc: {
+          transport: "webrtc",
+          codec: "h264",
+          iceTransportPolicy: "all",
+          iceServers: [
+            { urls: ["stun:stun.l.google.com:19302"] },
+            { urls: ["stun:stun1.l.google.com:19302"] },
+          ],
+        },
+      },
+    });
+    expect(createCalls).toBe(0);
+
+    await openWebRtcViewer(app);
+    expect(createCalls).toBe(1);
+    expect(publisherSettings).toMatchObject({
+      transport: "webrtc",
+      codec: "h264",
+      iceTransportPolicy: "all",
+    });
+  } finally {
+    await app.stop();
+  }
+});
+
+test("a close racing lazy middleware publisher startup cancels the pending viewer", async () => {
+  const { session } = fakeScrcpySession(0);
+  const publisher = fakeWebRtcPublisher();
+  const closedSessionIds: string[] = [];
+  publisher.closeSession = (sessionId) => {
+    closedSessionIds.push(sessionId);
+  };
+  let notifyFactoryStarted!: () => void;
+  const factoryStarted = new Promise<void>((resolve) => {
+    notifyFactoryStarted = resolve;
+  });
+  let releasePublisher!: (publisher: WebRtcPublisher) => void;
+  const publisherReady = new Promise<WebRtcPublisher>((resolve) => {
+    releasePublisher = resolve;
+  });
+  const app = await createApp(
+    { serial: session.serial },
+    {
+      startSession: async () => adaptScrcpySession(session),
+      createWebRtcPublisher: async () => {
+        notifyFactoryStarted();
+        return publisherReady;
+      },
+    },
+  );
+
+  try {
+    const offer = app.handleRequest(
+      new Request("http://middleware.test/webrtc/offer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: "offer",
+          sdp: "v=0\r\n",
+          sessionId: SESSION_ID,
+          codec: "h264",
+        }),
+      }),
+    );
+    await factoryStarted;
+    const close = app.handleRequest(
+      new Request("http://middleware.test/webrtc/close", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: SESSION_ID }),
+      }),
+    );
+
+    releasePublisher(publisher);
+    expect((await offer).status).toBe(200);
+    expect((await close).status).toBe(204);
+    expect(closedSessionIds).toEqual([SESSION_ID]);
+  } finally {
+    releasePublisher(publisher);
+    await app.stop();
+  }
+});
 
 test("normalizes middleware source FPS by the actual elapsed time", async () => {
   const clock = new ManualAppClock();
@@ -235,6 +364,7 @@ test("normalizes middleware source FPS by the actual elapsed time", async () => 
   );
 
   try {
+    await openWebRtcViewer(app);
     await drained;
     expect(app.health().frames).toBe(50);
 
@@ -251,7 +381,6 @@ test("normalizes middleware source FPS by the actual elapsed time", async () => 
     });
     expect(app.webRtcStats(SESSION_ID)).toMatchObject({
       source: { frames: 50, fps: 20 },
-      capture: { offeredFrames: 50, forwardedFrames: 50 },
     });
   } finally {
     app.stop();
@@ -279,6 +408,7 @@ test("serves viewer-scoped WebRTC statistics from createApp.handleRequest", asyn
   );
 
   try {
+    await openWebRtcViewer(app);
     await drained;
     const response = await app.handleRequest(
       new Request(
@@ -295,7 +425,7 @@ test("serves viewer-scoped WebRTC statistics from createApp.handleRequest", asyn
   }
 });
 
-test("uses the scrcpy FPS default when middleware maxFps is omitted", async () => {
+test("uses the 30 FPS middleware default when maxFps is omitted", async () => {
   const { session } = fakeScrcpySession(0);
   let openedMaxFps: number | undefined;
   const app = await createApp(
@@ -309,7 +439,7 @@ test("uses the scrcpy FPS default when middleware maxFps is omitted", async () =
   );
 
   try {
-    expect(openedMaxFps).toBe(SCRCPY_DEFAULTS.maxFps);
+    expect(openedMaxFps).toBe(30);
   } finally {
     await app.stop();
   }
@@ -336,6 +466,7 @@ test("reports configured source settings and rolling encoded-frame timing", asyn
   );
 
   try {
+    await openWebRtcViewer(app);
     await drained;
     const frameStats = {
       windowFrames: 3,
@@ -348,7 +479,7 @@ test("reports configured source settings and rolling encoded-frame timing", asyn
     expect(app.webRtcStats(SESSION_ID)).toMatchObject({
       source: {
         streamMode: "scrcpy",
-        configuredFps: SCRCPY_DEFAULTS.maxFps,
+        configuredFps: 30,
         frameStats,
       },
     });
@@ -369,6 +500,7 @@ test("includes optional gRPC session capture diagnostics in WebRTC stats", async
     {
       serial: session.serial,
       streamMode: "grpc-screenshot",
+      grpcImageMode: "mmap",
       streamSettings: {
         transport: "webrtc",
         codec: "h264",
@@ -383,7 +515,13 @@ test("includes optional gRPC session capture diagnostics in WebRTC stats", async
   );
 
   try {
+    await openWebRtcViewer(app);
     await drained;
+    expect(app.health()).toMatchObject({
+      streamMode: "grpc-screenshot",
+      grpcImageMode: "mmap",
+      grpcCapture: GRPC_CAPTURE_DIAGNOSTICS,
+    });
     expect(app.webRtcStats(SESSION_ID)).toMatchObject({
       capture: { grpc: GRPC_CAPTURE_DIAGNOSTICS },
     });

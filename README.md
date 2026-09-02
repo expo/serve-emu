@@ -31,7 +31,9 @@ Current package version: see [`packages/serve-emu/package.json`](packages/serve-
 Working:
 
 - Live H.264 video over WebSocket/WebCodecs or WebRTC, with an MSE fallback
+- Per-tab switching between WebSocket and WebRTC, with lazy WebRTC startup
 - Runtime switching between scrcpy and host-side gRPC screenshot capture on Android Emulators
+- Runtime PNG/MMAP selection and redacted JSON stream-stat downloads in the UI
 - Tap, swipe, text, keyevent, Back, Home, Recents, and Power input
 - Keyboard passthrough in the browser UI: editing/navigation keys, Ctrl/Cmd shortcuts (select all, copy, paste, cut, undo, redo), and IME composition for CJK text
 - Multi-client streaming, so multiple browser tabs can share one device
@@ -116,7 +118,7 @@ serve-emu --running-avds
 | `--max-size` | `1280` | Downscale the longest edge to N pixels; `0` keeps native size. The default balances detail and throughput, especially for the host-side software encoder used by `grpc-screenshot` |
 | `--key-frame-interval` | `10` | Ask the encoder for regular keyframes; `0` disables this codec option. Late joiners get keyframes on demand, so a long interval avoids periodic keyframe bursts |
 | `--repeat-frame-ms` | `0` | Re-encode the previous frame after N ms without screen changes (`16` ≈ steady 60fps on static screens, at extra CPU/bandwidth cost); `0` keeps the source default: 100ms for scrcpy and 500ms for `grpc-screenshot` |
-| `--transport` | `websocket` | Browser video transport: `websocket` or `webrtc` |
+| `--transport` | `websocket` | Initial browser video transport: `websocket` or `webrtc`. Each tab can switch independently in the UI |
 | `--stun-url` | public STUN defaults | Comma-separated STUN URL(s) for WebRTC ICE |
 | `--turn-url` | none | Comma-separated TURN URL(s); requires both TURN credential flags |
 | `--turn-username` | none | TURN username |
@@ -194,6 +196,7 @@ Open `http://localhost:3300` after starting the CLI. The UI streams the device i
 - Pointer input, keyboard passthrough (typing, navigation keys, shortcuts, IME composition), hardware buttons, and screenshots
 - Device selection plus AVD start/stop
 - Stream-source switching between scrcpy and gRPC screenshot capture on emulators, with an explicit PNG/MMAP image-mode selector for gRPC
+- Per-tab WebSocket/WebRTC selection and redacted stream-stat downloads
 - Orientation, night mode, font scale, network, GPS location, and route playback
 - Logcat filtering, pause/copy controls, app management, file import, and session replay
 
@@ -502,12 +505,30 @@ Connect to `/ws` for the raw Annex-B H.264 stream. Send JSON control messages ov
 
 Use `/ws?frame-meta=1` to receive a 24-byte `SEMU` v2 frame metadata header before each H.264 access unit: magic `SEMU` (4B), version=2 (1B), flags (1B, bit 0 = keyframe), reserved (2B), PTS (8B BE, µs), and the server send time (8B BE, epoch µs). Same-host clients can compare the send time against their own clock to measure transit and glass-to-glass latency. The bundled UI uses this mode to avoid per-frame NAL scans and to track PTS/keyframe/latency state.
 
-With `--transport webrtc`, video is negotiated through authenticated,
-same-origin `POST /webrtc/offer` and released through `POST /webrtc/close`.
-The browser keeps `/ws?video=0` open as a control-only socket, so input still
-travels through the active low-latency source control path without duplicating
-video over WebSocket. `/api` exposes the active ICE configuration to the authenticated
-UI; `/health` redacts TURN credentials.
+For H.264 sources, each browser tab can independently select WebSocket or
+WebRTC; `--transport` chooses only the initial selection for tabs without a
+saved preference. The server starts its WebRTC publisher lazily on the first
+authenticated, same-origin `POST /webrtc/offer`, and releases a viewer through
+`POST /webrtc/close`. A WebRTC viewer keeps `/ws?video=0` open as a control-only
+socket, so input still travels through the active low-latency source control
+path without duplicating video over WebSocket. `/api` exposes the default,
+available viewer transports, and ICE configuration to the authenticated UI;
+`/health` redacts TURN credentials.
+
+The UI's **Download stats** action writes a versioned, redacted JSON snapshot
+containing bounded viewer metrics, `/health`, and statistics for only the
+current WebRTC session when applicable. If a server sample is unavailable, the
+file is still downloaded with a safe error summary and the data that was
+available. Files use `schemaVersion: 1` and the name
+`serve-emu-<device>-<transport>-<timestamp>.json`. The exporter deliberately
+does not request `/api`, so it never collects the ICE/TURN configuration used
+to initialize the viewer.
+
+Authenticated clients can read one live viewer directly with
+`GET /webrtc/stats?sessionId=<uuid>`; multi-device middleware also accepts an
+explicit `device` query. Invalid requests return `400`, while an unknown,
+closed, or otherwise unavailable viewer returns `503`. Reading stats never
+starts an idle WebRTC publisher.
 
 See the [protocol reference](packages/serve-emu/docs/protocol.md) for the complete scrcpy v3/v4 framing, control packet, and `SEMU` v1/v2 wire formats.
 
@@ -526,7 +547,7 @@ See the [protocol reference](packages/serve-emu/docs/protocol.md) for the comple
 1. The CLI pushes `scrcpy-server-v4.0` to `/data/local/tmp/scrcpy-server.jar`.
 2. It opens `adb forward tcp:<localPort> localabstract:scrcpy_<scid>`.
 3. It spawns `app_process` with the scrcpy server class on the device, then connects video and control sockets through the tunnel.
-4. The Bun server reads scrcpy's framed H.264 stream and publishes each access unit over the selected WebSocket or WebRTC transport. Raw `/ws` clients receive Annex-B payloads unchanged; the built-in WebSocket UI opts into the 24-byte frame metadata header.
+4. The Bun server reads scrcpy's framed H.264 stream and publishes each access unit to active WebSocket viewers and, once requested, WebRTC viewers. Raw `/ws` clients receive Annex-B payloads unchanged; the built-in WebSocket UI opts into the 24-byte frame metadata header.
 5. The browser uses WebCodecs in a worker, falls back to MSE where necessary, or renders the WebRTC track into a `<video>`. Pointer events are normalized to unit coordinates and dispatched through the active source's ordered control channel.
 
 With `--stream-mode grpc-screenshot`, the emulator's gRPC endpoint

@@ -122,15 +122,18 @@ import {
   type UploadManagerOptions,
 } from "./upload-manager.ts";
 import {
+  DEFAULT_WEBRTC_STREAM_SETTINGS,
   DEFAULT_STREAM_SETTINGS,
   isJsonRequest,
   parseStreamEncoderSettingsPatch,
   redactedStreamSettings,
   streamEncoderSettingsEqual,
   StreamSettingsUnavailableError,
+  viewerTransportsFor,
   type StreamEncoderSettings,
   type StreamEncoderSettingsPatch,
   type StreamSettings,
+  type WebRtcStreamSettings,
 } from "./stream-settings.ts";
 import {
   MAX_WEBRTC_SIGNALING_BODY_BYTES,
@@ -188,7 +191,7 @@ export type ServerOpts = {
   maxActiveUploads?: number;
   maxQueuedUploads?: number;
   uploadQueueTimeoutMs?: number;
-  /** Video transport exposed by the browser UI. Defaults to WebSocket/WebCodecs. */
+  /** Default viewer transport. Each browser viewer may select either available path. */
   streamSettings?: StreamSettings;
 };
 
@@ -479,6 +482,10 @@ export async function startServer(
   const host = opts.host ?? DEFAULT_HOST;
   const authToken = opts.token && opts.token.length > 0 ? opts.token : null;
   const streamSettings = opts.streamSettings ?? DEFAULT_STREAM_SETTINGS;
+  const webRtcStreamSettings: WebRtcStreamSettings =
+    streamSettings.transport === "webrtc"
+      ? streamSettings
+      : DEFAULT_WEBRTC_STREAM_SETTINGS;
   const streamModes = new Map<string, StreamMode>();
   const grpcImageModes = new Map<string, GrpcImageMode>();
   const contextGrpcImageModes = new WeakMap<DeviceContext, GrpcImageMode>();
@@ -558,14 +565,6 @@ export async function startServer(
     deviceState?: DeviceSessionState,
     grpcImageMode = grpcImageModeForSerial(serial),
   ): DeviceContext => {
-    if (
-      streamSettings.transport === "webrtc" &&
-      stream.meta.codecId !== streamSettings.codec
-    ) {
-      throw new Error(
-        `WebRTC requires ${streamSettings.codec.toUpperCase()} video, but ${stream.mode} negotiated ${stream.meta.codecId}`,
-      );
-    }
     const context = new ActiveDeviceSession<Client>({
       serial,
       generation,
@@ -651,6 +650,8 @@ export async function startServer(
     device: context.stream.meta.deviceName,
     codec: context.stream.meta.codecId,
     streamMode: context.stream.mode,
+    grpcImageMode: grpcImageModeForContext(context),
+    grpcCapture: context.stream.diagnostics?.().grpcCapture ?? null,
     size: { width: context.screen.width, height: context.screen.height },
     clients: context.clients.size,
     videoClients: Array.from(context.clients).filter((client) => client.video)
@@ -719,14 +720,11 @@ export async function startServer(
 
   const webRtcStats = (context: DeviceContext, sessionId: string) => {
     const publisher = publishers.get(context);
-    if (
-      context.status !== "streaming" ||
-      streamSettings.transport !== "webrtc" ||
-      !publisher
-    ) {
+    if (context.status !== "streaming" || !publisher) {
       return null;
     }
     const sourceFps = recoveries.get(context)?.snapshot(recoveryClock.now()).sourceFps ?? 0;
+    const encoderSettings = encoderSettingsForSerial(context.serial);
     return webRtcStatsCollectorFor(context).report(
       {
         streamMode: context.stream.mode,
@@ -735,8 +733,8 @@ export async function startServer(
         height: context.screen.height,
         frames: context.frameCount,
         fps: sourceFps,
-        configuredFps: opts.maxFps ?? SCRCPY_DEFAULTS.maxFps,
-        configuredBitrateBps: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
+        configuredFps: encoderSettings.h264Fps,
+        configuredBitrateBps: encoderSettings.h264Bitrate,
         frameStats: context.frameStats.summary(),
       },
       publisher,
@@ -1299,12 +1297,12 @@ export async function startServer(
   const publisherFor = (
     context: DeviceContext,
   ): Promise<WebRtcPublisherLike> => {
-    if (streamSettings.transport !== "webrtc") {
+    if (context.stream.meta.codecId !== webRtcStreamSettings.codec) {
       return Promise.reject(
         new WebRtcSignalingError(
-          "WebRTC streaming is not enabled",
-          404,
-          "webrtc_disabled",
+          `WebRTC requires ${webRtcStreamSettings.codec.toUpperCase()} video, but ${context.stream.mode} negotiated ${context.stream.meta.codecId}`,
+          409,
+          "webrtc_codec_unavailable",
         ),
       );
     }
@@ -1314,7 +1312,7 @@ export async function startServer(
     if (pending) return pending;
 
     const task = openWebRtcPublisher({
-      settings: streamSettings,
+      settings: webRtcStreamSettings,
       onKeyframeRequest: (reason) => {
         const recovery = recoveries.get(context);
         const webRtcState = webRtcRecoveryStates.get(context);
@@ -1926,6 +1924,10 @@ export async function startServer(
             status: requestContext.status,
             clients: requestContext.clients.size,
             stream: streamSettings,
+            viewerTransports: viewerTransportsFor(
+              streamSettings,
+              requestContext.stream.meta.codecId,
+            ),
           },
           { headers: { "Cache-Control": "no-store" } },
         );
@@ -2105,9 +2107,11 @@ export async function startServer(
             ),
           );
           sessions.assertCurrent(requestContext);
-          const publisher = await publisherFor(requestContext);
+          const publisher =
+            publishers.get(requestContext) ??
+            (await publisherTasks.get(requestContext)?.catch(() => null));
           sessions.assertCurrent(requestContext);
-          publisher.closeSession(payload.sessionId);
+          publisher?.closeSession(payload.sessionId);
           return Response.json({ ok: true });
         } catch (error) {
           return errorResponse(error);

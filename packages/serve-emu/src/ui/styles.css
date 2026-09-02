@@ -685,7 +685,8 @@ input[type="checkbox"] {
 .grpc-image-mode-fieldset {
   margin-top: 12px;
 }
-.grpc-image-mode-fieldset legend {
+.grpc-image-mode-fieldset legend,
+.viewer-transport-fieldset legend {
   margin-bottom: 6px;
   padding: 0;
   color: #c7c7cc;
@@ -774,6 +775,42 @@ input[type="checkbox"] {
   color: #9a9aa3;
   font-size: 11px;
   line-height: 1.35;
+}
+.viewer-transport-control {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #25252d;
+}
+.viewer-transport-feedback {
+  margin-top: 8px;
+}
+.viewer-transport-feedback[data-state="live"] {
+  color: #73d99a;
+}
+.viewer-transport-feedback[data-state="error"] {
+  color: #ff9b93;
+}
+.stream-stats-download {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+.stream-stats-download button {
+  min-height: 44px;
+  touch-action: manipulation;
+}
+.stream-stats-download button:focus-visible {
+  outline: 2px solid #5cc8ff;
+  outline-offset: 2px;
+}
+.stream-stats-download-feedback {
+  min-height: 2.7em;
+}
+.stream-stats-download-feedback[data-state="complete"] {
+  color: #73d99a;
+}
+.stream-stats-download-feedback[data-state="error"] {
+  color: #ff9b93;
 }
 .stream-quality-panel {
   display: flex;

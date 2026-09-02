@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  STREAM_TRANSPORTS,
+  type StreamTransport,
+} from "../../stream-settings";
+import {
   GRPC_IMAGE_MODES,
   STREAM_MODES,
   type GrpcImageMode,
@@ -12,6 +16,7 @@ import {
   useDeviceSessionSnapshot,
 } from "../lib/device-session-store";
 import { usePoll } from "../lib/use-poll";
+import { useViewerTransportControls } from "../lib/viewer-transport-context";
 import { StreamSettingsPanel } from "./stream-settings-panel";
 
 type LoadedStreamMode = StreamModeResponse & { revision: number };
@@ -49,6 +54,138 @@ const GRPC_IMAGE_OPTIONS = GRPC_IMAGE_MODES.map((mode) => ({
   ...GRPC_IMAGE_MODE_COPY[mode],
 }));
 const STREAM_MODE_POLL_INTERVAL_MS = 4_000;
+const NOOP_SELECT_TRANSPORT = () => {};
+const NOOP_DOWNLOAD_STATS = () => {};
+
+const VIEWER_TRANSPORT_COPY = {
+  websocket: {
+    label: "WebSocket",
+    description: "WebCodecs or MSE",
+  },
+  webrtc: {
+    label: "WebRTC",
+    description: "Browser media path",
+  },
+} satisfies Record<StreamTransport, {
+  label: string;
+  description: string;
+}>;
+
+type ViewerTransportSelectorProps = {
+  value: StreamTransport | null;
+  available: readonly StreamTransport[];
+  switchingTo: StreamTransport | null;
+  error: string | null;
+  onChange: (transport: StreamTransport) => void;
+};
+
+export function ViewerTransportSelector({
+  value,
+  available,
+  switchingTo,
+  error,
+  onChange,
+}: ViewerTransportSelectorProps) {
+  const label = value ? VIEWER_TRANSPORT_COPY[value].label : null;
+  const feedback = switchingTo
+    ? `Switching to ${VIEWER_TRANSPORT_COPY[switchingTo].label}…`
+    : error
+      ? error
+      : label
+        ? `${label} live`
+        : "Loading viewer transports…";
+  const feedbackState = switchingTo
+    ? "switching"
+    : error
+      ? "error"
+      : value
+        ? "live"
+        : "loading";
+
+  return (
+    <div className="viewer-transport-control">
+      <fieldset
+        className="stream-mode-fieldset viewer-transport-fieldset"
+        aria-busy={switchingTo !== null || value === null}
+        aria-describedby="viewer-transport-help"
+      >
+        <legend>Browser transport</legend>
+        <div className="stream-mode-options">
+          {STREAM_TRANSPORTS.map((transport) => {
+            const option = VIEWER_TRANSPORT_COPY[transport];
+            return (
+              <label className="stream-mode-option" key={transport}>
+                <input
+                  type="radio"
+                  name="viewer-transport"
+                  value={transport}
+                  checked={value === transport}
+                  disabled={!available.includes(transport)}
+                  onChange={() => onChange(transport)}
+                />
+                <span>
+                  <strong>{option.label}</strong>
+                  <small>{option.description}</small>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+      </fieldset>
+      <p
+        className="stream-mode-help viewer-transport-feedback"
+        id="viewer-transport-help"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        data-state={feedbackState}
+      >
+        {feedback}
+      </p>
+    </div>
+  );
+}
+
+type StreamStatsDownloadControlProps = {
+  disabled: boolean;
+  status: "idle" | "downloading" | "complete" | "error";
+  message: string | null;
+  onDownload: () => void | Promise<void>;
+};
+
+export function StreamStatsDownloadControl({
+  disabled,
+  status,
+  message,
+  onDownload,
+}: StreamStatsDownloadControlProps) {
+  const downloading = status === "downloading";
+  const feedback = message ??
+    "Download a redacted JSON snapshot of viewer and server statistics.";
+
+  return (
+    <div className="stream-stats-download">
+      <button
+        type="button"
+        disabled={disabled || downloading}
+        aria-describedby="stream-stats-download-feedback"
+        onClick={() => void onDownload()}
+      >
+        {downloading ? "Preparing stats…" : "Download stats"}
+      </button>
+      <p
+        className="stream-mode-help stream-stats-download-feedback"
+        id="stream-stats-download-feedback"
+        role={status === "error" ? "alert" : "status"}
+        aria-live={status === "error" ? "assertive" : "polite"}
+        aria-atomic="true"
+        data-state={status}
+      >
+        {feedback}
+      </p>
+    </div>
+  );
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -94,6 +231,7 @@ export function GrpcImageModeSelector({
 }
 
 export function StreamModePanel() {
+  const viewerTransport = useViewerTransportControls();
   const deviceSession = useDeviceSessionSnapshot();
   const actionId = useRef(0);
   const [loaded, setLoaded] = useState<LoadedStreamMode | null>(null);
@@ -298,6 +436,24 @@ export function StreamModePanel() {
       <p className="stream-mode-help" id="stream-mode-help">
         {help}
       </p>
+      <ViewerTransportSelector
+        value={viewerTransport?.transport ?? null}
+        available={viewerTransport?.availableTransports ?? []}
+        switchingTo={viewerTransport?.switchingTo ?? null}
+        error={viewerTransport?.error ?? null}
+        onChange={viewerTransport?.selectTransport ?? NOOP_SELECT_TRANSPORT}
+      />
+      <StreamStatsDownloadControl
+        disabled={
+          viewerTransport?.transport === null ||
+          viewerTransport?.transport === undefined ||
+          viewerTransport.switchingTo !== null ||
+          viewerTransport.error !== null
+        }
+        status={viewerTransport?.statsDownloadStatus ?? "idle"}
+        message={viewerTransport?.statsDownloadMessage ?? null}
+        onDownload={viewerTransport?.downloadStats ?? NOOP_DOWNLOAD_STATS}
+      />
       <StreamSettingsPanel />
     </section>
   );

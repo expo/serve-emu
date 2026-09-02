@@ -8,7 +8,11 @@ import {
   type StartOpts,
   type VideoPacket,
 } from "./scrcpy.ts";
-import type { GrpcImageMode, StreamMode } from "./shared/api-contracts.ts";
+import type {
+  GrpcCaptureDiagnostics,
+  GrpcImageMode,
+  StreamMode,
+} from "./shared/api-contracts.ts";
 import { isAbnormalExit, procExitDetail } from "./session-status.ts";
 
 const SCRCPY_READINESS_TIMEOUT_MS = 10_000;
@@ -17,6 +21,11 @@ const MAX_SCRCPY_STARTUP_BYTES = 64 * 1024 * 1024;
 const STARTUP_READY: unique symbol = Symbol("scrcpy-startup-ready");
 const NEVER_ABORTED = new AbortController().signal;
 
+export type {
+  GrpcCaptureDiagnostics,
+  RollingTimingSummary,
+} from "./shared/api-contracts.ts";
+
 export type StreamFailure = {
   message: string;
   code?: string;
@@ -24,68 +33,6 @@ export type StreamFailure = {
 };
 
 export type StreamMeta = ScrcpySession["meta"];
-
-export type RollingTimingSummary = {
-  /** Number of samples retained in the rolling window. */
-  windowSamples: number;
-  latest: number;
-  p50: number;
-  p95: number;
-  max: number;
-};
-
-/** Cumulative and rolling diagnostics for emulator gRPC screenshot capture. */
-export type GrpcCaptureDiagnostics = {
-  /** Exact screenshot image/delivery strategy selected by the caller. */
-  imageMode: GrpcImageMode;
-  /** Raw framed protobuf messages received before either pacing stage. */
-  rawGrpcMessagesReceived: number;
-  /** PNG messages decoded by the raw pacer, or MMAP notifications selected for a snapshot. */
-  rawGrpcMessagesEmitted: number;
-  /** PNG messages replaced by a newer one, or MMAP notifications dropped/replaced by pacing. */
-  rawGrpcMessagesCoalesced: number;
-  /** Complete PNG or RGB images made available to the encoder. */
-  usableImages: number;
-  /** Emulator production cadence derived from source timestamps. */
-  sourceTimestampFps: number | null;
-  /** Raw framed message cadence before pacing/coalescing. */
-  rawMessageReceiveFps: number | null;
-  /** Complete source images made available to the encoder. */
-  usableImageFps: number | null;
-  /** Accepted fresh ffmpeg writes, excluding intentional repeats. */
-  freshEncoderWriteFps: number | null;
-  /** Missing emulator-produced sequence numbers observed between usable images. */
-  sequenceGaps: number;
-  /** Latest PNG or RGB source payload presented to ffmpeg. */
-  imagePayloadBytes: number;
-  /** Cumulative logical PNG or RGB bytes accepted from the selected transport. */
-  transportBytes: number;
-  /** Cumulative protobuf body bytes received, excluding gRPC frame prefixes. */
-  grpcMessageBytesReceived: number;
-  /** Cumulative positional file-read bytes, including verification and retries. */
-  mmapFileBytesRead: number;
-  /** Additional MMAP read pairs needed after a changing region was observed. */
-  mmapReadRetries: number;
-  /** MMAP notifications dropped after every bounded read attempt differed. */
-  mmapTornFramesDropped: number;
-  /** Rolling sequence-weighted per-produced-frame intervals. */
-  sourceTimestampIntervalMs: RollingTimingSummary | null;
-  /** Rolling raw framed-message arrival intervals. */
-  rawMessageReceiveIntervalMs: RollingTimingSummary | null;
-  /** Rolling emulator-production-to-host-receive latency. */
-  productionToReceiveLatencyMs: RollingTimingSummary | null;
-  /** Rolling notification-timestamp-to-complete-source-image latency estimate. */
-  productionToUsableLatencyMs: RollingTimingSummary | null;
-  /** Time to decode each Image protobuf processed by the selected transport. */
-  protobufDecodeTimeMs: RollingTimingSummary | null;
-  /** Time to obtain and compare a best-effort coherent MMAP snapshot. */
-  sharedReadCopyTimeMs: RollingTimingSummary | null;
-  freshEncoderWriteAttempts: number;
-  repeatEncoderWriteAttempts: number;
-  acceptedEncoderWrites: number;
-  /** Encoder writes rejected while ffmpeg input was backpressured. */
-  encoderBackpressureRejections: number;
-};
 
 export type EmuSessionDiagnostics = {
   /** Present only for the grpc-screenshot capture implementation. */

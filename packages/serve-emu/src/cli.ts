@@ -226,7 +226,8 @@ Options:
                          raw pixels. The selected mode is strict: capture errors
                          do not fall back to the other mode.
       --transport <websocket|webrtc>
-                         Browser video transport (default: websocket)
+                         Initial browser video transport (default: websocket).
+                         Each browser tab can switch transports in the UI.
       --stun-url <url[,url...]>
                          STUN URL(s); omitted = default public STUN servers
       --turn-url <url[,url...]>

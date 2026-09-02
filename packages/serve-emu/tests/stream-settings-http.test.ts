@@ -99,7 +99,7 @@ function fakeSession(
 }
 
 describe("stream settings HTTP API", () => {
-  test("uses the canonical encoder defaults when options are omitted", async () => {
+  test("uses the middleware encoder defaults when options are omitted", async () => {
     const starts: CapturedStartOpts[] = [];
     const app = await createApp(
       { serial: "emulator-test" },
@@ -120,12 +120,12 @@ describe("stream settings HTTP API", () => {
         ok: true,
         maxDimension: SCRCPY_DEFAULTS.maxSize,
         h264Bitrate: SCRCPY_DEFAULTS.bitRate,
-        h264Fps: SCRCPY_DEFAULTS.maxFps,
+        h264Fps: 30,
       });
       expect(starts[0]).toMatchObject({
         maxSize: SCRCPY_DEFAULTS.maxSize,
         bitRate: SCRCPY_DEFAULTS.bitRate,
-        maxFps: SCRCPY_DEFAULTS.maxFps,
+        maxFps: 30,
       });
     } finally {
       await app.stop();
@@ -318,7 +318,7 @@ describe("stream settings HTTP API", () => {
         ok: true,
         maxDimension: 1280,
         h264Bitrate: 8_000_000,
-        h264Fps: SCRCPY_DEFAULTS.maxFps,
+        h264Fps: 30,
       });
       expect(starts).toBe(1);
     } finally {
@@ -378,7 +378,7 @@ describe("stream settings HTTP API", () => {
         ok: true,
         maxDimension: 960,
         h264Bitrate: 8_000_000,
-        h264Fps: SCRCPY_DEFAULTS.maxFps,
+        h264Fps: 30,
       });
       const health = await app.handleRequest(new Request("http://localhost/health"));
       expect(health.status).toBe(200);
@@ -387,7 +387,7 @@ describe("stream settings HTTP API", () => {
         encoderSettings: {
           maxDimension: 960,
           h264Bitrate: SCRCPY_DEFAULTS.bitRate,
-          h264Fps: SCRCPY_DEFAULTS.maxFps,
+          h264Fps: 30,
         },
       });
       expect(starts).toBe(3);
@@ -502,13 +502,13 @@ describe("stream settings HTTP API", () => {
         ok: true,
         maxDimension: 720,
         h264Bitrate: 8_000_000,
-        h264Fps: SCRCPY_DEFAULTS.maxFps,
+        h264Fps: 30,
       });
       expect(await (await secondPatch).json()).toEqual({
         ok: true,
         maxDimension: 960,
         h264Bitrate: 8_000_000,
-        h264Fps: SCRCPY_DEFAULTS.maxFps,
+        h264Fps: 30,
       });
       expect(starts).toBe(3);
     } finally {

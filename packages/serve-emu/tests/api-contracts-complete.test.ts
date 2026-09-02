@@ -34,6 +34,47 @@ import {
 
 const timestamp = "2026-07-12T10:00:00.000Z";
 
+const grpcCaptureDiagnostics = {
+  imageMode: "mmap" as const,
+  rawGrpcMessagesReceived: 120,
+  rawGrpcMessagesEmitted: 100,
+  rawGrpcMessagesCoalesced: 20,
+  usableImages: 98,
+  sourceTimestampFps: 59.9,
+  rawMessageReceiveFps: 60,
+  usableImageFps: 58.8,
+  freshEncoderWriteFps: 58.2,
+  sequenceGaps: 22,
+  imagePayloadBytes: 2_211_840,
+  transportBytes: 216_760_320,
+  grpcMessageBytesReceived: 4_800,
+  mmapFileBytesRead: 433_520_640,
+  mmapReadRetries: 0,
+  mmapTornFramesDropped: 0,
+  sourceTimestampIntervalMs: {
+    windowSamples: 97,
+    latest: 16.7,
+    p50: 16.6,
+    p95: 20.1,
+    max: 25,
+  },
+  rawMessageReceiveIntervalMs: null,
+  productionToReceiveLatencyMs: null,
+  productionToUsableLatencyMs: null,
+  protobufDecodeTimeMs: null,
+  sharedReadCopyTimeMs: {
+    windowSamples: 98,
+    latest: 1,
+    p50: 0.9,
+    p95: 1.4,
+    max: 2.5,
+  },
+  freshEncoderWriteAttempts: 96,
+  repeatEncoderWriteAttempts: 2,
+  acceptedEncoderWrites: 95,
+  encoderBackpressureRejections: 3,
+};
+
 const appliedLocation = {
   latitude: 51.5072,
   longitude: -0.1276,
@@ -116,6 +157,18 @@ describe("complete API success contracts", () => {
         status: "streaming",
         clients: 2,
         stream: { transport: "websocket" },
+        viewerTransports: {
+          default: "websocket",
+          available: ["websocket", "webrtc"],
+          webrtc: {
+            transport: "webrtc",
+            codec: "h264",
+            iceServers: [
+              { urls: ["stun:stun.l.google.com:19302"] },
+            ],
+            iceTransportPolicy: "all",
+          },
+        },
       }),
     ).toEqual({
       generation: 3,
@@ -126,6 +179,16 @@ describe("complete API success contracts", () => {
       status: "streaming",
       clients: 2,
       stream: { transport: "websocket" },
+      viewerTransports: {
+        default: "websocket",
+        available: ["websocket", "webrtc"],
+        webrtc: {
+          transport: "webrtc",
+          codec: "h264",
+          iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }],
+          iceTransportPolicy: "all",
+        },
+      },
     });
     expect(
       parseDeviceListResponse({
@@ -389,6 +452,9 @@ describe("generic and detailed API contracts", () => {
       status: "streaming",
       serial: "emulator-5554",
       device: "Pixel 8",
+      streamMode: "grpc-screenshot",
+      grpcImageMode: "mmap",
+      grpcCapture: grpcCaptureDiagnostics,
       codec: "h264",
       size: { width: 1080, height: 1920 },
       clients: 1,
@@ -436,6 +502,8 @@ describe("generic and detailed API contracts", () => {
     });
 
     expect(health.frameStats?.intervalMs?.p95).toBe(20.1);
+    expect(health.grpcImageMode).toBe("mmap");
+    expect(health.grpcCapture).toEqual(grpcCaptureDiagnostics);
     expect(health.frameStats?.avgKeyFrameBytes).toBe(50_000);
     expect(health.clientsDetail[0]).toMatchObject({ id: 7, frameMeta: true });
     expect(health.lastErrorMeta).toEqual({ attempt: 2, phase: "connect" });
@@ -471,6 +539,23 @@ describe("API parser rejection boundaries", () => {
         stream: { transport: "websocket" },
       }),
     ).toThrow("dimensions must be positive");
+    expect(() =>
+      parseApiInfoResponse({
+        generation: 0,
+        serial: "a",
+        device: "d",
+        codec: "av1",
+        size: { width: 1, height: 1 },
+        status: "streaming",
+        clients: 0,
+        stream: { transport: "webrtc", codec: "h264", iceServers: [], iceTransportPolicy: "all" },
+        viewerTransports: {
+          default: "webrtc",
+          available: ["websocket"],
+          webrtc: null,
+        },
+      }),
+    ).toThrow("default must be available");
     expect(() => parseDeviceListResponse({ ok: true, devices: {} })).toThrow("must be an array");
     expect(() => parseAccessibilitySnapshot({ ok: true, nodes: {} })).toThrow("must be an array");
     expect(() => parseSessionSnapshot({ ...sessionSnapshot, events: [{ ...sessionSnapshot.events[0], kind: "unknown" }] })).toThrow(

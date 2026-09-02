@@ -41,15 +41,18 @@ import { parseGeoFix, setEmulatorLocationAsync, type GeoFix } from "./location.t
 import { parseRoutePlaybackRequest } from "./route-playback.ts";
 import type { StreamSocket } from "./stream-socket.ts";
 import {
+  DEFAULT_WEBRTC_STREAM_SETTINGS,
   DEFAULT_STREAM_SETTINGS,
   isJsonRequest,
   parseStreamEncoderSettingsPatch,
   redactedStreamSettings,
   StreamSettingsUnavailableError,
   streamEncoderSettingsEqual,
+  viewerTransportsFor,
   type StreamEncoderSettings,
   type StreamEncoderSettingsPatch,
   type StreamSettings,
+  type WebRtcStreamSettings,
 } from "./stream-settings.ts";
 import {
   corsHeadersForRequest,
@@ -123,7 +126,11 @@ export type {
   StreamSettings,
   WebRtcIceServer,
   WebRtcIceTransportPolicy,
+  WebRtcStreamSettings,
+  ViewerTransports,
 } from "./stream-settings.ts";
+export { STREAM_TRANSPORTS } from "./stream-settings.ts";
+export type { StreamTransport } from "./stream-settings.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // `src/middleware.ts` and `dist/middleware.mjs` both resolve to `<pkg>/dist/ui`.
@@ -142,6 +149,7 @@ export type AppOptions = {
   maxActiveUploads?: number;
   maxQueuedUploads?: number;
   uploadQueueTimeoutMs?: number;
+  /** Default viewer transport. Each browser viewer may select either available path. */
   streamSettings?: StreamSettings;
   /** Screen capture and input source. Defaults to scrcpy. */
   streamMode?: StreamMode;
@@ -313,7 +321,7 @@ async function createAppInternal(
   let streamEncoderSettings: StreamEncoderSettings = {
     maxDimension: opts.maxSize ?? SCRCPY_DEFAULTS.maxSize,
     h264Bitrate: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
-    h264Fps: opts.maxFps ?? SCRCPY_DEFAULTS.maxFps,
+    h264Fps: opts.maxFps ?? 30,
   };
   const openSession: typeof startEmuSession =
     dependencies.startSession ??
@@ -349,6 +357,10 @@ async function createAppInternal(
   const clients = new Set<Client>();
   const screen: Screen = { width: session.meta.width, height: session.meta.height };
   const streamSettings = opts.streamSettings ?? DEFAULT_STREAM_SETTINGS;
+  const webRtcStreamSettings: WebRtcStreamSettings =
+    streamSettings.transport === "webrtc"
+      ? streamSettings
+      : DEFAULT_WEBRTC_STREAM_SETTINGS;
   const startedMs = Date.now();
   const startedAt = new Date(startedMs).toISOString();
   let status: SessionStatus = "streaming";
@@ -377,6 +389,7 @@ async function createAppInternal(
   let watchdog: unknown | null = null;
   let nextClientId = 1;
   let webRtcPublisher: WebRtcPublisher | null = null;
+  let webRtcPublisherTask: Promise<WebRtcPublisher> | null = null;
   const webRtcStatsCollector = new WebRtcStatsCollector(() => clock.now());
   let removeFatalListener: (() => void) | null = null;
   const deviceStateOwner = {};
@@ -408,6 +421,8 @@ async function createAppInternal(
     serial: opts.serial,
     device: session.meta.deviceName,
     streamMode: session.mode,
+    grpcImageMode,
+    grpcCapture: session.diagnostics?.().grpcCapture ?? null,
     codec: session.meta.codecId,
     size: { width: screen.width, height: screen.height },
     clients: clients.size,
@@ -448,7 +463,7 @@ async function createAppInternal(
   });
 
   const webRtcStats = (sessionId: string) => {
-    if (streamSettings.transport !== "webrtc" || !webRtcPublisher) return null;
+    if (!webRtcPublisher) return null;
     return webRtcStatsCollector.report(
       {
         streamMode: session.mode,
@@ -736,31 +751,56 @@ async function createAppInternal(
     }, remainingCooldownMs);
   };
 
-  if (streamSettings.transport === "webrtc") {
-    if (session.meta.codecId !== "h264") {
-      await session.close();
-      await deviceState.release(
-        deviceStateOwner,
-        "WebRTC codec validation failed",
-      );
-      throw new Error(
-        `WebRTC transport currently supports only H.264, but the selected stream source uses ${session.meta.codecId}.`,
+  const publisherFor = (): Promise<WebRtcPublisher> => {
+    if (session.meta.codecId !== webRtcStreamSettings.codec) {
+      return Promise.reject(
+        new WebRtcSignalingError(
+          `WebRTC requires ${webRtcStreamSettings.codec.toUpperCase()} video, but ${session.mode} negotiated ${session.meta.codecId}.`,
+          409,
+          "webrtc_codec_unavailable",
+        ),
       );
     }
-    try {
-      webRtcPublisher = await openWebRtcPublisher({
-        settings: streamSettings,
-        onKeyframeRequest: requestVideoReset,
+    if (stopRequested || status !== "streaming") {
+      return Promise.reject(
+        new WebRtcSignalingError(
+          `WebRTC is unavailable while the stream is ${status}.`,
+          503,
+          "webrtc_unavailable",
+        ),
+      );
+    }
+    if (webRtcPublisher) return Promise.resolve(webRtcPublisher);
+    if (webRtcPublisherTask) return webRtcPublisherTask;
+
+    const generation = sessionGeneration;
+    const task = openWebRtcPublisher({
+      settings: webRtcStreamSettings,
+      onKeyframeRequest: requestVideoReset,
+    })
+      .then((publisher) => {
+        if (
+          stopRequested ||
+          status !== "streaming" ||
+          generation !== sessionGeneration ||
+          session.meta.codecId !== webRtcStreamSettings.codec
+        ) {
+          publisher.close();
+          throw new WebRtcSignalingError(
+            "The stream changed while WebRTC was starting.",
+            409,
+            "webrtc_stream_changed",
+          );
+        }
+        webRtcPublisher = publisher;
+        return publisher;
+      })
+      .finally(() => {
+        if (webRtcPublisherTask === task) webRtcPublisherTask = null;
       });
-    } catch (err) {
-      await session.close();
-      await deviceState.release(
-        deviceStateOwner,
-        "WebRTC publisher startup failed",
-      );
-      throw err;
-    }
-  }
+    webRtcPublisherTask = task;
+    return task;
+  };
 
   const dropUntilKeyFrame = (client: Client) => {
     client.droppedFrames++;
@@ -846,7 +886,9 @@ async function createAppInternal(
           lastFrameMs = Date.now();
           const config = f.isKey ? cachedConfig : null;
           webRtcStatsCollector.recordDelivery(
-            webRtcPublisher?.sendFrame(f, config),
+            activeSession.meta.codecId === webRtcStreamSettings.codec
+              ? webRtcPublisher?.sendFrame(f, config)
+              : undefined,
           );
           let rawOut: Buffer | null = null;
           let framedOut: Buffer | null = null;
@@ -888,20 +930,11 @@ async function createAppInternal(
     });
   };
 
-  const validateCapture = (candidate: EmuSession) => {
-    if (streamSettings.transport === "webrtc" && candidate.meta.codecId !== "h264") {
-      throw new Error(
-        `WebRTC transport currently supports only H.264, but the selected stream source uses ${candidate.meta.codecId}.`,
-      );
-    }
-  };
-
   const activateCapture = async (
     nextSession: EmuSession,
     settings: StreamEncoderSettings,
   ): Promise<void> => {
     try {
-      validateCapture(nextSession);
       if (stopRequested || status !== "streaming") {
         throw new StreamSettingsUnavailableError(`session is ${status}`);
       }
@@ -930,7 +963,12 @@ async function createAppInternal(
         size: { width: screen.width, height: screen.height },
       });
     }
-    webRtcPublisher?.resetVideoSource();
+    if (nextSession.meta.codecId === webRtcStreamSettings.codec) {
+      webRtcPublisher?.resetVideoSource();
+    } else {
+      webRtcPublisher?.close();
+      webRtcPublisher = null;
+    }
     startCaptureReader(nextSession, generation);
     requestVideoReset("stream settings changed");
   };
@@ -1141,6 +1179,10 @@ async function createAppInternal(
           lastError,
           clients: clients.size,
           stream: streamSettings,
+          viewerTransports: viewerTransportsFor(
+            streamSettings,
+            session.meta.codecId,
+          ),
         },
         { headers: { "Cache-Control": "no-store" } },
       );
@@ -1235,13 +1277,6 @@ async function createAppInternal(
       if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: webRtcCorsHeaders(req) });
       if (req.method !== "POST") return new Response("method not allowed", { status: 405, headers: webRtcCorsHeaders(req) });
       try {
-        if (streamSettings.transport !== "webrtc" || !webRtcPublisher) {
-          throw new WebRtcSignalingError(
-            "WebRTC transport is not enabled. Start serve-emu with --transport webrtc.",
-            400,
-            "webrtc_not_enabled",
-          );
-        }
         if (!isJsonRequest(req)) {
           throw new WebRtcSignalingError(
             "WebRTC offers require application/json",
@@ -1252,9 +1287,10 @@ async function createAppInternal(
         const offer = parseWebRtcOffer(
           parseJsonBody(await readBodyText(req, MAX_WEBRTC_SIGNALING_BODY_BYTES), "invalid_offer"),
         );
-        const answer = await webRtcPublisher.handleOffer(offer);
+        const publisher = await publisherFor();
+        const answer = await publisher.handleOffer(offer);
         if (req.signal.aborted) {
-          webRtcPublisher.closeSession(offer.sessionId);
+          publisher.closeSession(offer.sessionId);
           return new Response(null, { status: 499, headers: webRtcCorsHeaders(req) });
         }
         return Response.json(answer, { headers: webRtcJsonHeaders(req) });
@@ -1276,7 +1312,10 @@ async function createAppInternal(
         const request = parseWebRtcCloseRequest(
           parseJsonBody(await readBodyText(req, MAX_WEBRTC_CLOSE_BODY_BYTES), "invalid_close_request"),
         );
-        webRtcPublisher?.closeSession(request.sessionId);
+        const publisher =
+          webRtcPublisher ??
+          (await webRtcPublisherTask?.catch(() => null));
+        publisher?.closeSession(request.sessionId);
         return new Response(null, { status: 204, headers: webRtcCorsHeaders(req) });
       } catch (err) {
         const status = err instanceof WebRtcSignalingError ? err.status : 400;

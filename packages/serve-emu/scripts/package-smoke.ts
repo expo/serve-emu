@@ -30,13 +30,14 @@ interface PackReport {
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const npmExecutable = process.platform === "win32" ? "npm.cmd" : "npm";
 const bunExecutable = process.execPath;
-const nodeExecutable = "node";
+const nodeExecutable = Bun.which("node");
 
 const REQUIRED_PACKAGE_FILES = [
   "CHANGELOG.md",
   "LICENSE",
   "README.md",
   "dist/ui/index.html",
+  "dist/grpc-mmap.js",
   "dist/middleware.js",
   "dist/middleware.d.ts",
   "dist/stream-settings.js",
@@ -177,6 +178,12 @@ async function expectImportSuccess(
 }
 
 async function expectNodeMmapRegionSuccess(consumerDirectory: string): Promise<void> {
+  if (!nodeExecutable) {
+    console.warn(
+      "Package smoke test skipped the Node MMAP compatibility check because node is not available on PATH",
+    );
+    return;
+  }
   const moduleUrl = pathToFileURL(
     join(
       consumerDirectory,

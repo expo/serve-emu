@@ -11,7 +11,7 @@ import {
   H264StartupGate,
   androidKeyGestureToKeyboardEvents,
   androidKeycodeToW3c,
-  grpcPredecodeMaxFps,
+  grpcImageModeBehavior,
   isUsablePngFrame,
   isUsableRgbFrame,
   normalizeGrpcGestureText,
@@ -221,7 +221,7 @@ describe("gRPC screenshot session helpers", () => {
     ).toBe(false);
   });
 
-  test("accepts in-band PNG frames and bypasses predecode pacing only for MMAP", () => {
+  test("selects image-mode validation, encoding, and pacing behavior", () => {
     const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
     const base = {
       width: 2,
@@ -235,8 +235,18 @@ describe("gRPC screenshot session helpers", () => {
     expect(isUsablePngFrame({ ...base, image: Buffer.from("not png") })).toBe(
       false,
     );
-    expect(grpcPredecodeMaxFps("png", 60)).toBe(60);
-    expect(grpcPredecodeMaxFps("mmap", 60)).toBeUndefined();
+    const pngBehavior = grpcImageModeBehavior("png", 60);
+    expect(pngBehavior.encoderInputFormat).toBe("png");
+    expect(pngBehavior.predecodeMaxFps).toBe(60);
+    expect(pngBehavior.needsEncoderFollowUp(false, true)).toBe(true);
+    expect(pngBehavior.needsEncoderFollowUp(true, false)).toBe(true);
+    expect(pngBehavior.needsEncoderFollowUp(true, true)).toBe(false);
+
+    const mmapBehavior = grpcImageModeBehavior("mmap", 60);
+    expect(mmapBehavior.encoderInputFormat).toBe("rgb24");
+    expect(mmapBehavior.predecodeMaxFps).toBeUndefined();
+    expect(mmapBehavior.needsEncoderFollowUp(false, true)).toBe(true);
+    expect(mmapBehavior.needsEncoderFollowUp(true, false)).toBe(false);
   });
 
   test("treats an empty 0x0 MMAP notification as an inactive-display marker", () => {
