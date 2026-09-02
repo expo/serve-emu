@@ -12,6 +12,7 @@ import { rmdir as rmdirAsync, unlink as unlinkAsync } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_STABLE_READ_ATTEMPTS = 3;
 const DEFAULT_CLEANUP_ATTEMPTS = 5;
@@ -208,7 +209,7 @@ export class GrpcMmapScreenshotRegion {
     // AEMU's POSIX implementation strips the literal `file://` prefix; it does
     // not URL-decode percent escapes. Decode Node's URL so spaces, `%`, and
     // other valid path characters still identify the file the client owns.
-    this.handle = decodeURIComponent(Bun.pathToFileURL(path).href);
+    this.handle = decodeURIComponent(pathToFileURL(path).href);
     this.#fd = fd;
     this.byteLength = byteLength;
   }
