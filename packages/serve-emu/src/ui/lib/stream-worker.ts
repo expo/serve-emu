@@ -13,7 +13,7 @@ import {
   videoCodecLabel,
   webCodecsCodec,
   webCodecsHardwareAcceleration,
-} from "./video-codec";
+} from "./video-codec.ts";
 import {
   StreamSessionResources,
   beginStreamGeneration,

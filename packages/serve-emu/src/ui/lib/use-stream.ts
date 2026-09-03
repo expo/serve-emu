@@ -46,7 +46,7 @@ import {
   webRtcCodecError,
   webCodecsCodec,
   webCodecsHardwareAcceleration,
-} from "./video-codec";
+} from "./video-codec.ts";
 
 export type DeviceSize = { width: number; height: number };
 

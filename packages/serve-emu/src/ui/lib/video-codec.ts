@@ -1,5 +1,5 @@
-import type { GrpcVideoCodec } from "../../shared/api-contracts";
-import { buildCodecString, scanAU } from "./h264";
+import type { GrpcVideoCodec } from "../../shared/api-contracts.ts";
+import { buildCodecString, scanAU } from "./h264.ts";
 
 export type VideoSession = {
   size: { width: number; height: number };
