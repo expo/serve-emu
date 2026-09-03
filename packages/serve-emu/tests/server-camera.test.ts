@@ -8,7 +8,9 @@ import {
   placeholderCameraImage,
   readCameraFeed,
 } from "../src/camera.ts";
-import { startServer } from "../src/server.ts";
+import { solidPng } from "./fixtures/png.ts";
+import { startServer, type ServerDependencies } from "../src/server.ts";
+import type { EmulatorLaunch } from "../src/emulator.ts";
 import { parseCameraStatusResponse } from "../src/shared/api-contracts.ts";
 import type { EmuSession } from "../src/stream-session.ts";
 
@@ -72,6 +74,7 @@ function postImage(
 async function withServer(
   cameraSerial: string | undefined,
   run: (captured: CapturedServer) => Promise<void>,
+  extra: ServerDependencies = {},
 ): Promise<void> {
   const captured: CapturedServer = { options: null };
   const started = await startServer(
@@ -79,6 +82,7 @@ async function withServer(
     {
       openSession: async (options) => fakeSession(options.serial),
       serve: capturingServe(captured),
+      ...extra,
     },
   );
   try {
@@ -125,9 +129,7 @@ describe("standalone server camera image API", () => {
 
   test("POST writes the PNG to the requested facing and DELETE restores the placeholder", async () => {
     await withServer(SERIAL, async (captured) => {
-      const png = Buffer.from(placeholderCameraImage().png);
-      png.writeUInt32BE(640, 16);
-      png.writeUInt32BE(480, 20);
+      const png = solidPng(640, 480, [3, 4, 5]);
 
       const posted = parseCameraStatusResponse(
         await (await postImage(captured, Uint8Array.from(png), "?facing=front")).json(),
@@ -167,6 +169,82 @@ describe("standalone server camera image API", () => {
       expect((await readCameraFeed(SERIAL, "back")).digest).toBe(
         placeholderCameraImage().digest,
       );
+    });
+  });
+
+  test("tracks wiring across launches on a recycled serial", async () => {
+    const LAUNCHED = "emulator-5556";
+    const launches: EmulatorLaunch[] = [
+      { serial: LAUNCHED, proc: null, ownsProcess: true, cameraFeed: true, stop: () => {} },
+      { serial: LAUNCHED, proc: null, ownsProcess: true, cameraFeed: false, stop: () => {} },
+    ];
+    const readWired = async (captured: CapturedServer) =>
+      parseCameraStatusResponse(await (await request(captured, "/api/camera")).json())
+        .camera.wiredAtLaunch;
+
+    await withServer(
+      undefined,
+      async (captured) => {
+        const start = (avd: string, camera: boolean) =>
+          request(captured, "/api/avds/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ avd, camera, select: true }),
+          });
+
+        expect((await start("WithCamera", true)).status).toBe(200);
+        expect(await readWired(captured)).toBe(true);
+
+        // Same serial, relaunched without camera feeds. A stale claim here is
+        // what makes wiredAtLaunch lie about an emulator started with no flags.
+        expect((await start("WithoutCamera", false)).status).toBe(200);
+        expect(await readWired(captured)).toBe(false);
+      },
+      {
+        listDevices: async () => [
+          { serial: SERIAL, state: "device" },
+          { serial: LAUNCHED, state: "device" },
+        ],
+        startEmulator: async () => launches.shift()!,
+      },
+    );
+  });
+
+  test("refuses a camera launch that reused an already running AVD", async () => {
+    await withServer(
+      undefined,
+      async (captured) => {
+        const response = await request(captured, "/api/avds/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ avd: "AlreadyUp", camera: true, select: false }),
+        });
+        expect(response.status).toBe(400);
+        expect((await response.json()).error).toContain("already running");
+      },
+      {
+        listDevices: async () => [{ serial: SERIAL, state: "device" }],
+        startEmulator: async () => ({
+          serial: "emulator-5558",
+          proc: null,
+          ownsProcess: false,
+          cameraFeed: false,
+          stop: () => {},
+        }),
+      },
+    );
+  });
+
+  test("rejects a body the emulator could not decode", async () => {
+    await withServer(SERIAL, async (captured) => {
+      const real = solidPng(32, 24, [5, 5, 5]);
+      expect((await postImage(captured, Uint8Array.from(real))).status).toBe(200);
+
+      const truncated = Uint8Array.from(real.subarray(0, real.length - 20));
+      const response = await postImage(captured, truncated);
+      expect(response.status).toBe(400);
+      expect((await response.json()).error).toContain("truncated");
+      expect((await readCameraFeed(SERIAL, "back")).bytes).toBe(real.byteLength);
     });
   });
 

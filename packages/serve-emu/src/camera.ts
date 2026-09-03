@@ -9,7 +9,15 @@
  * emulator exposes no console or gRPC command that re-points a running camera.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
@@ -36,6 +44,8 @@ const PLACEHOLDER_CELL = 64;
 const PLACEHOLDER_DARK: Rgb = [0x1e, 0x22, 0x29];
 const PLACEHOLDER_LIGHT: Rgb = [0x49, 0x52, 0x60];
 const PNG_SIGNATURE = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
+/** 4-byte length, 4-byte type, 4-byte CRC. */
+const PNG_CHUNK_OVERHEAD_BYTES = 12;
 
 type Rgb = readonly [number, number, number];
 
@@ -90,11 +100,47 @@ function readPngSize(bytes: Uint8Array): PngSize {
   return { width, height };
 }
 
+/**
+ * Walk the chunk stream so a file that cannot be decoded is refused here rather
+ * than becoming a solid magenta camera frame. Checks structure only, which is
+ * what the demonstrated failures are: truncation, a corrupt or missing `IDAT`,
+ * and a missing `IEND`. Bit depth, colour type and interlace are left alone
+ * because the emulator's loader accepts more of those than is documented, and
+ * guessing at an allowlist would reject images it renders fine.
+ */
+function assertPngChunkStream(bytes: Uint8Array): void {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = PNG_SIGNATURE.length;
+  let sawImageData = false;
+
+  while (offset + PNG_CHUNK_OVERHEAD_BYTES <= bytes.length) {
+    const length = view.getUint32(offset);
+    const type = String.fromCharCode(...bytes.subarray(offset + 4, offset + 8));
+    const end = offset + PNG_CHUNK_OVERHEAD_BYTES + length;
+    if (end > bytes.length) {
+      throw new Error(`camera image PNG is truncated inside its ${type} chunk`);
+    }
+    if (crc32(bytes.subarray(offset + 4, end - 4)) !== view.getUint32(end - 4)) {
+      throw new Error(`camera image PNG has a corrupt ${type} chunk`);
+    }
+    if (type === "IDAT") sawImageData = true;
+    if (type === "IEND") {
+      if (!sawImageData) throw new Error("camera image PNG has no IDAT chunk");
+      return;
+    }
+    offset = end;
+  }
+
+  throw new Error("camera image PNG is truncated before its IEND chunk");
+}
+
 export function assertCameraImage(bytes: Uint8Array): PngSize {
   if (bytes.length > MAX_CAMERA_IMAGE_BYTES) {
     throw new Error(`camera image exceeds ${MAX_CAMERA_IMAGE_BYTES} bytes`);
   }
-  return readPngSize(bytes);
+  const size = readPngSize(bytes);
+  assertPngChunkStream(bytes);
+  return size;
 }
 
 const CRC_TABLE = (() => {
@@ -277,17 +323,40 @@ export async function clearCameraImage(
   return readCameraFeed(serial, facing);
 }
 
+/** Drop staging files this serial's earlier runs left behind on a crash. */
+async function sweepStagingFiles(serial: string): Promise<void> {
+  const root = cameraFeedRoot();
+  const prefixes = CAMERA_FACINGS.map((facing) => `${feedFileName(serial, facing)}.`);
+  let names: string[];
+  try {
+    names = await readdir(root);
+  } catch {
+    return;
+  }
+  await Promise.all(
+    names
+      .filter(
+        (name) =>
+          name.endsWith(".tmp") && prefixes.some((prefix) => name.startsWith(prefix)),
+      )
+      .map((name) => unlink(join(root, name)).catch(() => {})),
+  );
+}
+
 /**
- * Give every facing a parsable PNG before the emulator starts. An absent or
- * unparsable file renders as solid magenta, which reads as a broken camera.
+ * Put every facing in a known state before the emulator starts. Always writes,
+ * rather than keeping whatever is on disk: serials are recycled
+ * (`emulator-<port>`), and a launch only reaches here when it spawned a fresh
+ * emulator, so an existing file belongs to an unrelated earlier run and must
+ * not become this app's camera. An absent or unparsable file would render as
+ * solid magenta, which reads as a broken camera.
  */
 export async function seedCameraFeeds(serial: string): Promise<void> {
   const { png } = placeholderCameraImage();
+  await sweepStagingFiles(serial);
   await Promise.all(
-    CAMERA_FACINGS.map(async (facing) => {
-      const feed = await readCameraFeed(serial, facing);
-      if (feed.present && feed.width !== null) return;
-      await writeFeedFile(cameraFeedPath(serial, facing), png);
-    }),
+    CAMERA_FACINGS.map((facing) =>
+      writeFeedFile(cameraFeedPath(serial, facing), png),
+    ),
   );
 }

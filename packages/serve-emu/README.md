@@ -447,6 +447,10 @@ at two PNG files under `~/.cache/serve-emu/camera/` (override the directory with
 `SERVE_EMU_CAMERA_DIR`). The emulator only reads its camera source at startup,
 which is why there is no way to add this to an emulator that is already running.
 
+These endpoints live on the standalone server only. The embeddable middleware
+(`createApp` / `createRouter`, the package's default export) does not serve them
+yet, so a host that mounts serve-emu as middleware cannot drive the camera.
+
 Once wired, changing the picture is a plain file write, so no restart is needed:
 
 ```sh

@@ -2220,11 +2220,21 @@ export async function startServer(
           const camera =
             (payload as Record<string, unknown>).camera === true;
           const launch = await launchEmulator({ avd: avd.trim(), camera });
+          if (camera && !launch.cameraFeed) {
+            throw new Error(
+              `AVD "${avd.trim()}" is already running, so its camera source cannot be changed; ` +
+                "the emulator only reads that flag at startup. Stop it first, or start it with restartAvd.",
+            );
+          }
+          // Authoritative in both directions: emulator serials are recycled, so a
+          // launch without feeds must clear any stale claim on the same serial.
           if (launch.cameraFeed) cameraWiredSerials.add(launch.serial);
+          else cameraWiredSerials.delete(launch.serial);
           try {
             sessions.assertPublished(requestContext);
           } catch (err) {
             launch.stop();
+            cameraWiredSerials.delete(launch.serial);
             throw err;
           }
           const select = (payload as Record<string, unknown>).select !== false;
@@ -2234,6 +2244,7 @@ export async function startServer(
               return Response.json({ ...switched, avd: avd.trim() });
             } catch (err) {
               launch.stop();
+              cameraWiredSerials.delete(launch.serial);
               throw err;
             }
           }

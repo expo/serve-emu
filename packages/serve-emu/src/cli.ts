@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { pickDevice } from "./adb.ts";
-import { setCameraImage } from "./camera.ts";
+import { assertCameraImage, setCameraImage } from "./camera.ts";
 import { listAvds, listRunningAvds, startEmulator } from "./emulator.ts";
 import { SCRCPY_DEFAULTS } from "./scrcpy.ts";
 import {
@@ -269,6 +269,21 @@ Options:
   process.exit(0);
 }
 
+async function readCameraImage(path: string): Promise<Uint8Array> {
+  let bytes: Uint8Array;
+  try {
+    bytes = await readFile(path);
+  } catch (cause) {
+    throw new Error(`--camera-image could not be read: ${path}`, { cause });
+  }
+  assertCameraImage(bytes);
+  return bytes;
+}
+
+function avdName(avd: string | undefined): string {
+  return avd?.replace(/^@/, "") ?? "";
+}
+
 async function main() {
   await checkForUpdate().catch(() => {});
 
@@ -294,6 +309,10 @@ async function main() {
       "--camera and --camera-image require --avd; the emulator only reads its camera source at startup.",
     );
   }
+  // Read and validate before launching. A typo or a JPEG is a pure input error,
+  // and finding it after a two-minute boot would leave an emulator to clean up.
+  const cameraImage =
+    cameraImagePath === undefined ? undefined : await readCameraImage(cameraImagePath);
 
   if (values.avd && values.serial) {
     throw new Error("Use either --avd to launch an emulator or --serial to attach to an existing device, not both.");
@@ -329,8 +348,19 @@ async function main() {
         camera,
       })).serial
     : await pickDevice(values.serial);
-  if (cameraImagePath !== undefined && emulatorLaunch?.cameraFeed) {
-    await setCameraImage(serial, "back", await readFile(cameraImagePath));
+  if (camera && emulatorLaunch && !emulatorLaunch.cameraFeed) {
+    throw new Error(
+      `AVD "${avdName(values.avd)}" is already running, so its camera source cannot be changed; ` +
+        "the emulator only reads that flag at startup. Pass --restart-avd to relaunch it with camera feeds attached.",
+    );
+  }
+  if (cameraImage) {
+    try {
+      await setCameraImage(serial, "back", cameraImage);
+    } catch (err) {
+      emulatorLaunch?.stop();
+      throw err;
+    }
   }
   const port = Number(values.port);
   const maxFps = numberOption("max-fps", SCRCPY_DEFAULTS.maxFps);
