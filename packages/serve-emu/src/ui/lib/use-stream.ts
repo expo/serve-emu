@@ -34,7 +34,7 @@ import type {
   StreamLifecycleState,
 } from "./stream-lifecycle";
 import type { StreamStats, StreamWorkerEvent } from "./stream-worker";
-import type { GrpcVideoCodec } from "../../shared/api-contracts";
+import type { GrpcVideoCodec } from "../../shared/api-contracts.ts";
 import {
   fixedWebCodecsCodec,
   isGrpcVideoCodec,

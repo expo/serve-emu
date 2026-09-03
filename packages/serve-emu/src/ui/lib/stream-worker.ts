@@ -1,10 +1,10 @@
-import { scanAU } from "./h264";
+import { scanAU } from "./h264.ts";
 import {
   controlAcknowledgementMessage,
   logControlAcknowledgement,
 } from "./control-ack";
 import { epochNowMs, parseFramePacket } from "../../shared/frame-meta";
-import type { GrpcVideoCodec } from "../../shared/api-contracts";
+import type { GrpcVideoCodec } from "../../shared/api-contracts.ts";
 import {
   fixedWebCodecsCodec,
   isWebCodecsUnsupportedError,
