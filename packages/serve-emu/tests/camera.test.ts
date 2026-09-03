@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -17,6 +17,25 @@ import {
   seedCameraFeeds,
   setCameraImage,
 } from "../src/camera.ts";
+
+/**
+ * Header-valid PNG of a caller-chosen length. `assertCameraImage` reads only the
+ * signature and IHDR, so this is enough to exercise the write path with bodies
+ * whose bytes and lengths are all distinct.
+ */
+function syntheticPng(width: number, height: number, fillerBytes: number, fill: number): Buffer {
+  const png = Buffer.alloc(29 + fillerBytes, fill);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png, 0);
+  png.writeUInt32BE(13, 8);
+  png.write("IHDR", 12, "ascii");
+  png.writeUInt32BE(width, 16);
+  png.writeUInt32BE(height, 20);
+  return png;
+}
+
+async function stagingFiles(): Promise<string[]> {
+  return (await readdir(cameraFeedRoot())).filter((name) => name.endsWith(".tmp"));
+}
 
 let root: string;
 const previousRoot = process.env.SERVE_EMU_CAMERA_DIR;
@@ -139,8 +158,20 @@ describe("camera feed writes", () => {
 
   test("leaves no staging file behind", async () => {
     await setCameraImage("emulator-5554", "back", placeholderCameraImage().png);
-    const staging = `${cameraFeedPath("emulator-5554", "back")}.${process.pid}.tmp`;
-    expect(await Bun.file(staging).exists()).toBe(false);
+    expect(await stagingFiles()).toEqual([]);
+  });
+
+  test("concurrent writes to one facing publish one whole image, never a mixture", async () => {
+    const variants = Array.from({ length: 8 }, (_, i) =>
+      syntheticPng(100 + i, 200 + i, 4096 * (i + 1), 0x40 + i),
+    );
+    await Promise.all(
+      variants.map((png) => setCameraImage("emulator-5554", "back", png)),
+    );
+
+    const published = await readFile(cameraFeedPath("emulator-5554", "back"));
+    expect(variants.some((variant) => variant.equals(published))).toBe(true);
+    expect(await stagingFiles()).toEqual([]);
   });
 
   test("marks a caller-supplied image as not the placeholder", async () => {
