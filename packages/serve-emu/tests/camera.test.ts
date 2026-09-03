@@ -17,21 +17,7 @@ import {
   seedCameraFeeds,
   setCameraImage,
 } from "../src/camera.ts";
-
-/**
- * Header-valid PNG of a caller-chosen length. `assertCameraImage` reads only the
- * signature and IHDR, so this is enough to exercise the write path with bodies
- * whose bytes and lengths are all distinct.
- */
-function syntheticPng(width: number, height: number, fillerBytes: number, fill: number): Buffer {
-  const png = Buffer.alloc(29 + fillerBytes, fill);
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png, 0);
-  png.writeUInt32BE(13, 8);
-  png.write("IHDR", 12, "ascii");
-  png.writeUInt32BE(width, 16);
-  png.writeUInt32BE(height, 20);
-  return png;
-}
+import { headerOnlyPng, solidPng } from "./fixtures/png.ts";
 
 async function stagingFiles(): Promise<string[]> {
   return (await readdir(cameraFeedRoot())).filter((name) => name.endsWith(".tmp"));
@@ -108,12 +94,40 @@ describe("camera input validation", () => {
     ).toThrow("exceeds");
   });
 
-  test("rejects a PNG whose IHDR is missing or empty", () => {
-    const png = Buffer.from(placeholderCameraImage().png);
-    png.write("IDAT", 12, "ascii");
-    expect(() => assertCameraImage(png)).toThrow("missing its IHDR header");
+  test("rejects a PNG the emulator could not decode", () => {
+    expect(() => assertCameraImage(headerOnlyPng(4000, 3000, 4096))).toThrow(
+      "truncated",
+    );
 
-    const zeroed = Buffer.from(placeholderCameraImage().png);
+    const real = solidPng(8, 8, [10, 20, 30]);
+    expect(() => assertCameraImage(real.subarray(0, real.length - 20))).toThrow(
+      "truncated",
+    );
+
+    const corruptIdat = Buffer.from(real);
+    corruptIdat[corruptIdat.length - 20] ^= 0xff;
+    expect(() => assertCameraImage(corruptIdat)).toThrow("corrupt IDAT chunk");
+
+    const noImageData = Buffer.concat([
+      real.subarray(0, 8 + 25),
+      real.subarray(real.length - 12),
+    ]);
+    expect(() => assertCameraImage(noImageData)).toThrow("no IDAT chunk");
+  });
+
+  test("accepts a decodable PNG built outside this module", () => {
+    expect(assertCameraImage(solidPng(64, 48, [1, 2, 3]))).toEqual({
+      width: 64,
+      height: 48,
+    });
+  });
+
+  test("rejects a PNG whose IHDR is missing or empty", () => {
+    const renamed = Buffer.from(solidPng(8, 8, [0, 0, 0]));
+    renamed.write("IDAT", 12, "ascii");
+    expect(() => assertCameraImage(renamed)).toThrow("missing its IHDR header");
+
+    const zeroed = Buffer.from(solidPng(8, 8, [0, 0, 0]));
     zeroed.writeUInt32BE(0, 16);
     expect(() => assertCameraImage(zeroed)).toThrow("zero dimensions");
   });
@@ -163,7 +177,7 @@ describe("camera feed writes", () => {
 
   test("concurrent writes to one facing publish one whole image, never a mixture", async () => {
     const variants = Array.from({ length: 8 }, (_, i) =>
-      syntheticPng(100 + i, 200 + i, 4096 * (i + 1), 0x40 + i),
+      solidPng(120 + i * 40, 90 + i * 30, [i, 0x40 + i, 0x80 + i]),
     );
     await Promise.all(
       variants.map((png) => setCameraImage("emulator-5554", "back", png)),
@@ -175,10 +189,7 @@ describe("camera feed writes", () => {
   });
 
   test("marks a caller-supplied image as not the placeholder", async () => {
-    const png = Buffer.from(placeholderCameraImage().png);
-    png.writeUInt32BE(640, 16);
-    png.writeUInt32BE(480, 20);
-    const feed = await setCameraImage("emulator-5554", "back", png);
+    const feed = await setCameraImage("emulator-5554", "back", solidPng(640, 480, [9, 9, 9]));
     expect(feed.placeholder).toBe(false);
     expect(feed.width).toBe(640);
   });
@@ -195,9 +206,7 @@ describe("camera feed writes", () => {
   });
 
   test("clear restores the placeholder", async () => {
-    const png = Buffer.from(placeholderCameraImage().png);
-    png.writeUInt32BE(640, 16);
-    await setCameraImage("emulator-5554", "back", png);
+    await setCameraImage("emulator-5554", "back", solidPng(640, 480, [9, 9, 9]));
     expect((await readCameraFeed("emulator-5554", "back")).placeholder).toBe(false);
     expect((await clearCameraImage("emulator-5554", "back")).placeholder).toBe(true);
   });
@@ -211,19 +220,31 @@ describe("seedCameraFeeds", () => {
     expect(status.feeds.every((feed) => feed.placeholder)).toBe(true);
   });
 
-  test("keeps an image a caller already set", async () => {
-    const png = Buffer.from(placeholderCameraImage().png);
-    png.writeUInt32BE(640, 16);
-    await setCameraImage("emulator-5554", "back", png);
+  test("replaces whatever an earlier run on this serial left behind", async () => {
+    await setCameraImage("emulator-5554", "back", solidPng(640, 480, [7, 7, 7]));
     await seedCameraFeeds("emulator-5554");
-    expect((await readCameraFeed("emulator-5554", "back")).width).toBe(640);
-    expect((await readCameraFeed("emulator-5554", "front")).placeholder).toBe(true);
+    const feeds = await Promise.all(
+      (["back", "front"] as const).map((facing) => readCameraFeed("emulator-5554", facing)),
+    );
+    expect(feeds.every((feed) => feed.placeholder)).toBe(true);
   });
 
   test("replaces a file the emulator could not parse", async () => {
     await Bun.write(cameraFeedPath("emulator-5554", "back"), "corrupt");
     await seedCameraFeeds("emulator-5554");
     expect((await readCameraFeed("emulator-5554", "back")).placeholder).toBe(true);
+  });
+
+  test("sweeps only this serial's leftover staging files", async () => {
+    const ours = `${cameraFeedPath("emulator-5554", "back")}.abandoned.tmp`;
+    const theirs = `${cameraFeedPath("emulator-5556", "back")}.abandoned.tmp`;
+    await Bun.write(ours, "partial");
+    await Bun.write(theirs, "partial");
+
+    await seedCameraFeeds("emulator-5554");
+
+    expect(await Bun.file(ours).exists()).toBe(false);
+    expect(await Bun.file(theirs).exists()).toBe(true);
   });
 });
 

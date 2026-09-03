@@ -520,6 +520,7 @@ export type ApiContractMap = {
   };
   "/api/avds/start": {
     POST: EndpointContract<
+      /** `camera` is honoured by the standalone server; the middleware ignores it. */
       { avd: string; select?: boolean; camera?: boolean },
       AvdStartResponse
     >;
