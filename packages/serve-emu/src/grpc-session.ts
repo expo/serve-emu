@@ -23,13 +23,16 @@ import {
 } from "./emulator-grpc.ts";
 import { execText, type ExecResult } from "./exec.ts";
 import {
-  H264Encoder,
+  VideoEncoder,
   assertFfmpegAvailable,
-  type H264EncoderInputFormat,
-  type H264EncoderOpts,
   type QuarterTurn,
+  type VideoEncoderInputFormat,
+  type VideoEncoderOpts,
 } from "./h264-encoder.ts";
-import { H264StartupGate } from "./h264-readiness.ts";
+import {
+  H264StartupGate,
+  VideoStartupGate,
+} from "./h264-readiness.ts";
 import {
   GrpcMmapScreenshotRegion,
   rgb888MmapRegionBytes,
@@ -56,12 +59,14 @@ import type {
   StreamFailure,
   StreamMeta,
 } from "./stream-session.ts";
-import type {
-  GrpcImageMode,
-  InputSource,
+import {
+  DEFAULT_GRPC_VIDEO_CODEC,
+  type GrpcImageMode,
+  type GrpcVideoCodec,
+  type InputSource,
 } from "./shared/api-contracts.ts";
 
-export { H264StartupGate } from "./h264-readiness.ts";
+export { H264StartupGate, VideoStartupGate } from "./h264-readiness.ts";
 
 // Annex-B does not expose the final access-unit length. Submit one duplicate
 // RGB frame only after the observed source cadence goes idle, so ffmpeg emits
@@ -671,7 +676,7 @@ export function isUsablePngFrame(image: EmuImage): boolean {
 }
 
 export type GrpcImageModeBehavior = {
-  encoderInputFormat: H264EncoderInputFormat;
+  encoderInputFormat: VideoEncoderInputFormat;
   predecodeMaxFps: number | undefined;
   needsEncoderFollowUp(repeat: boolean, encoderHasOutput: boolean): boolean;
 };
@@ -680,19 +685,21 @@ export type GrpcImageModeBehavior = {
 export function grpcImageModeBehavior(
   imageMode: GrpcImageMode,
   maxFps: number,
+  videoCodec: GrpcVideoCodec = DEFAULT_GRPC_VIDEO_CODEC,
 ): GrpcImageModeBehavior {
+  const needsAccessUnitBoundary = videoCodec === "h264";
   if (imageMode === "png") {
     return {
       encoderInputFormat: "png",
       predecodeMaxFps: maxFps,
       needsEncoderFollowUp: (repeat, encoderHasOutput) =>
-        !repeat || !encoderHasOutput,
+        needsAccessUnitBoundary && (!repeat || !encoderHasOutput),
     };
   }
   return {
     encoderInputFormat: "rgb24",
     predecodeMaxFps: undefined,
-    needsEncoderFollowUp: (repeat) => !repeat,
+    needsEncoderFollowUp: (repeat) => needsAccessUnitBoundary && !repeat,
   };
 }
 
@@ -837,6 +844,7 @@ type GrpcImageCaptureTransport = GrpcImageModeBehavior & {
 
 function createGrpcImageCaptureTransport(options: {
   imageMode: GrpcImageMode;
+  videoCodec: GrpcVideoCodec;
   maxFps: number;
   maxSize: number;
   probe: Pick<EmuImage, "width" | "height">;
@@ -849,7 +857,11 @@ function createGrpcImageCaptureTransport(options: {
   ): void;
   onError(error: unknown): void;
 }): GrpcImageCaptureTransport {
-  const behavior = grpcImageModeBehavior(options.imageMode, options.maxFps);
+  const behavior = grpcImageModeBehavior(
+    options.imageMode,
+    options.maxFps,
+    options.videoCodec,
+  );
   if (options.imageMode === "png") {
     let closed = false;
     return {
@@ -1343,10 +1355,13 @@ export type GrpcSessionEncoder = {
 };
 
 export type GrpcSessionRuntime = {
-  assertFfmpeg(signal: AbortSignal): Promise<void>;
+  assertFfmpeg(
+    signal: AbortSignal,
+    codec: GrpcVideoCodec,
+  ): Promise<void>;
   ensureEndpoint(serial: string, signal: AbortSignal): Promise<GrpcEndpoint>;
   createClient(endpoint: GrpcEndpoint): GrpcSessionClient;
-  createEncoder(options: H264EncoderOpts): GrpcSessionEncoder;
+  createEncoder(options: VideoEncoderOpts): GrpcSessionEncoder;
   isDeviceAwake(serial: string, signal: AbortSignal): Promise<boolean>;
   wakeDevice(serial: string, signal: AbortSignal): Promise<void>;
   sleep(ms: number, signal: AbortSignal): Promise<void>;
@@ -1399,6 +1414,7 @@ function lastSessionPacket(
 /** A byte-bounded queue that only resumes readers from decodable H.264 state. */
 export class GrpcVideoPacketQueue {
   readonly #maxBytes: number;
+  readonly #requiresConfig: boolean;
   #packets: VideoPacket[] = [];
   #byteLength = 0;
   #latestConfig: FramePacket | null = null;
@@ -1406,11 +1422,15 @@ export class GrpcVideoPacketQueue {
   #pendingSession: SessionPacket | null = null;
   #awaitingKeyFrame = false;
 
-  constructor(maxBytes = MAX_QUEUED_PACKET_BYTES) {
+  constructor(
+    maxBytes = MAX_QUEUED_PACKET_BYTES,
+    codec: GrpcVideoCodec = DEFAULT_GRPC_VIDEO_CODEC,
+  ) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
       throw new RangeError("maxBytes must be a positive safe integer");
     }
     this.#maxBytes = maxBytes;
+    this.#requiresConfig = codec === "h264";
   }
 
   get byteLength(): number {
@@ -1444,20 +1464,24 @@ export class GrpcVideoPacketQueue {
       keyFrame?.type === "frame"
         ? this.#configByKeyFrame.get(keyFrame)
         : undefined;
-    if (keyIndex < 0 || !keyFrameConfig) {
+    if (keyIndex < 0 || (this.#requiresConfig && !keyFrameConfig)) {
       return this.#dropUntilKeyFrame();
     }
 
     const session = lastSessionPacket(this.#packets, keyIndex);
     const suffix = this.#packets.slice(keyIndex);
-    const retained = [...(session ? [session] : []), keyFrameConfig, ...suffix];
+    const retained = [
+      ...(session ? [session] : []),
+      ...(keyFrameConfig ? [keyFrameConfig] : []),
+      ...suffix,
+    ];
     const retainedBytes = retained.reduce(
       (total, queued) => total + queuedPacketBytes(queued),
       0,
     );
     if (retainedBytes > this.#maxBytes) {
       throw new Error(
-        `decodable gRPC H.264 queue exceeds ${this.#maxBytes} byte limit`,
+        `decodable gRPC video queue exceeds ${this.#maxBytes} byte limit`,
       );
     }
     this.#packets = retained;
@@ -1489,10 +1513,10 @@ export class GrpcVideoPacketQueue {
   }
 
   #resumeAtKeyFrame(keyFrame: FramePacket): GrpcPacketQueuePushResult {
-    if (!this.#latestConfig) return PACKET_DROPPED;
+    if (this.#requiresConfig && !this.#latestConfig) return PACKET_DROPPED;
     const resumed = [
       ...(this.#pendingSession ? [this.#pendingSession] : []),
-      this.#latestConfig,
+      ...(this.#latestConfig ? [this.#latestConfig] : []),
       keyFrame,
     ];
     const resumedBytes = resumed.reduce(
@@ -1501,7 +1525,7 @@ export class GrpcVideoPacketQueue {
     );
     if (resumedBytes > this.#maxBytes) {
       throw new Error(
-        `decodable gRPC H.264 queue exceeds ${this.#maxBytes} byte limit`,
+        `decodable gRPC video queue exceeds ${this.#maxBytes} byte limit`,
       );
     }
     this.#packets = resumed;
@@ -1613,10 +1637,10 @@ const defaultReadDisplaySizeSignal: NonNullable<
 };
 
 const DEFAULT_GRPC_SESSION_RUNTIME: GrpcSessionRuntime = {
-  assertFfmpeg: assertFfmpegAvailable,
+  assertFfmpeg: (signal, codec) => assertFfmpegAvailable(codec, signal),
   ensureEndpoint: ensureEmulatorGrpcEndpoint,
   createClient: (endpoint) => new EmulatorGrpcClient(endpoint),
-  createEncoder: (options) => new H264Encoder(options),
+  createEncoder: (options) => new VideoEncoder(options),
   isDeviceAwake,
   wakeDevice: (serial, signal) => runPowerCommand(serial, "wakeup", signal),
   sleep,
@@ -1653,7 +1677,7 @@ function nonNegativeInteger(
 }
 
 /**
- * Host-side emulator screenshot capture and input, encoded to the same H.264
+ * Host-side emulator screenshot capture and input, encoded to the same video
  * packet contract as scrcpy.
  */
 export async function startGrpcSession(
@@ -1665,6 +1689,7 @@ export async function startGrpcSession(
   const inputSource: InputSource = options.inputSource;
   const openScrcpyControl =
     dependencies.startScrcpyControl ?? startScrcpyControl;
+  const videoCodec = options.grpcVideoCodec ?? DEFAULT_GRPC_VIDEO_CODEC;
   const runtime: GrpcSessionRuntime = {
     ...DEFAULT_GRPC_SESSION_RUNTIME,
     ...dependencies.runtime,
@@ -1722,7 +1747,7 @@ export async function startGrpcSession(
 
   let endpoint: Awaited<ReturnType<typeof ensureEmulatorGrpcEndpoint>>;
   try {
-    await runtime.assertFfmpeg(lifetime.signal);
+    await runtime.assertFfmpeg(lifetime.signal, videoCodec);
     endpoint = await runtime.ensureEndpoint(serial, lifetime.signal);
   } catch (error) {
     options.signal?.removeEventListener("abort", abortFromParent);
@@ -1730,9 +1755,12 @@ export async function startGrpcSession(
   }
   const client = runtime.createClient(endpoint);
   const listeners = new Set<(failure: StreamFailure) => void>();
-  const packetQueue = new GrpcVideoPacketQueue();
+  const packetQueue = new GrpcVideoPacketQueue(
+    MAX_QUEUED_PACKET_BYTES,
+    videoCodec,
+  );
   const waiters: Array<(packet: VideoPacket | null) => void> = [];
-  const startupGate = new H264StartupGate();
+  const startupGate = new VideoStartupGate(videoCodec);
   let fatalFailure: StreamFailure | null = null;
   let closed = false;
   let closeTask: Promise<void> | null = null;
@@ -1899,6 +1927,7 @@ export async function startGrpcSession(
       sessionMeta.height = size.height;
     }
     const next = runtime.createEncoder({
+      codec: videoCodec,
       width: latest.width,
       height: latest.height,
       quarterTurn: 0,
@@ -1937,7 +1966,7 @@ export async function startGrpcSession(
   requestQueuedKeyFrame = () => {
     void restartEncoder(false, false).catch((error) =>
       emitFatal({
-        message: `could not recover the H.264 packet queue: ${error instanceof Error ? error.message : String(error)}`,
+        message: `could not recover the ${videoCodec.toUpperCase()} packet queue: ${error instanceof Error ? error.message : String(error)}`,
         code: "encoder-exit",
       }),
     );
@@ -2008,7 +2037,7 @@ export async function startGrpcSession(
       void refreshNativeTouchGeometry(true);
       void restartEncoder(true, true).catch((error) =>
         emitFatal({
-          message: `could not restart H.264 encoder: ${error instanceof Error ? error.message : String(error)}`,
+          message: `could not restart ${videoCodec.toUpperCase()} encoder: ${error instanceof Error ? error.message : String(error)}`,
           code: "encoder-exit",
         }),
       );
@@ -2346,6 +2375,7 @@ export async function startGrpcSession(
     if (existingFailure) throw new Error(existingFailure.message);
     captureTransport = createGrpcImageCaptureTransport({
       imageMode,
+      videoCodec,
       maxFps,
       maxSize,
       probe,
@@ -2447,7 +2477,7 @@ export async function startGrpcSession(
     if (!controls) throw new Error("gRPC input controls were not initialized");
     const meta: StreamMeta = {
       deviceName: endpoint.avdName ?? serial,
-      codecId: "h264",
+      codecId: videoCodec,
       width: size.width,
       height: size.height,
     };

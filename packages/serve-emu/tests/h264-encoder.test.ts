@@ -2,13 +2,19 @@ import { spawnSync } from "node:child_process";
 import { describe, expect, test } from "bun:test";
 import {
   createFfmpegAvailabilityProbe,
+  FFMPEG_ENCODER_FOR_CODEC,
   FfmpegStderrTail,
   ffmpegInputArgs,
+  ffmpegOutputArgs,
   H264Encoder,
   H264OutputParser,
+  isVpxKeyFrame,
+  IvfOutputParser,
   resolveFfmpeg,
+  VideoEncoder,
   videoFilter,
   type H264EncoderOpts,
+  type VideoCodec,
 } from "../src/h264-encoder.ts";
 import type { ExecResult } from "../src/exec.ts";
 import type { VideoFrame } from "../src/scrcpy.ts";
@@ -40,17 +46,23 @@ function execResult(
   };
 }
 
-function hasFfmpegWithLibx264(): boolean {
+function hasFfmpegEncoder(codec: VideoCodec): boolean {
   const result = spawnSync(resolveFfmpeg(), ["-hide_banner", "-encoders"], {
     encoding: "utf8",
   });
   return (
     result.status === 0 &&
-    /\blibx264\b/.test(`${result.stdout ?? ""}\n${result.stderr ?? ""}`)
+    `${result.stdout ?? ""}\n${result.stderr ?? ""}`.includes(
+      FFMPEG_ENCODER_FOR_CODEC[codec],
+    )
   );
 }
 
-const realFfmpegTest = hasFfmpegWithLibx264() ? test : test.skip;
+const realFfmpegTest = hasFfmpegEncoder("h264") ? test : test.skip;
+const realVpxFfmpegTest: Record<"vp8" | "vp9", typeof test> = {
+  vp8: hasFfmpegEncoder("vp8") ? test : test.skip,
+  vp9: hasFfmpegEncoder("vp9") ? test : test.skip,
+};
 
 function nal(
   typeByte: number,
@@ -67,6 +79,42 @@ function aud(startCodeBytes: 3 | 4 = 4): Buffer {
 
 function pushInUnevenChunks(parser: H264OutputParser, stream: Buffer): void {
   const widths = [1, 2, 7, 3, 11, 5];
+  let offset = 0;
+  let index = 0;
+  while (offset < stream.length) {
+    const end = Math.min(
+      stream.length,
+      offset + widths[index % widths.length]!,
+    );
+    parser.push(stream.subarray(offset, end));
+    offset = end;
+    index++;
+  }
+}
+
+function ivfHeader(codec: "vp8" | "vp9", headerBytes = 32): Buffer {
+  const header = Buffer.alloc(headerBytes);
+  header.write("DKIF", 0, "ascii");
+  header.writeUInt16LE(0, 4);
+  header.writeUInt16LE(headerBytes, 6);
+  header.write(codec === "vp8" ? "VP80" : "VP90", 8, "ascii");
+  header.writeUInt16LE(16, 12);
+  header.writeUInt16LE(16, 14);
+  header.writeUInt32LE(30, 16);
+  header.writeUInt32LE(1, 20);
+  header.writeUInt32LE(0xffff_ffff, 24);
+  return header;
+}
+
+function ivfFrame(data: Buffer, timestamp: bigint): Buffer {
+  const header = Buffer.alloc(12);
+  header.writeUInt32LE(data.length, 0);
+  header.writeBigUInt64LE(timestamp, 4);
+  return Buffer.concat([header, data]);
+}
+
+function pushIvfInUnevenChunks(parser: IvfOutputParser, stream: Buffer): void {
+  const widths = [31, 1, 3, 9, 2, 17, 5];
   let offset = 0;
   let index = 0;
   while (offset < stream.length) {
@@ -197,6 +245,140 @@ describe("H264OutputParser", () => {
   });
 });
 
+describe("IvfOutputParser", () => {
+  const vp8Key = Buffer.from([
+    0xf0, 0x02, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00, 0x10, 0x00,
+  ]);
+  const vp8Delta = Buffer.from([0xb1, 0x01, 0x00, 0x05]);
+  const vp9Key = Buffer.from([0x82, 0x49, 0x83, 0x42]);
+  const vp9Delta = Buffer.from([0x86, 0x00, 0x40, 0x92]);
+
+  test("recognizes VP8 and VP9 keyframe headers", () => {
+    expect(isVpxKeyFrame("vp8", vp8Key)).toBe(true);
+    expect(isVpxKeyFrame("vp8", vp8Delta)).toBe(false);
+    expect(isVpxKeyFrame("vp8", Buffer.from([0, 0, 0, 1, 2, 3]))).toBe(
+      false,
+    );
+    expect(isVpxKeyFrame("vp9", vp9Key)).toBe(true);
+    expect(isVpxKeyFrame("vp9", vp9Delta)).toBe(false);
+    expect(isVpxKeyFrame("vp9", Buffer.from([0x8a]))).toBe(false);
+    expect(isVpxKeyFrame("vp9", Buffer.from([0xb0, 0, 0]))).toBe(true);
+    expect(isVpxKeyFrame("vp9", Buffer.from([0xb8, 0, 0]))).toBe(false);
+  });
+
+  for (const { codec, key, delta } of [
+    { codec: "vp8" as const, key: vp8Key, delta: vp8Delta },
+    { codec: "vp9" as const, key: vp9Key, delta: vp9Delta },
+  ]) {
+    test(`unwraps split ${codec.toUpperCase()} IVF frames and preserves submitted PTS`, () => {
+      const frames: VideoFrame[] = [];
+      const parser = new IvfOutputParser({
+        codec,
+        fps: 30,
+        onFrame: (frame) => frames.push(frame),
+      });
+      parser.enqueuePts(10_000n);
+      parser.enqueuePts(20_000n);
+      pushIvfInUnevenChunks(
+        parser,
+        Buffer.concat([
+          ivfHeader(codec, 40),
+          ivfFrame(key, 100n),
+          ivfFrame(delta, 200n),
+        ]),
+      );
+
+      expect(frames).toEqual([
+        {
+          type: "frame",
+          data: key,
+          pts: 10_000n,
+          isConfig: false,
+          isKey: true,
+        },
+        {
+          type: "frame",
+          data: delta,
+          pts: 20_000n,
+          isConfig: false,
+          isKey: false,
+        },
+      ]);
+    });
+  }
+
+  test("uses configured frame duration when IVF output has no submitted PTS", () => {
+    const frames: VideoFrame[] = [];
+    const parser = new IvfOutputParser({
+      codec: "vp8",
+      fps: 30,
+      onFrame: (frame) => frames.push(frame),
+    });
+    parser.push(
+      Buffer.concat([
+        ivfHeader("vp8"),
+        ivfFrame(vp8Key, 0n),
+        ivfFrame(vp8Delta, 1n),
+      ]),
+    );
+    expect(frames.map((frame) => frame.pts)).toEqual([33_333n, 66_666n]);
+  });
+
+  test("rejects malformed, mismatched, and oversized IVF structures", () => {
+    const create = (codec: "vp8" | "vp9" = "vp8") =>
+      new IvfOutputParser({ codec, fps: 30, onFrame: () => {} });
+
+    expect(() => create().push(Buffer.alloc(32))).toThrow(
+      "invalid IVF signature",
+    );
+
+    const badVersion = ivfHeader("vp8");
+    badVersion.writeUInt16LE(1, 4);
+    expect(() => create().push(badVersion)).toThrow(
+      "unsupported IVF version 1",
+    );
+
+    expect(() => create("vp9").push(ivfHeader("vp8"))).toThrow(
+      "IVF codec mismatch",
+    );
+
+    const oversizedHeader = ivfHeader("vp8");
+    oversizedHeader.writeUInt16LE(4_097, 6);
+    expect(() => create().push(oversizedHeader)).toThrow(
+      "invalid IVF header length 4097",
+    );
+
+    const invalidFrame = Buffer.alloc(12);
+    invalidFrame.writeUInt32LE(64 * 1024 * 1024, 0);
+    expect(() =>
+      create().push(Buffer.concat([ivfHeader("vp8"), invalidFrame])),
+    ).toThrow("invalid IVF frame size");
+  });
+
+  test("validates parser codec, timing, and timestamps", () => {
+    expect(() =>
+      new IvfOutputParser({
+        codec: "h264" as never,
+        fps: 30,
+        onFrame: () => {},
+      }),
+    ).toThrow("IVF does not support codec h264");
+    expect(() =>
+      new IvfOutputParser({ codec: "vp8", fps: 0, onFrame: () => {} }),
+    ).toThrow("fps must be greater than 0");
+    const parser = createIvfParser();
+    expect(() => parser.enqueuePts(-1n)).toThrow("non-negative bigint");
+  });
+});
+
+function createIvfParser(): IvfOutputParser {
+  return new IvfOutputParser({
+    codec: "vp8",
+    fps: 30,
+    onFrame: () => {},
+  });
+}
+
 describe("ffmpeg availability probe", () => {
   test("runs asynchronously in the background and caches a successful binary", async () => {
     const completion = deferred<ExecResult<string>>();
@@ -236,6 +418,29 @@ describe("ffmpeg availability probe", () => {
     await first;
     await probe();
     expect(calls).toHaveLength(1);
+  });
+
+  test("probes and caches each selected codec independently", async () => {
+    const calls: string[] = [];
+    const probe = createFfmpegAvailabilityProbe({
+      resolveBinary: () => "test-ffmpeg",
+      runExec: async () => {
+        calls.push("encoders");
+        return execResult({
+          stdout: [
+            " V..... libx264 H.264",
+            " V..... libvpx VP8",
+            " V..... libvpx-vp9 VP9",
+          ].join("\n"),
+        });
+      },
+    });
+
+    await probe("vp8");
+    await probe("vp8");
+    await probe("vp9");
+    await probe();
+    expect(calls).toHaveLength(3);
   });
 
   test("passes cancellation to the process and does not cache an aborted probe", async () => {
@@ -286,6 +491,14 @@ describe("ffmpeg availability probe", () => {
     await expect(missingX264()).rejects.toThrow(
       'ffmpeg at "ffmpeg-without-x264" does not include the libx264 encoder',
     );
+
+    const missingVp9 = createFfmpegAvailabilityProbe({
+      resolveBinary: () => "ffmpeg-without-vp9",
+      runExec: async () => execResult(),
+    });
+    await expect(missingVp9("vp9")).rejects.toThrow(
+      'ffmpeg at "ffmpeg-without-vp9" does not include the libvpx-vp9 encoder required for VP9',
+    );
   });
 });
 
@@ -322,6 +535,12 @@ describe("H264Encoder validation", () => {
     expect(() => new H264Encoder({ ...valid, keyFrameInterval: -1 })).toThrow(
       "non-negative",
     );
+    expect(() =>
+      new VideoEncoder({
+        ...valid,
+        codec: "av1" as VideoCodec,
+      }),
+    ).toThrow("unsupported video codec av1");
   });
 
   test("reports transposed output dimensions for quarter-turn encoding", async () => {
@@ -377,6 +596,25 @@ describe("H264Encoder validation", () => {
       "-i",
       "pipe:0",
     ]);
+  });
+
+  test("selects codec-specific low-latency FFmpeg output", () => {
+    const h264 = ffmpegOutputArgs("h264", 60, 8_000_000, 10);
+    expect(h264.join(" ")).toContain(
+      "-c:v libx264 -preset ultrafast -tune zerolatency",
+    );
+    expect(h264.join(" ")).toContain("-f h264");
+    expect(h264.join(" ")).toContain(
+      "keyint=600:min-keyint=600:scenecut=0:repeat-headers=1:aud=1",
+    );
+
+    for (const codec of ["vp8", "vp9"] as const) {
+      const args = ffmpegOutputArgs(codec, 60, 8_000_000, 10);
+      expect(args.join(" ")).toContain(
+        `-c:v ${FFMPEG_ENCODER_FOR_CODEC[codec]} -deadline realtime -cpu-used 8 -lag-in-frames 0 -auto-alt-ref 0 -error-resilient 1 -g 600`,
+      );
+      expect(args.join(" ")).toContain("-f ivf -flush_packets 1");
+    }
   });
 
   test("validates PNG frame boundaries before writing to ffmpeg", async () => {
@@ -455,6 +693,71 @@ describe("H264Encoder validation", () => {
       expect(frames.some((frame) => frame.isKey)).toBe(true);
     },
   );
+
+  for (const codec of ["vp8", "vp9"] as const) {
+    realVpxFfmpegTest[codec](
+      `emits raw ${codec.toUpperCase()} frames from real FFmpeg IVF output`,
+      async () => {
+        const width = 16;
+        const height = 16;
+        const frames: VideoFrame[] = [];
+        let resolveFrames!: () => void;
+        let rejectFrames!: (error: Error) => void;
+        const framesReady = new Promise<void>((resolve, reject) => {
+          resolveFrames = resolve;
+          rejectFrames = reject;
+        });
+        const encoder = new VideoEncoder({
+          codec,
+          width,
+          height,
+          fps: 30,
+          bitRate: 1_000_000,
+          keyFrameInterval: 10,
+          onFrame(frame) {
+            frames.push(frame);
+            if (frames.length >= 2) resolveFrames();
+          },
+          onExit(reason) {
+            rejectFrames(new Error(reason));
+          },
+        });
+
+        try {
+          for (let index = 0; index < 4; index++) {
+            const rgb = Buffer.alloc(width * height * 3, index * 40);
+            expect(encoder.write(rgb, BigInt((index + 1) * 1_000))).toBe(true);
+          }
+          await Promise.race([
+            framesReady,
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () => reject(new Error(`timed out waiting for ${codec}`)),
+                3_000,
+              ),
+            ),
+          ]);
+        } finally {
+          await encoder.close();
+        }
+
+        expect(frames.length).toBeGreaterThanOrEqual(2);
+        expect(frames[0]).toMatchObject({
+          pts: 1_000n,
+          isConfig: false,
+          isKey: true,
+        });
+        expect(frames[1]).toMatchObject({
+          pts: 2_000n,
+          isConfig: false,
+          isKey: false,
+        });
+        expect(frames[0]!.data.subarray(0, 4).toString("ascii")).not.toBe(
+          "DKIF",
+        );
+      },
+    );
+  }
 
   realFfmpegTest(
     "applies Android quarter-turn direction to encoded pixels",

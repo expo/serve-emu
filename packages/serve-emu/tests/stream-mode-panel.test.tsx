@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   GrpcImageModeSelector,
+  GrpcVideoCodecSelector,
   StreamStatsDownloadControl,
   StreamModePanel,
   ViewerTransportSelector,
@@ -149,5 +150,32 @@ describe("StreamModePanel", () => {
     );
     expect(disabledMarkup).toContain("<fieldset");
     expect(disabledMarkup).toContain("disabled=\"\"");
+  });
+
+  test("renders every gRPC codec and keeps VPx off WebRTC", () => {
+    const markup = renderToStaticMarkup(
+      <GrpcVideoCodecSelector
+        value="vp9"
+        disabled={false}
+        onChange={() => {}}
+      />,
+    );
+
+    expect(markup).toContain("<legend>gRPC video codec</legend>");
+    expect(markup.match(/name="grpc-video-codec"/g)?.length).toBe(3);
+    expect(markup).toContain('value="h264"');
+    expect(markup).toContain('value="vp8"');
+    expect(markup).toContain('checked="" value="vp9"');
+    expect(markup).not.toContain("disabled");
+
+    const webRtcMarkup = renderToStaticMarkup(
+      <GrpcVideoCodecSelector
+        value="h264"
+        disabled={false}
+        webRtcActive
+        onChange={() => {}}
+      />,
+    );
+    expect(webRtcMarkup.match(/disabled=""/g)?.length).toBe(2);
   });
 });

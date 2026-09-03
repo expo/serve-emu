@@ -18,6 +18,9 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
   through configuration, the CLI, runtime API, and browser UI.
 - Add selectable scrcpy and emulator gRPC input transports for gRPC screenshot
   streams through configuration, the CLI, runtime API, and browser UI.
+- Add host-side VP8 and VP9 encoding for gRPC WebSocket streams, including
+  runtime/CLI selection, codec-aware session announcements, and WebCodecs
+  playback alongside the existing H.264 path.
 
 ### Changed
 

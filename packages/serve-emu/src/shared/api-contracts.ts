@@ -109,6 +109,17 @@ export function isGrpcImageMode(value: unknown): value is GrpcImageMode {
   );
 }
 
+/** Host-side video encoder used by the emulator gRPC screenshot source. */
+export const GRPC_VIDEO_CODECS = ["h264", "vp8", "vp9"] as const;
+export type GrpcVideoCodec = (typeof GRPC_VIDEO_CODECS)[number];
+export const DEFAULT_GRPC_VIDEO_CODEC: GrpcVideoCodec = "h264";
+export function isGrpcVideoCodec(value: unknown): value is GrpcVideoCodec {
+  return (
+    typeof value === "string" &&
+    GRPC_VIDEO_CODECS.some((codec) => codec === value)
+  );
+}
+
 export type RollingTimingSummary = {
   /** Number of samples retained in the rolling window. */
   windowSamples: number;
@@ -179,6 +190,8 @@ export type StreamModeRequest =
       grpcImageMode?: GrpcImageMode;
       /** Optional for backwards compatibility; omitted means keep the configured source. */
       inputSource?: InputSource;
+      /** Optional for backwards compatibility; omitted means keep the configured codec. */
+      grpcVideoCodec?: GrpcVideoCodec;
     };
 export type StreamModeResponse = ApiSuccess<{
   serial: string;
@@ -186,6 +199,7 @@ export type StreamModeResponse = ApiSuccess<{
   grpcImageMode: GrpcImageMode;
   inputSource: InputSource;
   availableInputSources: InputSource[];
+  grpcVideoCodec: GrpcVideoCodec;
   availableModes: StreamMode[];
   sessionGeneration: number;
 }>;
@@ -854,9 +868,9 @@ export function parseStreamModeRequest(value: unknown): StreamModeRequest {
   const root = record(value, "stream mode request");
   const mode = oneOf(root.mode, STREAM_MODES, "stream mode request.mode");
   if (mode === "scrcpy") {
-    if (root.grpcImageMode !== undefined) {
+    if (root.grpcImageMode !== undefined || root.grpcVideoCodec !== undefined) {
       fail(
-        "stream mode request.grpcImageMode is available only with mode grpc-screenshot",
+        "stream mode request gRPC options are available only with mode grpc-screenshot",
       );
     }
     if (root.inputSource !== undefined) {
@@ -884,6 +898,15 @@ export function parseStreamModeRequest(value: unknown): StreamModeRequest {
             root.inputSource,
             INPUT_SOURCES,
             "stream mode request.inputSource",
+          ),
+        }),
+    ...(root.grpcVideoCodec === undefined
+      ? {}
+      : {
+          grpcVideoCodec: oneOf(
+            root.grpcVideoCodec,
+            GRPC_VIDEO_CODECS,
+            "stream mode request.grpcVideoCodec",
           ),
         }),
   };
@@ -924,6 +947,11 @@ export function parseStreamModeResponse(value: unknown): StreamModeResponse {
   if (!availableInputSources.includes(inputSource)) {
     fail("stream mode response.inputSource must be available");
   }
+  const grpcVideoCodec = oneOf(
+    root.grpcVideoCodec,
+    GRPC_VIDEO_CODECS,
+    "stream mode response.grpcVideoCodec",
+  );
   if (!Array.isArray(root.availableModes)) {
     fail("stream mode response.availableModes must be an array");
   }
@@ -959,6 +987,7 @@ export function parseStreamModeResponse(value: unknown): StreamModeResponse {
     grpcImageMode,
     inputSource,
     availableInputSources,
+    grpcVideoCodec,
     availableModes,
     sessionGeneration,
   };

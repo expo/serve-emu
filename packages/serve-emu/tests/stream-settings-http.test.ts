@@ -12,6 +12,7 @@ type CapturedStartOpts = StartOpts & {
   mode?: "scrcpy";
   grpcImageMode?: "png" | "mmap";
   inputSource?: "scrcpy" | "grpc";
+  grpcVideoCodec?: "h264" | "vp8" | "vp9";
 };
 
 function deferred<T>() {
@@ -173,6 +174,7 @@ describe("stream settings HTTP API", () => {
         mode: "scrcpy",
         grpcImageMode: "png",
         inputSource: "scrcpy",
+        grpcVideoCodec: "h264",
       });
       expect(app.health().encoderSettings).toEqual({
         maxDimension: 960,
@@ -237,6 +239,7 @@ describe("stream settings HTTP API", () => {
         mode: "scrcpy",
         grpcImageMode: "png",
         inputSource: "scrcpy",
+        grpcVideoCodec: "h264",
       });
     } finally {
       app.stop();
@@ -276,6 +279,7 @@ describe("stream settings HTTP API", () => {
       ).toContainEqual({
         type: "video-session",
         size: { width: 405, height: 720 },
+        codec: "h264",
       });
       expect(replacementControlWrites).toContainEqual(Buffer.from([17]));
     } finally {

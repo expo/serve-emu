@@ -122,6 +122,9 @@ describe("stream lifecycle generations", () => {
   test("only terminal worker capability failures persist over lifecycle ticks", () => {
     expect(isStreamFatalStatus("WebCodecs unsupported")).toBe(true);
     expect(isStreamFatalStatus("canvas unavailable")).toBe(true);
+    expect(isStreamFatalStatus("H.264 unsupported by WebCodecs")).toBe(true);
+    expect(isStreamFatalStatus("VP8 unsupported by WebCodecs")).toBe(true);
+    expect(isStreamFatalStatus("VP9 unsupported by WebCodecs")).toBe(true);
     expect(isStreamFatalStatus("decoder error")).toBe(false);
     expect(isStreamFatalStatus("connection error")).toBe(false);
   });

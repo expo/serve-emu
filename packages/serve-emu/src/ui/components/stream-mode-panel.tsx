@@ -5,8 +5,10 @@ import {
 } from "../../stream-settings";
 import {
   GRPC_IMAGE_MODES,
+  GRPC_VIDEO_CODECS,
   STREAM_MODES,
   type GrpcImageMode,
+  type GrpcVideoCodec,
   type StreamMode,
   type StreamModeResponse,
 } from "../../shared/api-contracts";
@@ -52,6 +54,18 @@ const GRPC_IMAGE_MODE_COPY = {
 const GRPC_IMAGE_OPTIONS = GRPC_IMAGE_MODES.map((mode) => ({
   mode,
   ...GRPC_IMAGE_MODE_COPY[mode],
+}));
+const GRPC_VIDEO_CODEC_COPY = {
+  h264: { label: "H.264", description: "Fastest compatibility option" },
+  vp8: { label: "VP8", description: "Web-native software encoding" },
+  vp9: { label: "VP9", description: "Higher compression, more CPU" },
+} satisfies Record<GrpcVideoCodec, {
+  label: string;
+  description: string;
+}>;
+const GRPC_VIDEO_CODEC_OPTIONS = GRPC_VIDEO_CODECS.map((codec) => ({
+  codec,
+  ...GRPC_VIDEO_CODEC_COPY[codec],
 }));
 const STREAM_MODE_POLL_INTERVAL_MS = 4_000;
 const NOOP_SELECT_TRANSPORT = () => {};
@@ -230,6 +244,48 @@ export function GrpcImageModeSelector({
   );
 }
 
+type GrpcVideoCodecSelectorProps = {
+  value: GrpcVideoCodec;
+  disabled: boolean;
+  webRtcActive?: boolean;
+  onChange: (codec: GrpcVideoCodec) => void;
+};
+
+export function GrpcVideoCodecSelector({
+  value,
+  disabled,
+  webRtcActive = false,
+  onChange,
+}: GrpcVideoCodecSelectorProps) {
+  return (
+    <fieldset
+      className="stream-mode-fieldset grpc-video-codec-fieldset"
+      disabled={disabled}
+      aria-describedby="stream-mode-help"
+    >
+      <legend>gRPC video codec</legend>
+      <div className="stream-mode-options">
+        {GRPC_VIDEO_CODEC_OPTIONS.map((option) => (
+          <label className="stream-mode-option" key={option.codec}>
+            <input
+              type="radio"
+              name="grpc-video-codec"
+              value={option.codec}
+              checked={value === option.codec}
+              disabled={webRtcActive && option.codec !== "h264"}
+              onChange={() => onChange(option.codec)}
+            />
+            <span>
+              <strong>{option.label}</strong>
+              <small>{option.description}</small>
+            </span>
+          </label>
+        ))}
+      </div>
+    </fieldset>
+  );
+}
+
 export function StreamModePanel() {
   const viewerTransport = useViewerTransportControls();
   const deviceSession = useDeviceSessionSnapshot();
@@ -291,6 +347,7 @@ export function StreamModePanel() {
     async (
       nextMode: StreamMode,
       nextGrpcImageMode: GrpcImageMode,
+      nextGrpcVideoCodec: GrpcVideoCodec,
     ) => {
       if (
         busy ||
@@ -298,7 +355,8 @@ export function StreamModePanel() {
         !loaded ||
         (
           nextMode === loaded.mode &&
-          nextGrpcImageMode === loaded.grpcImageMode
+          nextGrpcImageMode === loaded.grpcImageMode &&
+          nextGrpcVideoCodec === loaded.grpcVideoCodec
         ) ||
         !loaded.availableModes.includes(nextMode)
       ) {
@@ -316,7 +374,11 @@ export function StreamModePanel() {
         response = await apiRequest("/api/stream-mode", {
           method: "PUT",
           body: nextMode === "grpc-screenshot"
-            ? { mode: nextMode, grpcImageMode: nextGrpcImageMode }
+            ? {
+                mode: nextMode,
+                grpcImageMode: nextGrpcImageMode,
+                grpcVideoCodec: nextGrpcVideoCodec,
+              }
             : { mode: nextMode },
         });
       } catch (error) {
@@ -365,6 +427,16 @@ export function StreamModePanel() {
     deviceSession.transitioning ||
     !selectionReady ||
     !grpcSelected;
+  const grpcVideoCodecDisabled = grpcImageModeDisabled;
+  const webRtcActive = viewerTransport?.transport === "webrtc";
+  const vpxSelected =
+    loaded?.mode === "grpc-screenshot" &&
+    loaded.grpcVideoCodec !== "h264";
+  const availableViewerTransports = vpxSelected
+    ? (viewerTransport?.availableTransports ?? []).filter(
+        (transport) => transport !== "webrtc",
+      )
+    : (viewerTransport?.availableTransports ?? []);
   const help = busy || deviceSession.transitioning
     ? "Changing the stream capture and reconnecting the browser stream…"
     : !selectionReady
@@ -374,9 +446,15 @@ export function StreamModePanel() {
       : !grpcAvailable
         ? "gRPC screenshot is available only for Android Emulator devices."
         : loaded.mode === "grpc-screenshot"
-          ? loaded.grpcImageMode === "mmap"
-            ? "Frames use the emulator's shared-memory MMAP path; input uses gRPC."
-            : "Frames use in-band PNG images; input uses gRPC."
+          ? `${GRPC_VIDEO_CODEC_COPY[loaded.grpcVideoCodec].label} video uses ${
+              loaded.grpcImageMode === "mmap"
+                ? "the emulator's shared-memory MMAP frames"
+                : "in-band PNG source frames"
+            }; input uses ${
+              loaded.inputSource === "scrcpy"
+                ? "a control-only scrcpy session"
+                : "gRPC"
+            }. VP8 and VP9 are WebSocket-only.`
           : "Frames and input use the scrcpy server on the device.";
 
   return (
@@ -414,7 +492,13 @@ export function StreamModePanel() {
                   checked={displayedMode === option.mode}
                   disabled={disabled}
                   onChange={() => {
-                    if (loaded) void apply(option.mode, loaded.grpcImageMode);
+                    if (loaded) {
+                      void apply(
+                        option.mode,
+                        loaded.grpcImageMode,
+                        loaded.grpcVideoCodec,
+                      );
+                    }
                   }}
                 />
                 <span>
@@ -430,7 +514,19 @@ export function StreamModePanel() {
         <GrpcImageModeSelector
           value={loaded.grpcImageMode}
           disabled={grpcImageModeDisabled}
-          onChange={(mode) => void apply("grpc-screenshot", mode)}
+          onChange={(mode) =>
+            void apply("grpc-screenshot", mode, loaded.grpcVideoCodec)
+          }
+        />
+      ) : null}
+      {grpcSelected && loaded ? (
+        <GrpcVideoCodecSelector
+          value={loaded.grpcVideoCodec}
+          disabled={grpcVideoCodecDisabled}
+          webRtcActive={webRtcActive}
+          onChange={(codec) =>
+            void apply("grpc-screenshot", loaded.grpcImageMode, codec)
+          }
         />
       ) : null}
       <p className="stream-mode-help" id="stream-mode-help">
@@ -438,7 +534,7 @@ export function StreamModePanel() {
       </p>
       <ViewerTransportSelector
         value={viewerTransport?.transport ?? null}
-        available={viewerTransport?.availableTransports ?? []}
+        available={availableViewerTransports}
         switchingTo={viewerTransport?.switchingTo ?? null}
         error={viewerTransport?.error ?? null}
         onChange={viewerTransport?.selectTransport ?? NOOP_SELECT_TRANSPORT}

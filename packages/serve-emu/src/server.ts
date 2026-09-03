@@ -149,15 +149,19 @@ import {
 import {
   DEFAULT_GRPC_INPUT_SOURCE,
   DEFAULT_GRPC_IMAGE_MODE,
+  DEFAULT_GRPC_VIDEO_CODEC,
   GRPC_IMAGE_MODES,
+  GRPC_VIDEO_CODECS,
   INPUT_SOURCES,
   isGrpcImageMode,
+  isGrpcVideoCodec,
   isInputSource,
   isStreamMode,
   parseFontScale,
   parseStreamModeRequest,
   STREAM_MODES,
   type GrpcImageMode,
+  type GrpcVideoCodec,
   type InputSource,
   type StreamMode,
 } from "./shared/api-contracts.ts";
@@ -192,6 +196,8 @@ export type ServerOpts = {
   grpcImageMode?: GrpcImageMode;
   /** Input transport. gRPC streaming defaults to scrcpy input. */
   inputSource?: InputSource;
+  /** Host video encoder used by the gRPC source. Defaults to H.264. */
+  grpcVideoCodec?: GrpcVideoCodec;
   maxApkUploadBytes?: number;
   maxMediaUploadBytes?: number;
   maxActiveUploads?: number;
@@ -386,6 +392,14 @@ export async function startServer(
     throw new Error(`inputSource must be one of: ${INPUT_SOURCES.join(", ")}`);
   }
   const defaultInputSource = requestedDefaultInputSource;
+  const requestedDefaultGrpcVideoCodec: unknown =
+    opts.grpcVideoCodec ?? DEFAULT_GRPC_VIDEO_CODEC;
+  if (!isGrpcVideoCodec(requestedDefaultGrpcVideoCodec)) {
+    throw new Error(
+      `grpcVideoCodec must be one of: ${GRPC_VIDEO_CODECS.join(", ")}`,
+    );
+  }
+  const defaultGrpcVideoCodec = requestedDefaultGrpcVideoCodec;
   const serve = dependencies.serve ?? Bun.serve;
   const listDevices =
     dependencies.listDevices ?? dependencies.listAllDevices ?? listAllDevices;
@@ -501,7 +515,9 @@ export async function startServer(
   const streamModes = new Map<string, StreamMode>();
   const grpcImageModes = new Map<string, GrpcImageMode>();
   const inputSources = new Map<string, InputSource>();
+  const grpcVideoCodecs = new Map<string, GrpcVideoCodec>();
   const contextGrpcImageModes = new WeakMap<DeviceContext, GrpcImageMode>();
+  const contextGrpcVideoCodecs = new WeakMap<DeviceContext, GrpcVideoCodec>();
   const defaultStreamEncoderSettings: StreamEncoderSettings = {
     maxDimension: opts.maxSize ?? SCRCPY_DEFAULTS.maxSize,
     h264Bitrate: opts.bitRate ?? SCRCPY_DEFAULTS.bitRate,
@@ -524,6 +540,8 @@ export async function startServer(
     mode === "grpc-screenshot"
       ? inputSources.get(serial) ?? defaultInputSource
       : "scrcpy";
+  const grpcVideoCodecForSerial = (serial: string): GrpcVideoCodec =>
+    grpcVideoCodecs.get(serial) ?? defaultGrpcVideoCodec;
 
   const openStream = (
     serial: string,
@@ -532,12 +550,14 @@ export async function startServer(
     encoderSettings = encoderSettingsForSerial(serial),
     grpcImageMode = grpcImageModeForSerial(serial),
     inputSource = inputSourceForSerial(serial, mode),
+    grpcVideoCodec = grpcVideoCodecForSerial(serial),
   ) =>
     openSession({
       serial,
       mode,
       grpcImageMode,
       inputSource,
+      grpcVideoCodec,
       signal,
       maxFps: encoderSettings.h264Fps,
       bitRate: encoderSettings.h264Bitrate,
@@ -586,6 +606,7 @@ export async function startServer(
     stream: EmuSession,
     deviceState?: DeviceSessionState,
     grpcImageMode = grpcImageModeForSerial(serial),
+    grpcVideoCodec = grpcVideoCodecForSerial(serial),
   ): DeviceContext => {
     const context = new ActiveDeviceSession<Client>({
       serial,
@@ -605,6 +626,7 @@ export async function startServer(
       ),
     );
     contextGrpcImageModes.set(context, grpcImageMode);
+    contextGrpcVideoCodecs.set(context, grpcVideoCodec);
     return context;
   };
 
@@ -620,6 +642,7 @@ export async function startServer(
   streamModes.set(opts.serial, initialMode);
   grpcImageModes.set(opts.serial, defaultGrpcImageMode);
   inputSources.set(opts.serial, defaultInputSource);
+  grpcVideoCodecs.set(opts.serial, defaultGrpcVideoCodec);
   const sessions = new DeviceSessionManager(initialContext);
   const recoveries = new WeakMap<
     DeviceContext,
@@ -674,6 +697,7 @@ export async function startServer(
     codec: context.stream.meta.codecId,
     streamMode: context.stream.mode,
     grpcImageMode: grpcImageModeForContext(context),
+    grpcVideoCodec: grpcVideoCodecForContext(context),
     grpcCapture: context.stream.diagnostics?.().grpcCapture ?? null,
     size: { width: context.screen.width, height: context.screen.height },
     clients: context.clients.size,
@@ -1489,6 +1513,7 @@ export async function startServer(
                 sendJson(c.ws, {
                   type: "video-session",
                   size: { width: f.width, height: f.height },
+                  codec: context.stream.meta.codecId,
                 });
               }
               recoveries.get(context)?.requestVideoReset(
@@ -1608,6 +1633,7 @@ export async function startServer(
     encoderSettings = encoderSettingsForSerial(serial),
     grpcImageMode = grpcImageModeForSerial(serial),
     inputSource = inputSourceForSerial(serial, mode),
+    grpcVideoCodec = grpcVideoCodecForSerial(serial),
   ): Promise<DeviceContext> => {
     const stagingOwner = {};
     let retainedDeviceState =
@@ -1629,6 +1655,7 @@ export async function startServer(
         encoderSettings,
         grpcImageMode,
         inputSource,
+        grpcVideoCodec,
       );
       try {
         return createContext(
@@ -1637,6 +1664,7 @@ export async function startServer(
           stream,
           retainedDeviceState,
           grpcImageMode,
+          grpcVideoCodec,
         );
       } catch (error) {
         await stream.close().catch(() => {});
@@ -1653,6 +1681,9 @@ export async function startServer(
   const grpcImageModeForContext = (context: DeviceContext): GrpcImageMode =>
     contextGrpcImageModes.get(context) ??
     grpcImageModeForSerial(context.serial);
+  const grpcVideoCodecForContext = (context: DeviceContext): GrpcVideoCodec =>
+    contextGrpcVideoCodecs.get(context) ??
+    grpcVideoCodecForSerial(context.serial);
 
   const streamModeResponse = (context: DeviceContext) => ({
     ok: true as const,
@@ -1664,6 +1695,7 @@ export async function startServer(
       context.stream.mode === "grpc-screenshot"
         ? [...INPUT_SOURCES]
         : (["scrcpy"] satisfies InputSource[]),
+    grpcVideoCodec: grpcVideoCodecForContext(context),
     availableModes: availableStreamModesForSerial(context.serial),
     sessionGeneration: context.generation,
   });
@@ -1709,6 +1741,7 @@ export async function startServer(
     );
     streamModes.set(context.serial, context.stream.mode);
     grpcImageModes.set(context.serial, grpcImageModeForContext(context));
+    grpcVideoCodecs.set(context.serial, grpcVideoCodecForContext(context));
     return {
       ok: true,
       serial: context.serial,
@@ -1720,6 +1753,7 @@ export async function startServer(
     mode: StreamMode,
     requestedGrpcImageMode: GrpcImageMode | undefined,
     requestedInputSource: InputSource | undefined,
+    requestedGrpcVideoCodec: GrpcVideoCodec | undefined,
     expected?: DeviceContext,
   ) => {
     const active = sessions.current;
@@ -1734,6 +1768,7 @@ export async function startServer(
     }
     let grpcImageMode: GrpcImageMode | undefined;
     let inputSource: InputSource | undefined;
+    let grpcVideoCodec: GrpcVideoCodec | undefined;
     const context = await sessions.replace(
       (current, generation, signal) => {
         const selectedGrpcImageMode =
@@ -1750,6 +1785,11 @@ export async function startServer(
                 : inputSourceForSerial(current.serial, mode))
             : "scrcpy";
         inputSource = selectedInputSource;
+        const selectedGrpcVideoCodec =
+          grpcVideoCodec ??
+          requestedGrpcVideoCodec ??
+          grpcVideoCodecForContext(current);
+        grpcVideoCodec = selectedGrpcVideoCodec;
         return prepareContext(
           current.serial,
           generation,
@@ -1759,6 +1799,7 @@ export async function startServer(
           encoderSettingsForSerial(current.serial),
           selectedGrpcImageMode,
           selectedInputSource,
+          selectedGrpcVideoCodec,
         );
       },
       activateContext,
@@ -1779,15 +1820,20 @@ export async function startServer(
                 ? current.stream.inputSource
                 : inputSourceForSerial(current.serial, mode))
             : "scrcpy";
+        grpcVideoCodec =
+          requestedGrpcVideoCodec ?? grpcVideoCodecForContext(current);
         return (
           current.stream.mode !== mode ||
           grpcImageModeForContext(current) !== grpcImageMode ||
-          current.stream.inputSource !== inputSource
+          current.stream.inputSource !== inputSource ||
+          grpcVideoCodecForContext(current) !== grpcVideoCodec
         );
       },
     );
     const appliedGrpcImageMode =
       grpcImageMode ?? grpcImageModeForContext(context);
+    const appliedGrpcVideoCodec =
+      grpcVideoCodec ?? grpcVideoCodecForContext(context);
     streamModes.set(context.serial, mode);
     grpcImageModes.set(context.serial, appliedGrpcImageMode);
     if (mode === "grpc-screenshot") {
@@ -1796,6 +1842,7 @@ export async function startServer(
         inputSource ?? context.stream.inputSource,
       );
     }
+    grpcVideoCodecs.set(context.serial, appliedGrpcVideoCodec);
     if (context.generation !== active.generation) {
       console.log(
         `${context.stream.mode} ready: ${context.stream.meta.deviceName} • ${context.stream.meta.codecId} • ${context.stream.meta.width}×${context.stream.meta.height}`,
@@ -2001,6 +2048,7 @@ export async function startServer(
         let mode: StreamMode;
         let grpcImageMode: GrpcImageMode | undefined;
         let inputSource: InputSource | undefined;
+        let grpcVideoCodec: GrpcVideoCodec | undefined;
         try {
           const payload = await readJsonBody(req, MAX_JSON_BODY_BYTES);
           const streamModeRequest = parseStreamModeRequest(payload);
@@ -2022,6 +2070,10 @@ export async function startServer(
             streamModeRequest.mode === "grpc-screenshot"
               ? streamModeRequest.inputSource
               : undefined;
+          grpcVideoCodec =
+            streamModeRequest.mode === "grpc-screenshot"
+              ? streamModeRequest.grpcVideoCodec
+              : undefined;
         } catch (error) {
           return streamModeRequestErrorResponse(error);
         }
@@ -2031,6 +2083,7 @@ export async function startServer(
               mode,
               grpcImageMode,
               inputSource,
+              grpcVideoCodec,
               requestContext,
             ),
           );
@@ -2918,6 +2971,14 @@ export async function startServer(
         context.clients.add(handle);
         ws.data.handle = handle;
         if (handle.video) {
+          sendJson(ws, {
+            type: "video-session",
+            size: {
+              width: context.screen.width,
+              height: context.screen.height,
+            },
+            codec: context.stream.meta.codecId,
+          });
           const recovery = recoveries.get(context);
           recovery?.markAwaiting(handle);
           recovery?.requestVideoReset("client opened");

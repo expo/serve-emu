@@ -34,6 +34,19 @@ import type {
   StreamLifecycleState,
 } from "./stream-lifecycle";
 import type { StreamStats, StreamWorkerEvent } from "./stream-worker";
+import type { GrpcVideoCodec } from "../../shared/api-contracts";
+import {
+  fixedWebCodecsCodec,
+  isGrpcVideoCodec,
+  isWebCodecsUnsupportedError,
+  mseFallbackCodecError,
+  parseVideoSession,
+  resolveVideoKeyFrame,
+  videoCodecLabel,
+  webRtcCodecError,
+  webCodecsCodec,
+  webCodecsHardwareAcceleration,
+} from "./video-codec";
 
 export type DeviceSize = { width: number; height: number };
 
@@ -55,6 +68,7 @@ export type { StreamTransport } from "../../stream-settings";
 type ApiInfo = {
   generation: number;
   size: DeviceSize;
+  codec?: string;
   status?: "streaming" | "stopped" | "error";
   lastError?: string | null;
   stream?: StreamSettings;
@@ -83,6 +97,8 @@ const WEBRTC_TRANSPORT_RETRY_BASE_MS = 500;
 const WEBRTC_TRANSPORT_RETRY_MAX_MS = 5_000;
 const WEBRTC_DISCONNECTED_GRACE_MS = 10_000;
 const CONTROL_ERROR_VISIBLE_MS = 5_000;
+const MAIN_THREAD_DECODE_QUEUE_SIZE = 12;
+const MAIN_THREAD_KEYFRAME_REQUEST_COOLDOWN_MS = 400;
 const VIEWER_TRANSPORT_SESSION_KEY = "serve-emu.viewer-transport";
 
 function viewerTransportsKey(value: ViewerTransports | null): string | null {
@@ -217,6 +233,7 @@ export function useStream(
   const [webRtcRetryGeneration, setWebRtcRetryGeneration] = useState(0);
   const [serverGeneration, setServerGeneration] = useState<number | null>(null);
   const serverGenerationRef = useRef<number | null>(null);
+  const activeVideoCodecRef = useRef<GrpcVideoCodec>("h264");
   const stateRef = useRef(state);
   stateRef.current = state;
   const liveTransportRef = useRef<StreamTransport | null>(null);
@@ -261,6 +278,14 @@ export function useStream(
       setTransportError(
         `${next === "webrtc" ? "WebRTC" : "WebSocket"} is unavailable for this stream.`,
       );
+      return;
+    }
+    const codecError =
+      next === "webrtc"
+        ? webRtcCodecError(activeVideoCodecRef.current)
+        : null;
+    if (codecError) {
+      setTransportError(codecError);
       return;
     }
     if (transportRef.current === next) return;
@@ -389,6 +414,9 @@ export function useStream(
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = (await response.json()) as ApiInfo;
         if (cancelled) return;
+        if (isGrpcVideoCodec(data.codec)) {
+          activeVideoCodecRef.current = data.codec;
+        }
         const nextViewerTransports =
           data.viewerTransports ?? legacyViewerTransports(data.stream);
         if (nextViewerTransports) {
@@ -403,7 +431,7 @@ export function useStream(
           const currentTransport = transportRef.current;
           if (currentTransport === null) {
             const stored = storedViewerTransport();
-            const initial =
+            const preferred =
               stored && nextViewerTransports.available.includes(stored)
                 ? stored
                 : nextViewerTransports.available.includes(
@@ -411,6 +439,12 @@ export function useStream(
                   )
                   ? nextViewerTransports.default
                   : nextViewerTransports.available[0]!;
+            const initial =
+              preferred === "webrtc" &&
+              webRtcCodecError(activeVideoCodecRef.current) &&
+              nextViewerTransports.available.includes("websocket")
+                ? "websocket"
+                : preferred;
             transportRef.current = initial;
             liveTransportRef.current = null;
             setSwitchingTo(initial);
@@ -428,6 +462,17 @@ export function useStream(
           ) {
             setTransportError(null);
             markTransportSwitching("webrtc");
+          }
+        }
+        const webRtcError = webRtcCodecError(activeVideoCodecRef.current);
+        if (transportRef.current === "webrtc" && webRtcError) {
+          if (viewerTransportsRef.current?.available.includes("websocket")) {
+            selectTransport("websocket");
+            setTransportError(
+              `${webRtcError} Switched the viewer to WebSocket.`,
+            );
+          } else {
+            reportTransportError("webrtc", webRtcError);
           }
         }
         if (
@@ -476,7 +521,7 @@ export function useStream(
       controller?.abort();
       if (timer !== null) clearTimeout(timer);
     };
-  }, [markTransportSwitching]);
+  }, [markTransportSwitching, reportTransportError, selectTransport]);
 
   useEffect(() => {
     if (transport !== "websocket") return;
@@ -582,6 +627,7 @@ export function useStream(
         workerFatalStatus = msg.status;
         reportTransportError("websocket", msg.status);
       }
+      if (msg.type === "session") activeVideoCodecRef.current = msg.codec;
       if (msg.type === "control-error") showControlError(msg.message);
 
       setState((prev) => {
@@ -751,24 +797,28 @@ export function useStream(
     transport,
   ]);
 
-  // WebCodecs is unavailable on some plain-HTTP LAN origins. Keep the fork's
-  // Media Source Extensions fallback for those browsers while the normal path
-  // stays in upstream's lower-overhead worker.
+  // Keep decoding on the main thread when Worker/OffscreenCanvas is missing.
+  // Plain-HTTP LAN origins may also lack WebCodecs entirely; only H.264 can use
+  // the Media Source Extensions fallback in that case.
   useEffect(() => {
     if (transport !== "websocket") return;
     const canvas = canvasRef.current;
     if (!canvas) return;
+    const canUseMainThreadWebCodecs =
+      typeof VideoDecoder === "function" &&
+      typeof EncodedVideoChunk === "function";
     const canUseWorker =
       typeof Worker === "function" &&
-      typeof VideoDecoder === "function" &&
-      typeof EncodedVideoChunk === "function" &&
+      canUseMainThreadWebCodecs &&
       typeof canvas.transferControlToOffscreen === "function";
     if (canUseWorker) return;
-    if (!MsePlayer.isSupported()) {
-      reportTransportError("websocket", "WebCodecs and MSE unsupported");
+    const useMse = !canUseMainThreadWebCodecs;
+    if (useMse && !MsePlayer.isSupported()) {
+      const message = "WebCodecs unavailable and H.264 MSE unsupported";
+      reportTransportError("websocket", message);
       setState((current) => ({
         ...current,
-        status: "WebCodecs and MSE unsupported",
+        status: message,
       }));
       return;
     }
@@ -778,20 +828,337 @@ export function useStream(
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let player: MsePlayer | null = null;
     let ws: WebSocket | null = null;
+    let activeCodec: GrpcVideoCodec | null = null;
+    let decoder: VideoDecoder | null = null;
+    let decoderConfigFailed = false;
+    let sawKeyframe = false;
+    let droppingUntilKeyframe = false;
+    let frameIndex = 0;
+    let pendingFrame: VideoFrame | null = null;
+    let renderHandle = 0;
+    let painted = false;
+    let fpsFrames = 0;
+    let fpsStartedAt = performance.now();
+    let lastKeyframeRequestAt = Number.NEGATIVE_INFINITY;
+    let directContext: CanvasRenderingContext2D | null = null;
 
     const setStatus = (status: string) =>
       setState((current) =>
         current.status === status ? current : { ...current, status },
       );
     const requestKeyframe = () => {
-      if (ws?.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "reset-video", ack: false }));
+      const now = performance.now();
+      if (
+        ws?.readyState === WebSocket.OPEN &&
+        now - lastKeyframeRequestAt >=
+          MAIN_THREAD_KEYFRAME_REQUEST_COOLDOWN_MS
+      ) {
+        lastKeyframeRequestAt = now;
+        try {
+          ws.send(JSON.stringify({ type: "reset-video", ack: false }));
+        } catch {}
       }
     };
     const resetPlayer = () => {
       player?.destroy();
       player = null;
     };
+    const closeDecoder = () => {
+      const current = decoder;
+      decoder = null;
+      if (!current) return;
+      try {
+        if (current.state !== "closed") current.close();
+      } catch {}
+    };
+    const resetPendingFrame = () => {
+      if (renderHandle) cancelAnimationFrame(renderHandle);
+      renderHandle = 0;
+      pendingFrame?.close();
+      pendingFrame = null;
+    };
+    const resetVideoGeneration = () => {
+      resetPlayer();
+      closeDecoder();
+      resetPendingFrame();
+      activeCodec = null;
+      decoderConfigFailed = false;
+      sawKeyframe = false;
+      droppingUntilKeyframe = false;
+      frameIndex = 0;
+      painted = false;
+      fpsFrames = 0;
+      fpsStartedAt = performance.now();
+      lastKeyframeRequestAt = Number.NEGATIVE_INFINITY;
+    };
+
+    const renderPendingFrame = () => {
+      renderHandle = 0;
+      const frame = pendingFrame;
+      pendingFrame = null;
+      if (!frame) return;
+      if (cancelled || !directContext) {
+        frame.close();
+        return;
+      }
+      try {
+        if (
+          canvas.width !== frame.displayWidth ||
+          canvas.height !== frame.displayHeight
+        ) {
+          canvas.width = frame.displayWidth;
+          canvas.height = frame.displayHeight;
+        }
+        directContext.drawImage(frame, 0, 0);
+      } catch {
+        frame.close();
+        closeDecoder();
+        sawKeyframe = false;
+        droppingUntilKeyframe = true;
+        markTransportSwitching("websocket");
+        requestKeyframe();
+        return;
+      }
+      frame.close();
+
+      const renderedAt = Date.now();
+      if (!painted) {
+        painted = true;
+        fpsFrames = 0;
+        fpsStartedAt = performance.now();
+        markTransportLive("websocket");
+        setState((current) => ({
+          ...current,
+          status: "streaming",
+          lastRenderedAt: renderedAt,
+          deviceSize: {
+            width: canvas.width,
+            height: canvas.height,
+          },
+        }));
+      }
+      fpsFrames++;
+      const now = performance.now();
+      if (now - fpsStartedAt >= 1_000) {
+        const fps = Math.round(
+          (fpsFrames * 1_000) / Math.max(1, now - fpsStartedAt),
+        );
+        fpsFrames = 0;
+        fpsStartedAt = now;
+        setState((current) => ({
+          ...current,
+          fps,
+          lastRenderedAt: renderedAt,
+        }));
+      }
+    };
+
+    const queueFrame = (frame: VideoFrame) => {
+      if (cancelled) {
+        frame.close();
+        return;
+      }
+      pendingFrame?.close();
+      pendingFrame = frame;
+      if (!renderHandle) {
+        renderHandle = requestAnimationFrame(renderPendingFrame);
+      }
+    };
+
+    const ensureDecoder = (
+      codec: string,
+      sourceCodec: GrpcVideoCodec,
+    ): boolean => {
+      if (decoder?.state === "configured") return true;
+      if (decoderConfigFailed) return false;
+      closeDecoder();
+      let created: VideoDecoder;
+      created = new VideoDecoder({
+        output: (frame) => {
+          if (decoder !== created) {
+            frame.close();
+            return;
+          }
+          queueFrame(frame);
+        },
+        error: (error) => {
+          if (decoder !== created) return;
+          if (isWebCodecsUnsupportedError(error)) {
+            decoderConfigFailed = true;
+            closeDecoder();
+            const message = activeCodec
+              ? `${videoCodecLabel(activeCodec)} unsupported by WebCodecs`
+              : "Video codec unsupported by WebCodecs";
+            reportTransportError("websocket", message);
+            setStatus(message);
+            return;
+          }
+          closeDecoder();
+          resetPendingFrame();
+          sawKeyframe = false;
+          droppingUntilKeyframe = true;
+          markTransportSwitching("websocket");
+          setStatus("decoder error");
+          requestKeyframe();
+        },
+      });
+      try {
+        created.configure({
+          codec,
+          optimizeForLatency: true,
+          hardwareAcceleration: webCodecsHardwareAcceleration(sourceCodec),
+        });
+        decoder = created;
+        return true;
+      } catch {
+        decoderConfigFailed = true;
+        try {
+          created.close();
+        } catch {}
+        const message = activeCodec
+          ? `${videoCodecLabel(activeCodec)} unsupported by WebCodecs`
+          : "Video codec unsupported by WebCodecs";
+        reportTransportError("websocket", message);
+        setStatus(message);
+        return false;
+      }
+    };
+
+    const createMsePlayer = (): MsePlayer =>
+      new MsePlayer(canvas, {
+        onFirstFrame: () => {
+          if (cancelled) return;
+          painted = true;
+          markTransportLive("websocket");
+          setState((current) => ({
+            ...current,
+            status: "streaming",
+            lastRenderedAt: Date.now(),
+          }));
+        },
+        onResize: (width, height) =>
+          setState((current) => ({
+            ...current,
+            deviceSize: { width, height },
+          })),
+        onFps: (fps) =>
+          setState((current) =>
+            current.fps === fps ? current : { ...current, fps },
+          ),
+        onError: (message) => {
+          reportTransportError("websocket", message);
+          setStatus(message);
+        },
+        requestKeyframe,
+      });
+
+    const recoverDecoder = () => {
+      resetPlayer();
+      closeDecoder();
+      resetPendingFrame();
+      sawKeyframe = false;
+      droppingUntilKeyframe = true;
+      markTransportSwitching("websocket");
+      requestKeyframe();
+    };
+
+    const feedFrame = (raw: ArrayBuffer) => {
+      const codec = activeCodec;
+      if (!codec) return;
+      let packet: ReturnType<typeof parseFramePacket>;
+      try {
+        packet = parseFramePacket(raw);
+      } catch {
+        recoverDecoder();
+        return;
+      }
+
+      if (useMse) {
+        if (codec !== "h264") return;
+        const isKey = resolveVideoKeyFrame(codec, packet.isKey, packet.data);
+        player ??= createMsePlayer();
+        player.feed(packet.data, isKey, packet.timestamp);
+        return;
+      }
+
+      const needsH264Scan =
+        codec === "h264" &&
+        (packet.isKey === null ||
+          (packet.isKey &&
+            (!decoder ||
+              decoder.state !== "configured" ||
+              droppingUntilKeyframe)));
+      const scanned = needsH264Scan ? scanAU(packet.data) : null;
+      const isKey =
+        packet.isKey ??
+        scanned?.isKey ??
+        resolveVideoKeyFrame(codec, null, packet.data);
+      const decoderCodec = webCodecsCodec(codec, scanned?.spsBytes ?? null);
+      if (
+        (!decoder || decoder.state !== "configured") &&
+        decoderCodec &&
+        !ensureDecoder(decoderCodec, codec)
+      ) {
+        return;
+      }
+      if (decoderConfigFailed) return;
+
+      if (droppingUntilKeyframe) {
+        if (!isKey) return;
+        if (!decoder || decoder.state !== "configured") {
+          requestKeyframe();
+          return;
+        }
+        droppingUntilKeyframe = false;
+      }
+
+      if (!decoder || decoder.state !== "configured") {
+        requestKeyframe();
+        return;
+      }
+      if (decoder.decodeQueueSize > MAIN_THREAD_DECODE_QUEUE_SIZE) {
+        droppingUntilKeyframe = true;
+        requestKeyframe();
+        return;
+      }
+      if (!sawKeyframe) {
+        if (!isKey) {
+          requestKeyframe();
+          return;
+        }
+        sawKeyframe = true;
+      }
+
+      const timestamp =
+        packet.timestamp ?? Math.round((frameIndex * 1_000_000) / 60);
+      try {
+        decoder.decode(
+          new EncodedVideoChunk({
+            type: isKey ? "key" : "delta",
+            timestamp,
+            data: packet.data,
+          }),
+        );
+        frameIndex++;
+      } catch {
+        recoverDecoder();
+      }
+    };
+
+    if (!useMse) {
+      try {
+        directContext = canvas.getContext("2d", {
+          alpha: false,
+          desynchronized: true,
+        });
+      } catch {}
+      if (!directContext) {
+        const message = "canvas unavailable";
+        reportTransportError("websocket", message);
+        setStatus(message);
+        return;
+      }
+    }
 
     const connect = () => {
       if (cancelled) return;
@@ -811,57 +1178,45 @@ export function useStream(
         if (typeof event.data === "string") {
           handleControlAcknowledgement(event.data);
           try {
-            const message = JSON.parse(event.data) as {
-              type?: string;
-              size?: DeviceSize;
-            };
-            if (message.type === "video-session" && message.size) {
-              resetPlayer();
+            const message = parseVideoSession(JSON.parse(event.data));
+            if (message) {
+              resetVideoGeneration();
+              activeCodec = message.codec;
+              activeVideoCodecRef.current = message.codec;
+              droppingUntilKeyframe = true;
+              markTransportSwitching("websocket");
               setState((current) => ({
                 ...current,
-                deviceSize: message.size!,
+                status: "connecting video",
+                deviceSize: message.size,
+                lastRenderedAt: null,
+                fps: 0,
+                stats: null,
               }));
+              const mseError = useMse
+                ? mseFallbackCodecError(message.codec)
+                : null;
+              if (mseError) {
+                reportTransportError("websocket", mseError);
+                setStatus(mseError);
+                return;
+              }
+              const fixedCodec = fixedWebCodecsCodec(message.codec);
+              if (fixedCodec && !ensureDecoder(fixedCodec, message.codec)) {
+                return;
+              }
               requestKeyframe();
             }
           } catch {}
           return;
         }
-
-        const packet = parseFramePacket(event.data as ArrayBuffer);
-        const isKey = packet.isKey ?? scanAU(packet.data).isKey;
-        if (!player) {
-          player = new MsePlayer(canvas, {
-            onFirstFrame: () => {
-              markTransportLive("websocket");
-              setState((current) => ({
-                ...current,
-                status: "streaming",
-                lastRenderedAt: Date.now(),
-              }));
-            },
-            onResize: (width, height) =>
-              setState((current) => ({
-                ...current,
-                deviceSize: { width, height },
-              })),
-            onFps: (fps) =>
-              setState((current) =>
-                current.fps === fps ? current : { ...current, fps },
-              ),
-            onError: (message) => {
-              reportTransportError("websocket", message);
-              setStatus(message);
-            },
-            requestKeyframe,
-          });
-        }
-        player.feed(packet.data, isKey, packet.timestamp);
+        feedFrame(event.data as ArrayBuffer);
       };
       ws.onclose = () => {
         if (directWsRef.current === ws) directWsRef.current = null;
         if (cancelled) return;
         markTransportSwitching("websocket");
-        resetPlayer();
+        resetVideoGeneration();
         const retryIn = reconnectDelay;
         setStatus(
           `disconnected — retrying in ${Math.round(retryIn / 1_000)}s`,
@@ -879,7 +1234,7 @@ export function useStream(
         ws?.close();
       } catch {}
       if (directWsRef.current === ws) directWsRef.current = null;
-      resetPlayer();
+      resetVideoGeneration();
     };
   }, [
     canvasRef,
