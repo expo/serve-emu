@@ -35,10 +35,21 @@ function fakeSession(): ScrcpySession {
   };
 }
 
+/**
+ * The server answers 413 and resets the connection while the client is still
+ * writing chunks, so a reset is part of the behavior under test, not a failure.
+ * Swallow it and let `close` resolve with whatever response arrived; the
+ * timeout still catches a server that never answers.
+ */
+function isConnectionReset(error: NodeJS.ErrnoException): boolean {
+  return error.code === "ECONNRESET" || error.code === "EPIPE";
+}
+
 function rawChunkedRequest(port: number, body: string): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = [];
     const socket = createConnection({ host: "127.0.0.1", port });
+    const ignoreWriteError = () => {};
     let settled = false;
     const finish = () => {
       if (settled) return;
@@ -64,21 +75,28 @@ function rawChunkedRequest(port: number, body: string): Promise<string> {
           "Content-Type: application/json\r\n" +
           "Transfer-Encoding: chunked\r\n" +
           "Connection: close\r\n\r\n",
+        ignoreWriteError,
       );
       for (let offset = 0; offset < body.length; offset += 97) {
         const chunk = body.slice(offset, offset + 97);
-        socket.write(`${Buffer.byteLength(chunk).toString(16)}\r\n`);
-        socket.write(chunk);
-        socket.write("\r\n");
+        socket.write(
+          `${Buffer.byteLength(chunk).toString(16)}\r\n`,
+          ignoreWriteError,
+        );
+        socket.write(chunk, ignoreWriteError);
+        socket.write("\r\n", ignoreWriteError);
       }
       // Keep the writable side open so Bun can finish parsing the terminal
       // chunk and send its response before the client half-closes the socket.
-      socket.write("0\r\n\r\n");
+      socket.write("0\r\n\r\n", ignoreWriteError);
     });
     socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
     socket.on("end", finish);
     socket.on("close", finish);
-    socket.on("error", fail);
+    socket.on("error", (error: NodeJS.ErrnoException) => {
+      if (isConnectionReset(error)) return;
+      fail(error);
+    });
   });
 }
 
