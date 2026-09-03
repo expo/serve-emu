@@ -44,6 +44,7 @@ describe("stream session", () => {
       startEmuSession({
         mode: "grpc-screenshot",
         grpcImageMode: "png",
+        inputSource: "grpc",
         serial: "physical-device",
       }),
     ).rejects.toThrow("requires an Android Emulator serial");

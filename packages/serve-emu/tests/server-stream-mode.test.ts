@@ -40,6 +40,7 @@ function fakeSession(
   });
   const session: EmuSession = {
     mode,
+    inputSource: mode === "grpc-screenshot" ? "grpc" : "scrcpy",
     serial,
     meta: {
       deviceName: `${mode}:${serial}`,
@@ -421,6 +422,8 @@ describe("server stream source switching", () => {
       serial: "emulator-5554",
       mode: "scrcpy",
       grpcImageMode: "png",
+      inputSource: "scrcpy",
+      availableInputSources: ["scrcpy"],
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 0,
     });

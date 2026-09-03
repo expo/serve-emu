@@ -6,6 +6,7 @@ import type { Socket } from "node:net";
 import { SCRCPY_VERSION } from "../scripts/fetch-scrcpy.ts";
 import {
   startScrcpy,
+  startScrcpyControl,
   type AdbCommandResult,
   type ScrcpyDependencies,
 } from "../src/scrcpy.ts";
@@ -408,6 +409,7 @@ describe("scrcpy async lifecycle", () => {
       "scid=01234560",
       "log_level=info",
       "audio=false",
+      "video=true",
       "tunnel_forward=true",
       "control=true",
       "send_dummy_byte=true",
@@ -451,6 +453,40 @@ describe("scrcpy async lifecycle", () => {
       ),
     ).toHaveLength(2);
     await second.close();
+  });
+
+  test("starts one control socket without scrcpy video or audio", async () => {
+    const harness = createHarness();
+    const session = await startScrcpyControl(
+      { serial: SERIAL },
+      harness.deps,
+    );
+
+    expect(session.transport).toBe("scrcpy-control");
+    expect(session.controlSocket).toBe(harness.state.sockets[0]);
+    expect(harness.state.connectCalls).toHaveLength(1);
+    expect(harness.state.spawnCalls[0].args).toEqual([
+      "shell",
+      "CLASSPATH=/data/local/tmp/serve-emu-scrcpy-01234560.jar",
+      "app_process",
+      "/",
+      "com.genymobile.scrcpy.Server",
+      SCRCPY_VERSION,
+      "scid=01234560",
+      "log_level=info",
+      "audio=false",
+      "video=false",
+      "tunnel_forward=true",
+      "control=true",
+      "send_dummy_byte=false",
+      "send_stream_meta=false",
+      "send_frame_meta=false",
+      "send_device_meta=false",
+      "clipboard_autosync=false",
+      "cleanup=true",
+    ]);
+
+    await session.close();
   });
 
   test("a deferred adb command does not block unrelated timers", async () => {

@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { describe, expect, test } from "bun:test";
 import {
   GrpcAccessUnitBoundaryCadence,
@@ -34,7 +35,10 @@ import {
 } from "../src/emulator-grpc.ts";
 import type { H264EncoderOpts, QuarterTurn } from "../src/h264-encoder.ts";
 import { compileGesture, parseGesture } from "../src/input.ts";
-import type { VideoFrame } from "../src/scrcpy.ts";
+import type {
+  ScrcpyControlSession,
+  VideoFrame,
+} from "../src/scrcpy.ts";
 
 const CONFIG_FRAME: VideoFrame = {
   type: "frame",
@@ -1162,6 +1166,60 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe("startGrpcSession integration", () => {
+  test("routes controls through a control-only scrcpy session", async () => {
+    const client = new FakeGrpcClient(integrationImage());
+    const encoders: FakeGrpcEncoder[] = [];
+    const packets: Buffer[] = [];
+    let controlCloseCalls = 0;
+    const controlSocket = Object.assign(new EventEmitter(), {
+      destroyed: false,
+      writable: true,
+      write(packet: Buffer, callback: (error?: Error | null) => void) {
+        packets.push(Buffer.from(packet));
+        callback();
+        return true;
+      },
+    });
+    const controlProcess = new EventEmitter();
+    const session = await startGrpcSession(
+      {
+        serial: "emulator-5554",
+        mode: "grpc-screenshot",
+        grpcImageMode: "png",
+        inputSource: "scrcpy",
+      },
+      {
+        readDisplaySizeSignal: async () => "physical:4x6",
+        runtime: integrationRuntime(client, encoders),
+        startScrcpyControl: async () =>
+          ({
+            transport: "scrcpy-control",
+            serial: "emulator-5554",
+            scid: "00000001",
+            localPort: 27_183,
+            controlSocket,
+            proc: controlProcess,
+            async close() {
+              controlCloseCalls++;
+            },
+          }) as unknown as ScrcpyControlSession,
+      },
+    );
+
+    const gesture = { type: "tap", x: 0.25, y: 0.5 } as const;
+    await session.controls.enqueue(gesture, { width: 2, height: 3 }).completion;
+
+    expect(session.inputSource).toBe("scrcpy");
+    expect(packets).toEqual(
+      compileGesture(gesture, { width: 4, height: 6 }).steps.map(
+        (step) => step.packet,
+      ),
+    );
+    expect(client.keys).toEqual([]);
+    await session.close();
+    expect(controlCloseCalls).toBe(1);
+  });
+
   test("starts, routes hardware controls through gRPC keys, and closes resources", async () => {
     const client = new FakeGrpcClient(integrationImage());
     const encoders: FakeGrpcEncoder[] = [];
@@ -1170,6 +1228,7 @@ describe("startGrpcSession integration", () => {
         serial: "emulator-5554",
         mode: "grpc-screenshot",
         grpcImageMode: "png",
+        inputSource: "grpc",
       },
       {
         readDisplaySizeSignal: async () => "physical:4x6",
@@ -1207,6 +1266,7 @@ describe("startGrpcSession integration", () => {
         serial: "emulator-5554",
         mode: "grpc-screenshot",
         grpcImageMode: "png",
+        inputSource: "grpc",
       },
       {
         readDisplaySizeSignal: async () => "physical:4x6",
@@ -1230,6 +1290,7 @@ describe("startGrpcSession integration", () => {
         serial: "emulator-5554",
         mode: "grpc-screenshot",
         grpcImageMode: "png",
+        inputSource: "grpc",
         maxFps: 0.01,
       },
       {
@@ -1252,6 +1313,7 @@ describe("startGrpcSession integration", () => {
         serial: "emulator-5554",
         mode: "grpc-screenshot",
         grpcImageMode: "png",
+        inputSource: "grpc",
       },
       {
         readDisplaySizeSignal: async () => "physical:4x6",
@@ -1275,6 +1337,7 @@ describe("startGrpcSession integration", () => {
         serial: "emulator-5554",
         mode: "grpc-screenshot",
         grpcImageMode: "png",
+        inputSource: "grpc",
       },
       {
         readDisplaySizeSignal: async () => "physical:4x6",
@@ -1300,6 +1363,7 @@ describe("startGrpcSession integration", () => {
         serial: "emulator-5554",
         mode: "grpc-screenshot",
         grpcImageMode: "png",
+        inputSource: "grpc",
       },
       {
         readDisplaySizeSignal: async () => "physical:4x6",
@@ -1331,6 +1395,7 @@ describe("startGrpcSession integration", () => {
         serial: "emulator-5554",
         mode: "grpc-screenshot",
         grpcImageMode: "png",
+        inputSource: "grpc",
         signal: controller.signal,
       },
       {

@@ -11,6 +11,7 @@ import type { StreamSocket } from "../src/stream-socket.ts";
 type CapturedStartOpts = StartOpts & {
   mode?: "scrcpy";
   grpcImageMode?: "png" | "mmap";
+  inputSource?: "scrcpy" | "grpc";
 };
 
 function deferred<T>() {
@@ -171,6 +172,7 @@ describe("stream settings HTTP API", () => {
         keyFrameInterval: undefined,
         mode: "scrcpy",
         grpcImageMode: "png",
+        inputSource: "scrcpy",
       });
       expect(app.health().encoderSettings).toEqual({
         maxDimension: 960,
@@ -234,6 +236,7 @@ describe("stream settings HTTP API", () => {
         keyFrameInterval: undefined,
         mode: "scrcpy",
         grpcImageMode: "png",
+        inputSource: "scrcpy",
       });
     } finally {
       app.stop();

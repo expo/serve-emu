@@ -147,14 +147,18 @@ import {
   type WebRtcPublisherOptions,
 } from "./webrtc-publisher.ts";
 import {
+  DEFAULT_GRPC_INPUT_SOURCE,
   DEFAULT_GRPC_IMAGE_MODE,
   GRPC_IMAGE_MODES,
+  INPUT_SOURCES,
   isGrpcImageMode,
+  isInputSource,
   isStreamMode,
   parseFontScale,
   parseStreamModeRequest,
   STREAM_MODES,
   type GrpcImageMode,
+  type InputSource,
   type StreamMode,
 } from "./shared/api-contracts.ts";
 import {
@@ -182,10 +186,12 @@ export type ServerOpts = {
   maxSize?: number;
   keyFrameInterval?: number;
   repeatFrameMs?: number;
-  /** Screen/input source. Defaults to scrcpy. */
+  /** Screen capture source. Defaults to scrcpy. */
   streamMode?: StreamMode;
   /** Emulator gRPC image delivery mode. Defaults to PNG. */
   grpcImageMode?: GrpcImageMode;
+  /** Input transport. gRPC streaming defaults to scrcpy input. */
+  inputSource?: InputSource;
   maxApkUploadBytes?: number;
   maxMediaUploadBytes?: number;
   maxActiveUploads?: number;
@@ -374,6 +380,12 @@ export async function startServer(
     );
   }
   const defaultGrpcImageMode = requestedDefaultGrpcImageMode;
+  const requestedDefaultInputSource: unknown =
+    opts.inputSource ?? DEFAULT_GRPC_INPUT_SOURCE;
+  if (!isInputSource(requestedDefaultInputSource)) {
+    throw new Error(`inputSource must be one of: ${INPUT_SOURCES.join(", ")}`);
+  }
+  const defaultInputSource = requestedDefaultInputSource;
   const serve = dependencies.serve ?? Bun.serve;
   const listDevices =
     dependencies.listDevices ?? dependencies.listAllDevices ?? listAllDevices;
@@ -488,6 +500,7 @@ export async function startServer(
       : DEFAULT_WEBRTC_STREAM_SETTINGS;
   const streamModes = new Map<string, StreamMode>();
   const grpcImageModes = new Map<string, GrpcImageMode>();
+  const inputSources = new Map<string, InputSource>();
   const contextGrpcImageModes = new WeakMap<DeviceContext, GrpcImageMode>();
   const defaultStreamEncoderSettings: StreamEncoderSettings = {
     maxDimension: opts.maxSize ?? SCRCPY_DEFAULTS.maxSize,
@@ -504,6 +517,13 @@ export async function startServer(
     (isEmulatorSerial(serial) ? defaultStreamMode : "scrcpy");
   const grpcImageModeForSerial = (serial: string): GrpcImageMode =>
     grpcImageModes.get(serial) ?? defaultGrpcImageMode;
+  const inputSourceForSerial = (
+    serial: string,
+    mode: StreamMode,
+  ): InputSource =>
+    mode === "grpc-screenshot"
+      ? inputSources.get(serial) ?? defaultInputSource
+      : "scrcpy";
 
   const openStream = (
     serial: string,
@@ -511,11 +531,13 @@ export async function startServer(
     signal?: AbortSignal,
     encoderSettings = encoderSettingsForSerial(serial),
     grpcImageMode = grpcImageModeForSerial(serial),
+    inputSource = inputSourceForSerial(serial, mode),
   ) =>
     openSession({
       serial,
       mode,
       grpcImageMode,
+      inputSource,
       signal,
       maxFps: encoderSettings.h264Fps,
       bitRate: encoderSettings.h264Bitrate,
@@ -597,6 +619,7 @@ export async function startServer(
   }
   streamModes.set(opts.serial, initialMode);
   grpcImageModes.set(opts.serial, defaultGrpcImageMode);
+  inputSources.set(opts.serial, defaultInputSource);
   const sessions = new DeviceSessionManager(initialContext);
   const recoveries = new WeakMap<
     DeviceContext,
@@ -1584,6 +1607,7 @@ export async function startServer(
     deviceState?: DeviceSessionState,
     encoderSettings = encoderSettingsForSerial(serial),
     grpcImageMode = grpcImageModeForSerial(serial),
+    inputSource = inputSourceForSerial(serial, mode),
   ): Promise<DeviceContext> => {
     const stagingOwner = {};
     let retainedDeviceState =
@@ -1604,6 +1628,7 @@ export async function startServer(
         signal,
         encoderSettings,
         grpcImageMode,
+        inputSource,
       );
       try {
         return createContext(
@@ -1634,6 +1659,11 @@ export async function startServer(
     serial: context.serial,
     mode: context.stream.mode,
     grpcImageMode: grpcImageModeForContext(context),
+    inputSource: context.stream.inputSource,
+    availableInputSources:
+      context.stream.mode === "grpc-screenshot"
+        ? [...INPUT_SOURCES]
+        : (["scrcpy"] satisfies InputSource[]),
     availableModes: availableStreamModesForSerial(context.serial),
     sessionGeneration: context.generation,
   });
@@ -1689,6 +1719,7 @@ export async function startServer(
   const switchStreamMode = async (
     mode: StreamMode,
     requestedGrpcImageMode: GrpcImageMode | undefined,
+    requestedInputSource: InputSource | undefined,
     expected?: DeviceContext,
   ) => {
     const active = sessions.current;
@@ -1702,6 +1733,7 @@ export async function startServer(
       );
     }
     let grpcImageMode: GrpcImageMode | undefined;
+    let inputSource: InputSource | undefined;
     const context = await sessions.replace(
       (current, generation, signal) => {
         const selectedGrpcImageMode =
@@ -1709,6 +1741,15 @@ export async function startServer(
           requestedGrpcImageMode ??
           grpcImageModeForContext(current);
         grpcImageMode = selectedGrpcImageMode;
+        const selectedInputSource =
+          mode === "grpc-screenshot"
+            ? inputSource ??
+              requestedInputSource ??
+              (current.stream.mode === "grpc-screenshot"
+                ? current.stream.inputSource
+                : inputSourceForSerial(current.serial, mode))
+            : "scrcpy";
+        inputSource = selectedInputSource;
         return prepareContext(
           current.serial,
           generation,
@@ -1717,6 +1758,7 @@ export async function startServer(
           current.signal.aborted ? undefined : current.deviceState,
           encoderSettingsForSerial(current.serial),
           selectedGrpcImageMode,
+          selectedInputSource,
         );
       },
       activateContext,
@@ -1730,9 +1772,17 @@ export async function startServer(
         }
         grpcImageMode =
           requestedGrpcImageMode ?? grpcImageModeForContext(current);
+        inputSource =
+          mode === "grpc-screenshot"
+            ? requestedInputSource ??
+              (current.stream.mode === "grpc-screenshot"
+                ? current.stream.inputSource
+                : inputSourceForSerial(current.serial, mode))
+            : "scrcpy";
         return (
           current.stream.mode !== mode ||
-          grpcImageModeForContext(current) !== grpcImageMode
+          grpcImageModeForContext(current) !== grpcImageMode ||
+          current.stream.inputSource !== inputSource
         );
       },
     );
@@ -1740,6 +1790,12 @@ export async function startServer(
       grpcImageMode ?? grpcImageModeForContext(context);
     streamModes.set(context.serial, mode);
     grpcImageModes.set(context.serial, appliedGrpcImageMode);
+    if (mode === "grpc-screenshot") {
+      inputSources.set(
+        context.serial,
+        inputSource ?? context.stream.inputSource,
+      );
+    }
     if (context.generation !== active.generation) {
       console.log(
         `${context.stream.mode} ready: ${context.stream.meta.deviceName} • ${context.stream.meta.codecId} • ${context.stream.meta.width}×${context.stream.meta.height}`,
@@ -1944,6 +2000,7 @@ export async function startServer(
         }
         let mode: StreamMode;
         let grpcImageMode: GrpcImageMode | undefined;
+        let inputSource: InputSource | undefined;
         try {
           const payload = await readJsonBody(req, MAX_JSON_BODY_BYTES);
           const streamModeRequest = parseStreamModeRequest(payload);
@@ -1961,12 +2018,21 @@ export async function startServer(
             streamModeRequest.mode === "grpc-screenshot"
               ? streamModeRequest.grpcImageMode
               : undefined;
+          inputSource =
+            streamModeRequest.mode === "grpc-screenshot"
+              ? streamModeRequest.inputSource
+              : undefined;
         } catch (error) {
           return streamModeRequestErrorResponse(error);
         }
         try {
           return Response.json(
-            await switchStreamMode(mode, grpcImageMode, requestContext),
+            await switchStreamMode(
+              mode,
+              grpcImageMode,
+              inputSource,
+              requestContext,
+            ),
           );
         } catch (error) {
           return error instanceof SessionChangedError

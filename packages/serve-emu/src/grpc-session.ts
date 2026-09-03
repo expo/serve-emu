@@ -2,6 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   ControlInputQueue,
   ControlInputRejectedError,
+  SocketControlWriter,
 } from "./control-input-queue.ts";
 import { isEmulatorSerial } from "./device-capabilities.ts";
 import {
@@ -34,12 +35,19 @@ import {
   rgb888MmapRegionBytes,
   type StableMmapRead,
 } from "./grpc-mmap.ts";
-import { normalizeTextForControl, type Gesture } from "./input.ts";
+import {
+  compileGesture,
+  normalizeTextForControl,
+  type Gesture,
+} from "./input.ts";
 import {
   SCRCPY_DEFAULTS,
+  startScrcpyControl,
+  type ScrcpyControlSession,
   type VideoFrame,
   type VideoPacket,
 } from "./scrcpy.ts";
+import { isAbnormalExit, procExitDetail } from "./session-status.ts";
 import type {
   EmuSession,
   GrpcCaptureDiagnostics,
@@ -48,7 +56,10 @@ import type {
   StreamFailure,
   StreamMeta,
 } from "./stream-session.ts";
-import type { GrpcImageMode } from "./shared/api-contracts.ts";
+import type {
+  GrpcImageMode,
+  InputSource,
+} from "./shared/api-contracts.ts";
 
 export { H264StartupGate } from "./h264-readiness.ts";
 
@@ -1291,6 +1302,7 @@ export type GrpcSessionDependencies = {
     serial: string,
     signal: AbortSignal,
   ) => Promise<string>;
+  startScrcpyControl?: typeof startScrcpyControl;
   runtime?: Partial<GrpcSessionRuntime>;
 };
 
@@ -1650,6 +1662,9 @@ export async function startGrpcSession(
 ): Promise<EmuSession> {
   const serial = options.serial;
   const imageMode = options.grpcImageMode;
+  const inputSource: InputSource = options.inputSource;
+  const openScrcpyControl =
+    dependencies.startScrcpyControl ?? startScrcpyControl;
   const runtime: GrpcSessionRuntime = {
     ...DEFAULT_GRPC_SESSION_RUNTIME,
     ...dependencies.runtime,
@@ -1736,6 +1751,9 @@ export async function startGrpcSession(
   let resolveFirstImage: ((image: EmuImage) => void) | null = null;
   let rejectFirstImage: ((error: Error) => void) | null = null;
   let requestQueuedKeyFrame: (() => void) | null = null;
+  let scrcpyControl: ScrcpyControlSession | null = null;
+  let removeScrcpyControlListeners: (() => void) | null = null;
+  let controls: ControlInputQueue | null = null;
 
   const wakeReaders = () => {
     while (waiters.length) waiters.shift()!(null);
@@ -2127,22 +2145,47 @@ export async function startGrpcSession(
     return task;
   };
 
-  const controls = new ControlInputQueue({
-    dispatcher: {
-      dispatchGesture: (gesture, _screen, signal) =>
-        dispatchGesture(gesture, signal),
-      async resetVideo(signal) {
-        throwIfAborted(signal, "gRPC video reset aborted");
-        // Existing packets remain valid until the replacement emits its IDR.
-        // The lifecycle coalesces bursts and never overlaps ffmpeg shutdowns.
-        await restartEncoder(false, false);
-        throwIfAborted(signal, "gRPC video reset aborted");
+  const resetGrpcVideo = async (signal: AbortSignal) => {
+    throwIfAborted(signal, "gRPC video reset aborted");
+    // Existing packets remain valid until the replacement emits its IDR.
+    // The lifecycle coalesces bursts and never overlaps ffmpeg shutdowns.
+    await restartEncoder(false, false);
+    throwIfAborted(signal, "gRPC video reset aborted");
+  };
+
+  const createGrpcControls = () =>
+    new ControlInputQueue({
+      dispatcher: {
+        dispatchGesture: (gesture, _screen, signal) =>
+          dispatchGesture(gesture, signal),
+        resetVideo: resetGrpcVideo,
+        close() {
+          void releaseInput();
+        },
       },
-      close() {
-        void releaseInput();
+    });
+
+  const createScrcpyControls = (session: ScrcpyControlSession) => {
+    const writer = new SocketControlWriter(session.controlSocket);
+    return new ControlInputQueue({
+      dispatcher: {
+        async dispatchGesture(gesture, _screen, signal) {
+          // With scrcpy video disabled, touch coordinates must target the native
+          // display directly rather than the downscaled gRPC encoder output.
+          for (const step of compileGesture(gesture, nativeTouchSize).steps) {
+            if (step.delayMs > 0) {
+              await runtime.sleep(step.delayMs, signal);
+            }
+            await writer.write(step.packet, signal);
+          }
+        },
+        resetVideo: resetGrpcVideo,
+        close(reason) {
+          writer.close(reason);
+        },
       },
-    },
-  });
+    });
+  };
 
   const close = (): Promise<void> => {
     if (closeTask) return closeTask;
@@ -2161,13 +2204,22 @@ export async function startGrpcSession(
     idleTimer = null;
     if (displaySizePollTimer) clearTimeout(displaySizePollTimer);
     displaySizePollTimer = null;
-    controls.close(new Error("gRPC screenshot session closed"));
-    const inputRelease = releaseInput();
+    controls?.close(new Error("gRPC screenshot session closed"));
+    const inputRelease =
+      inputSource === "grpc" ? releaseInput() : Promise.resolve();
     const encoderClose = encoderLifecycle?.close() ?? Promise.resolve();
+    removeScrcpyControlListeners?.();
+    removeScrcpyControlListeners = null;
+    const scrcpyControlClose = scrcpyControl?.close() ?? Promise.resolve();
+    scrcpyControl = null;
     listeners.clear();
     packetQueue.clear();
     wakeReaders();
-    void Promise.allSettled([inputRelease, encoderClose]).then(async () => {
+    void Promise.allSettled([
+      inputRelease,
+      encoderClose,
+      scrcpyControlClose,
+    ]).then(async () => {
       client.close();
       try {
         await transportToClose?.close();
@@ -2243,6 +2295,39 @@ export async function startGrpcSession(
         nativeTouchSize = size;
       },
     });
+    if (inputSource === "scrcpy") {
+      const controlSession = await openScrcpyControl({
+        serial,
+        signal: lifetime.signal,
+      });
+      scrcpyControl = controlSession;
+      const onControlError = (error: Error) =>
+        emitFatal({
+          message: `scrcpy control socket error: ${error.message}`,
+          code: "control-socket-error",
+        });
+      const onProcessExit = (
+        code: number | null,
+        signal: NodeJS.Signals | null,
+      ) => {
+        if (!isAbnormalExit(code, signal)) return;
+        const detail = procExitDetail(code, signal);
+        emitFatal({
+          message: detail.reason,
+          code: detail.code,
+          meta: detail.meta,
+        });
+      };
+      controlSession.controlSocket.on("error", onControlError);
+      controlSession.proc.on("exit", onProcessExit);
+      removeScrcpyControlListeners = () => {
+        controlSession.controlSocket.off("error", onControlError);
+        controlSession.proc.off("exit", onProcessExit);
+      };
+      controls = createScrcpyControls(controlSession);
+    } else {
+      controls = createGrpcControls();
+    }
     const existingFailure = getFatalFailure();
     if (existingFailure) throw new Error(existingFailure.message);
     captureTransport = createGrpcImageCaptureTransport({
@@ -2345,6 +2430,7 @@ export async function startGrpcSession(
     scheduleDisplaySizePoll();
 
     const size = currentGeometry(first)!.encodedSize;
+    if (!controls) throw new Error("gRPC input controls were not initialized");
     const meta: StreamMeta = {
       deviceName: endpoint.avdName ?? serial,
       codecId: "h264",
@@ -2354,6 +2440,7 @@ export async function startGrpcSession(
     sessionMeta = meta;
     return {
       mode: "grpc-screenshot",
+      inputSource,
       serial,
       meta,
       controls,

@@ -29,6 +29,11 @@ blindly discard the first byte: `parseVideoPreamble()` accepts the video preambl
 at offset 0 or 1 and validates its codec and dimensions. The control socket is
 drained for any device-to-host events that this package does not consume.
 
+When gRPC supplies video but scrcpy supplies input, the host starts the same
+device server with `video=false`, `audio=false`, and `control=true`. Only the
+control socket is connected; device, stream, frame, and dummy-byte metadata are
+disabled because no video preamble is read in this control-only mode.
+
 ## Video preamble
 
 Both supported layouts begin with a 64-byte UTF-8 device name, padded with NUL

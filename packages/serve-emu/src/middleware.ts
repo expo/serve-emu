@@ -90,12 +90,16 @@ import {
   type ScrcpySession,
 } from "./scrcpy.ts";
 import {
+  DEFAULT_GRPC_INPUT_SOURCE,
   DEFAULT_GRPC_IMAGE_MODE,
   GRPC_IMAGE_MODES,
+  INPUT_SOURCES,
   isGrpcImageMode,
+  isInputSource,
   parseFontScale,
   parseStreamModeRequest,
   type GrpcImageMode,
+  type InputSource,
   type StreamMode,
   type StreamModeResponse,
 } from "./shared/api-contracts.ts";
@@ -116,11 +120,14 @@ export type {
   RollingTimingSummary,
 } from "./stream-session.ts";
 export {
+  DEFAULT_GRPC_INPUT_SOURCE,
   DEFAULT_GRPC_IMAGE_MODE,
   GRPC_IMAGE_MODES,
+  INPUT_SOURCES,
   isGrpcImageMode,
+  isInputSource,
 } from "./shared/api-contracts.ts";
-export type { GrpcImageMode } from "./shared/api-contracts.ts";
+export type { GrpcImageMode, InputSource } from "./shared/api-contracts.ts";
 export type {
   StreamEncoderSettings,
   StreamSettings,
@@ -151,10 +158,12 @@ export type AppOptions = {
   uploadQueueTimeoutMs?: number;
   /** Default viewer transport. Each browser viewer may select either available path. */
   streamSettings?: StreamSettings;
-  /** Screen capture and input source. Defaults to scrcpy. */
+  /** Screen capture source. Defaults to scrcpy. */
   streamMode?: StreamMode;
   /** Emulator gRPC image delivery mode. Defaults to PNG. */
   grpcImageMode?: GrpcImageMode;
+  /** Input transport. gRPC streaming defaults to scrcpy input. */
+  inputSource?: InputSource;
   /** @internal Shared by router-managed source generations for one device. */
   deviceState?: DeviceSessionState;
 } & BrowserOriginPolicy;
@@ -307,6 +316,17 @@ async function createAppInternal(
     );
   }
   const grpcImageMode = requestedGrpcImageMode;
+  const streamMode = opts.streamMode ?? "scrcpy";
+  const requestedInputSource: unknown =
+    opts.inputSource ??
+    (streamMode === "grpc-screenshot" ? DEFAULT_GRPC_INPUT_SOURCE : "scrcpy");
+  if (!isInputSource(requestedInputSource)) {
+    throw new Error(`inputSource must be one of: ${INPUT_SOURCES.join(", ")}`);
+  }
+  const inputSource = requestedInputSource;
+  if (streamMode === "scrcpy" && inputSource !== "scrcpy") {
+    throw new Error("scrcpy streaming requires scrcpy input");
+  }
   const openWebRtcPublisher =
     dependencies.createWebRtcPublisher ?? createWebRtcPublisher;
   const clock = dependencies.clock ?? SYSTEM_APP_CLOCK;
@@ -338,8 +358,9 @@ async function createAppInternal(
       bitRate: streamEncoderSettings.h264Bitrate,
       maxSize: streamEncoderSettings.maxDimension,
       keyFrameInterval: opts.keyFrameInterval,
-      mode: opts.streamMode ?? "scrcpy",
+      mode: streamMode,
       grpcImageMode,
+      inputSource,
     });
     throwIfAborted(opts.signal, "serve-emu app startup aborted");
   } catch (error) {
@@ -422,6 +443,7 @@ async function createAppInternal(
     device: session.meta.deviceName,
     streamMode: session.mode,
     grpcImageMode,
+    inputSource: session.inputSource,
     grpcCapture: session.diagnostics?.().grpcCapture ?? null,
     codec: session.meta.codecId,
     size: { width: screen.width, height: screen.height },
@@ -976,6 +998,7 @@ async function createAppInternal(
   const startCapture = (
     settings: StreamEncoderSettings,
     mode: StreamMode,
+    nextInputSource: InputSource,
     signal: AbortSignal,
   ) =>
     openSession({
@@ -987,14 +1010,21 @@ async function createAppInternal(
       keyFrameInterval: opts.keyFrameInterval,
       mode,
       grpcImageMode,
+      inputSource: nextInputSource,
     });
 
   const replaceCapture = async (
     settings: StreamEncoderSettings,
     mode: StreamMode,
+    nextInputSource: InputSource,
     signal: AbortSignal,
   ): Promise<void> => {
-    const candidate = await startCapture(settings, mode, signal);
+    const candidate = await startCapture(
+      settings,
+      mode,
+      nextInputSource,
+      signal,
+    );
     await activateCapture(candidate, settings);
   };
 
@@ -1019,6 +1049,7 @@ async function createAppInternal(
 
       const previousSession = session;
       const previousMode = previousSession.mode;
+      const previousInputSource = previousSession.inputSource;
       const restartController = new AbortController();
       captureRestartController = restartController;
       captureRestarting = true;
@@ -1033,6 +1064,7 @@ async function createAppInternal(
         await replaceCapture(
           nextSettings,
           previousMode,
+          previousInputSource,
           restartController.signal,
         );
         return { ...streamEncoderSettings };
@@ -1045,6 +1077,7 @@ async function createAppInternal(
           await replaceCapture(
             previousSettings,
             previousMode,
+            previousInputSource,
             restartController.signal,
           );
         } catch (rollbackError) {
@@ -1743,6 +1776,8 @@ async function createAppInternal(
     }),
     /** Exact gRPC image mode configured for this app generation. */
     getGrpcImageMode: (): GrpcImageMode => grpcImageMode,
+    /** Exact input source configured for this app generation. */
+    getInputSource: (): InputSource => session.inputSource,
     health,
     webRtcStats,
     handleRequest,
@@ -1761,7 +1796,7 @@ export type ScrcpyEmuApp = Omit<EmuApp, "session"> & {
   session: ScrcpySession;
 };
 
-type RouterStreamSession = Pick<EmuSession, "mode" | "meta">;
+type RouterStreamSession = Pick<EmuSession, "mode" | "inputSource" | "meta">;
 
 /**
  * Read the backend-neutral session exposed by current apps while continuing to
@@ -1773,8 +1808,13 @@ function streamSessionForApp(app: EmuApp): RouterStreamSession {
   if (streamSession) return streamSession;
   const session = app.session as ScrcpySession | EmuSession;
   return "mode" in session
-    ? session
-    : { mode: "scrcpy", meta: session.meta };
+    ? {
+        mode: session.mode,
+        inputSource:
+          "inputSource" in session ? session.inputSource : "scrcpy",
+        meta: session.meta,
+      }
+    : { mode: "scrcpy", inputSource: "scrcpy", meta: session.meta };
 }
 
 function deviceStateForApp(app: EmuApp): DeviceSessionState | undefined {
@@ -1808,6 +1848,18 @@ function grpcImageModeForApp(
     }
   ).getGrpcImageMode;
   return readMode?.() ?? fallback;
+}
+
+function inputSourceForApp(
+  app: EmuApp,
+  fallback: InputSource,
+): InputSource {
+  const readSource = (
+    app as EmuApp & {
+      getInputSource?: () => InputSource;
+    }
+  ).getInputSource;
+  return readSource?.() ?? streamSessionForApp(app).inputSource ?? fallback;
 }
 
 export function createApp(
@@ -1863,6 +1915,7 @@ export function createRouter(
   const failureAt = new Map<string, number>();
   const streamModeOverrides = new Map<string, StreamMode>();
   const grpcImageModeOverrides = new Map<string, GrpcImageMode>();
+  const inputSourceOverrides = new Map<string, InputSource>();
   const streamModeQueues = new Map<string, Promise<void>>();
   const sessionGenerations = new Map<string, number>();
   const operationControllers = new Map<string, Set<AbortController>>();
@@ -1983,6 +2036,12 @@ export function createRouter(
       grpcImageModeOverrides.get(serial) ??
       defaults.grpcImageMode ??
       DEFAULT_GRPC_IMAGE_MODE,
+    inputSource =
+      streamMode === "grpc-screenshot"
+        ? inputSourceOverrides.get(serial) ??
+          defaults.inputSource ??
+          DEFAULT_GRPC_INPUT_SOURCE
+        : "scrcpy",
   ): Promise<EmuApp> => {
     const operation = beginOperation(serial, parentSignal);
     let created: EmuApp | null = null;
@@ -2000,6 +2059,7 @@ export function createRouter(
         serial,
         streamMode,
         grpcImageMode,
+        inputSource,
         deviceState,
         signal: combineAbortSignals(defaults.signal, operation.signal),
       });
@@ -2126,6 +2186,7 @@ export function createRouter(
     serial: string,
     streamMode: StreamMode,
     requestedGrpcImageMode: GrpcImageMode | undefined,
+    requestedInputSource: InputSource | undefined,
     signal: AbortSignal,
   ): Promise<EmuApp> => {
     if (stopped) throw new Error("serve-emu router is stopped");
@@ -2149,13 +2210,39 @@ export function createRouter(
       : configuredGrpcImageMode;
     const grpcImageMode =
       requestedGrpcImageMode ?? currentGrpcImageMode;
+    const currentMode = current
+      ? streamSessionForApp(current).mode
+      : streamModeOverrides.get(serial) ?? defaults.streamMode ?? "scrcpy";
+    const configuredInputSource =
+      inputSourceOverrides.get(serial) ??
+      defaults.inputSource ??
+      DEFAULT_GRPC_INPUT_SOURCE;
+    const currentInputSource = current
+      ? inputSourceForApp(
+          current,
+          currentMode === "grpc-screenshot" ? configuredInputSource : "scrcpy",
+        )
+      : currentMode === "grpc-screenshot"
+        ? configuredInputSource
+        : "scrcpy";
+    const inputSource =
+      streamMode === "scrcpy"
+        ? "scrcpy"
+        : requestedInputSource ??
+          (currentMode === "grpc-screenshot"
+            ? currentInputSource
+            : configuredInputSource);
     if (
       current?.isStreaming() &&
-      streamSessionForApp(current).mode === streamMode &&
-      currentGrpcImageMode === grpcImageMode
+      currentMode === streamMode &&
+      currentGrpcImageMode === grpcImageMode &&
+      currentInputSource === inputSource
     ) {
       streamModeOverrides.set(serial, streamMode);
       grpcImageModeOverrides.set(serial, grpcImageMode);
+      if (streamMode === "grpc-screenshot") {
+        inputSourceOverrides.set(serial, inputSource);
+      }
       return current;
     }
 
@@ -2185,6 +2272,7 @@ export function createRouter(
         retainedDeviceState,
         current ? streamEncoderSettingsForApp(current) : undefined,
         grpcImageMode,
+        inputSource,
       );
     } finally {
       await retainedDeviceState?.release(
@@ -2215,6 +2303,9 @@ export function createRouter(
     }
     streamModeOverrides.set(serial, streamMode);
     grpcImageModeOverrides.set(serial, grpcImageMode);
+    if (streamMode === "grpc-screenshot") {
+      inputSourceOverrides.set(serial, inputSource);
+    }
     failureAt.delete(serial);
     sessionGenerations.set(
       serial,
@@ -2235,9 +2326,16 @@ export function createRouter(
     serial: string,
     streamMode: StreamMode,
     grpcImageMode?: GrpcImageMode,
+    inputSource?: InputSource,
   ): Promise<EmuApp> =>
     enqueueStreamModeOperation(serial, (signal) =>
-      performStreamModeSwitch(serial, streamMode, grpcImageMode, signal),
+      performStreamModeSwitch(
+        serial,
+        streamMode,
+        grpcImageMode,
+        inputSource,
+        signal,
+      ),
     );
 
   // Resolve + start in one step.
@@ -2276,6 +2374,18 @@ export function createRouter(
         defaults.grpcImageMode ??
         DEFAULT_GRPC_IMAGE_MODE,
     ),
+    inputSource: inputSourceForApp(
+      app,
+      streamSessionForApp(app).mode === "grpc-screenshot"
+        ? inputSourceOverrides.get(serial) ??
+          defaults.inputSource ??
+          DEFAULT_GRPC_INPUT_SOURCE
+        : "scrcpy",
+    ),
+    availableInputSources:
+      streamSessionForApp(app).mode === "grpc-screenshot"
+        ? [...INPUT_SOURCES]
+        : ["scrcpy"],
     availableModes: availableStreamModesForSerial(serial),
     sessionGeneration: sessionGenerations.get(serial) ?? 0,
   });
@@ -2332,6 +2442,7 @@ export function createRouter(
     failureAt.delete(serial);
     streamModeOverrides.delete(serial);
     grpcImageModeOverrides.delete(serial);
+    inputSourceOverrides.delete(serial);
     streamModeQueues.delete(serial);
     sessionGenerations.delete(serial);
   };
@@ -2420,6 +2531,7 @@ export function createRouter(
 
       let streamMode: StreamMode;
       let grpcImageMode: GrpcImageMode | undefined;
+      let inputSource: InputSource | undefined;
       try {
         const payload = await readRouterPayload(req);
         const streamModeRequest = parseStreamModeRequest(payload);
@@ -2434,6 +2546,10 @@ export function createRouter(
           streamModeRequest.mode === "grpc-screenshot"
             ? streamModeRequest.grpcImageMode
             : undefined;
+        inputSource =
+          streamModeRequest.mode === "grpc-screenshot"
+            ? streamModeRequest.inputSource
+            : undefined;
       } catch (err) {
         return streamModeRequestErrorResponse(err);
       }
@@ -2443,6 +2559,7 @@ export function createRouter(
           serial,
           streamMode,
           grpcImageMode,
+          inputSource,
         );
         return Response.json(streamModeResponse(serial, app));
       } catch (err) {
@@ -2662,6 +2779,7 @@ export function createRouter(
       failureAt.clear();
       streamModeOverrides.clear();
       grpcImageModeOverrides.clear();
+      inputSourceOverrides.clear();
       streamModeQueues.clear();
       sessionGenerations.clear();
       operationControllers.clear();
