@@ -58,6 +58,9 @@ describe("WebSocket video codec helpers", () => {
     expect(videoCodecLabel("h264")).toBe("H.264");
     expect(videoCodecLabel("vp9")).toBe("VP9");
     expect(mseFallbackCodecError("h264")).toBeNull();
+    expect(mseFallbackCodecError("h264", false)).toBe(
+      "WebCodecs unavailable and H.264 MSE unsupported",
+    );
     expect(mseFallbackCodecError("vp8")).toBe(
       "VP8 WebSocket video requires WebCodecs; the MSE fallback only supports H.264",
     );

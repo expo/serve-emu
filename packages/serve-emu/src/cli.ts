@@ -209,9 +209,9 @@ Options:
                          Anyone who can reach the port can control the device.
   -s, --serial <serial>  adb device serial (defaults to the only booted device)
       --max-fps <n>      Cap source frame rate (default: ${SCRCPY_DEFAULTS.maxFps})
-      --bit-rate <bps>   H.264 bit rate (default: ${SCRCPY_DEFAULTS.bitRate})
+      --bit-rate <bps>   Target video bit rate (default: ${SCRCPY_DEFAULTS.bitRate})
       --max-size <px>    Cap longest screen edge in pixels; 0 = native. The
-                         gRPC screenshot source uses host-side software H.264
+                         gRPC screenshot source uses host-side software video
                          encoding; ${SCRCPY_DEFAULTS.maxSize} balances detail and steady frame
                          delivery for either source.
       --key-frame-interval <sec>

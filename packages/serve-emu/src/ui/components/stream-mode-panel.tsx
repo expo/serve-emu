@@ -90,6 +90,7 @@ type ViewerTransportSelectorProps = {
   available: readonly StreamTransport[];
   switchingTo: StreamTransport | null;
   error: string | null;
+  unavailableReason?: string | null;
   onChange: (transport: StreamTransport) => void;
 };
 
@@ -98,6 +99,7 @@ export function ViewerTransportSelector({
   available,
   switchingTo,
   error,
+  unavailableReason = null,
   onChange,
 }: ViewerTransportSelectorProps) {
   const label = value ? VIEWER_TRANSPORT_COPY[value].label : null;
@@ -106,7 +108,7 @@ export function ViewerTransportSelector({
     : error
       ? error
       : label
-        ? `${label} live`
+        ? `${label} live${unavailableReason ? `. ${unavailableReason}` : ""}`
         : "Loading viewer transports…";
   const feedbackState = switchingTo
     ? "switching"
@@ -537,6 +539,11 @@ export function StreamModePanel() {
         available={availableViewerTransports}
         switchingTo={viewerTransport?.switchingTo ?? null}
         error={viewerTransport?.error ?? null}
+        unavailableReason={
+          vpxSelected && loaded
+            ? `${GRPC_VIDEO_CODEC_COPY[loaded.grpcVideoCodec].label} gRPC video is WebSocket-only. Select H.264 to use WebRTC.`
+            : null
+        }
         onChange={viewerTransport?.selectTransport ?? NOOP_SELECT_TRANSPORT}
       />
       <StreamStatsDownloadControl

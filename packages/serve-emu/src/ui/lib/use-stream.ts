@@ -813,15 +813,7 @@ export function useStream(
       typeof canvas.transferControlToOffscreen === "function";
     if (canUseWorker) return;
     const useMse = !canUseMainThreadWebCodecs;
-    if (useMse && !MsePlayer.isSupported()) {
-      const message = "WebCodecs unavailable and H.264 MSE unsupported";
-      reportTransportError("websocket", message);
-      setState((current) => ({
-        ...current,
-        status: message,
-      }));
-      return;
-    }
+    const mseSupported = !useMse || MsePlayer.isSupported();
 
     let cancelled = false;
     let reconnectDelay = 500;
@@ -1194,7 +1186,7 @@ export function useStream(
                 stats: null,
               }));
               const mseError = useMse
-                ? mseFallbackCodecError(message.codec)
+                ? mseFallbackCodecError(message.codec, mseSupported)
                 : null;
               if (mseError) {
                 reportTransportError("websocket", mseError);

@@ -96,6 +96,21 @@ describe("StreamModePanel", () => {
     expect(liveMarkup).toContain('data-state="live"');
     expect(liveMarkup).toContain("WebSocket live");
 
+    const constrainedMarkup = renderToStaticMarkup(
+      <ViewerTransportSelector
+        value="websocket"
+        available={["websocket"]}
+        switchingTo={null}
+        error={null}
+        unavailableReason="VP9 gRPC video is WebSocket-only. Select H.264 to use WebRTC."
+        onChange={() => {}}
+      />,
+    );
+    expect(constrainedMarkup).toContain(
+      "WebSocket live. VP9 gRPC video is WebSocket-only. Select H.264 to use WebRTC.",
+    );
+    expect(constrainedMarkup).toContain('aria-describedby="viewer-transport-help"');
+
     const switchingMarkup = renderToStaticMarkup(
       <ViewerTransportSelector
         value="webrtc"

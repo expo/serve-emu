@@ -74,11 +74,17 @@ export function videoCodecLabel(codec: GrpcVideoCodec): string {
   return codec === "h264" ? "H.264" : codec.toUpperCase();
 }
 
-/** MSE muxing is H.264-only; VPx requires the browser's WebCodecs decoder. */
-export function mseFallbackCodecError(codec: GrpcVideoCodec): string | null {
-  return codec === "h264"
+/** Report why a codec cannot use the browser's non-WebCodecs fallback. */
+export function mseFallbackCodecError(
+  codec: GrpcVideoCodec,
+  mseSupported = true,
+): string | null {
+  if (codec !== "h264") {
+    return `${videoCodecLabel(codec)} WebSocket video requires WebCodecs; the MSE fallback only supports H.264`;
+  }
+  return mseSupported
     ? null
-    : `${videoCodecLabel(codec)} WebSocket video requires WebCodecs; the MSE fallback only supports H.264`;
+    : "WebCodecs unavailable and H.264 MSE unsupported";
 }
 
 /** gRPC VPx output is an elementary WebSocket stream, not a WebRTC source. */

@@ -283,8 +283,8 @@ must be integers within these bounds:
 | Field | Range | Meaning |
 | --- | ---: | --- |
 | `maxDimension` | 0–4096 | Longest encoded edge; `0` disables the size cap |
-| `h264Bitrate` | 100000–50000000 | Target H.264 bitrate in bits per second |
-| `h264Fps` | 1–120 | Maximum encoded frames per second |
+| `h264Bitrate` | 100000–50000000 | Target video bitrate in bits per second (legacy field name) |
+| `h264Fps` | 1–120 | Maximum encoded frames per second (legacy field name) |
 
 A changed setting restarts only the active capture while keeping the device's
 recorded-session state. Middleware clients remain attached and resynchronize on

@@ -57,9 +57,10 @@ Recognized FourCC values are:
 | `0x68323635` | H.265 (`h265`) |
 | `0x00617631` | AV1 (`av1`) |
 
-The bundled browser UI currently supports H.264 only. A valid H.265 or AV1
-preamble is therefore reported as an unsupported-codec error rather than passed
-to WebCodecs.
+For the scrcpy transport, the bundled browser UI currently supports H.264 only.
+A valid H.265 or AV1 preamble is therefore reported as an unsupported-codec
+error rather than passed to WebCodecs. The separate gRPC source supports the
+host-encoded codecs described below.
 
 ## Video packets
 
