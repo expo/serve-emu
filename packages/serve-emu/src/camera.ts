@@ -8,7 +8,7 @@
  * reopen in the app under test. The path has to be fixed at launch because the
  * emulator exposes no console or gRPC command that re-points a running camera.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -185,11 +185,12 @@ function digestOf(bytes: Uint8Array): string {
 /**
  * Replace the feed file in one step. The emulator falls back to a solid magenta
  * frame whenever it cannot parse the file, so a reader must never observe a
- * partial write.
+ * partial write. The staging name is unique per write, not per process, so two
+ * concurrent writes to one facing cannot interleave into the same file.
  */
 async function writeFeedFile(path: string, png: Uint8Array): Promise<void> {
   await mkdir(cameraFeedRoot(), { recursive: true });
-  const staging = `${path}.${process.pid}.tmp`;
+  const staging = `${path}.${randomUUID()}.tmp`;
   try {
     await writeFile(staging, png);
     await rename(staging, path);
