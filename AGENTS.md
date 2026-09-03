@@ -48,11 +48,9 @@ scrcpy setup lazily on first start.
 - Default device selection should remain the only booted device. If multiple devices are connected, require or pass `-s <serial>`.
 - Do not shell out to `adb shell input` for input events. Write directly to scrcpy's control socket via `src/input.ts`; this keeps latency low enough for agent workflows.
 - Location control is emulator-only and uses Android Emulator `geo fix`.
-- Camera image passthrough is emulator-only and uses `-camera-back`/`-camera-front imagefile:<path>`.
-  The emulator reads that flag only at startup, so a session wires the feeds through
-  `startEmulator({ camera: true })` and then changes the picture by rewriting the PNG. The
-  emulator loads PNG only, and renders solid magenta whenever it cannot parse the file, so
-  keep a valid PNG at every wired feed path.
+- Camera image passthrough is emulator-only. The [Camera Image](README.md#camera-image)
+  section is the source of truth for the mechanism and its constraints. In code, wire feeds
+  through `startEmulator({ camera: true })`, and keep a valid PNG at every wired feed path.
 - WebCodecs support matters for the bundled UI, so test streaming changes in a browser that supports it.
 
 ## scrcpy Protocol Notes
