@@ -2,6 +2,13 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import type { ServerWebSocket } from "bun";
+import {
+  clearCameraImage,
+  MAX_CAMERA_IMAGE_BYTES,
+  parseCameraFacing,
+  readCameraStatus,
+  setCameraImage,
+} from "./camera.ts";
 import { getExecSnapshot } from "./exec.ts";
 import {
   getFontScale,
@@ -113,7 +120,11 @@ import {
   MultipartUploadError,
   stageMultipartUpload,
 } from "./multipart-upload.ts";
-import { HttpBodyError, readJsonLimited } from "./request-body.ts";
+import {
+  HttpBodyError,
+  readBodyLimited,
+  readJsonLimited,
+} from "./request-body.ts";
 import {
   MAX_UPLOAD_QUEUE_TIMEOUT_MS,
   UploadManager,
@@ -193,6 +204,11 @@ export type ServerOpts = {
   uploadQueueTimeoutMs?: number;
   /** Default viewer transport. Each browser viewer may select either available path. */
   streamSettings?: StreamSettings;
+  /**
+   * Serial whose emulator was started with serve-emu's camera feeds attached.
+   * Only a launch can attach them, so the server cannot infer this.
+   */
+  cameraSerial?: string;
 };
 
 export const DEFAULT_HOST = "127.0.0.1";
@@ -629,6 +645,12 @@ export async function startServer(
   console.log(
     `${initialMode} ready: ${initialStream.meta.deviceName} • ${initialStream.meta.codecId} • ${initialStream.meta.width}×${initialStream.meta.height}`,
   );
+
+  const cameraWiredSerials = new Set<string>(
+    opts.cameraSerial ? [opts.cameraSerial] : [],
+  );
+  const cameraStatus = (serial: string) =>
+    readCameraStatus(serial, cameraWiredSerials.has(serial));
 
   const health = (context = sessions.current) => {
     const now = recoveryClock.now();
@@ -2195,7 +2217,10 @@ export async function startServer(
           const avd = (payload as Record<string, unknown>).avd;
           if (typeof avd !== "string" || !avd.trim())
             throw new Error("avd is required");
-          const launch = await launchEmulator({ avd: avd.trim() });
+          const camera =
+            (payload as Record<string, unknown>).camera === true;
+          const launch = await launchEmulator({ avd: avd.trim(), camera });
+          if (launch.cameraFeed) cameraWiredSerials.add(launch.serial);
           try {
             sessions.assertPublished(requestContext);
           } catch (err) {
@@ -2257,6 +2282,7 @@ export async function startServer(
             await stopCurrentSession(requestContext, "current emulator stopped");
           }
           await killEmulator(serial);
+          cameraWiredSerials.delete(serial);
           sessions.assertPublished(requestContext);
           return Response.json({ ok: true, serial });
         } catch (err) {
@@ -2790,6 +2816,37 @@ export async function startServer(
               route: requestContext.route.stop(),
             });
           throw new Error("action must be pause, resume, or stop");
+        } catch (err) {
+          return errorResponse(err);
+        }
+      }
+
+      if (url.pathname === "/api/camera") {
+        if (req.method !== "GET")
+          return new Response("method not allowed", { status: 405 });
+        return Response.json({
+          ok: true,
+          camera: await cameraStatus(requestContext.serial),
+        });
+      }
+
+      if (url.pathname === "/api/camera/image") {
+        if (req.method !== "POST" && req.method !== "DELETE")
+          return new Response("method not allowed", { status: 405 });
+        try {
+          const facing = parseCameraFacing(url.searchParams.get("facing"));
+          if (req.method === "POST") {
+            const png = await readBodyLimited(req, MAX_CAMERA_IMAGE_BYTES);
+            sessions.assertCurrent(requestContext);
+            await setCameraImage(requestContext.serial, facing, png);
+          } else {
+            sessions.assertCurrent(requestContext);
+            await clearCameraImage(requestContext.serial, facing);
+          }
+          return Response.json({
+            ok: true,
+            camera: await cameraStatus(requestContext.serial),
+          });
         } catch (err) {
           return errorResponse(err);
         }

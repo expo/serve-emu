@@ -124,6 +124,7 @@ function routerDependencies(state: {
         serial,
         proc: null,
         ownsProcess: false,
+        cameraFeed: false,
         stop: () => {},
       };
     },

@@ -101,7 +101,7 @@ bun run packages/serve-emu/src/cli.ts
 ```text
 serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode scrcpy|grpc-screenshot] [--grpc-image-mode png|mmap] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms] [--max-apk-upload-bytes N] [--max-media-upload-bytes N]
 serve-emu --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
-serve-emu --avd <name> [--gpu <mode>] [--restart-avd]
+serve-emu --avd <name> [--gpu <mode>] [--restart-avd] [--camera] [--camera-image <path.png>]
 serve-emu --avd-list
 serve-emu --running-avds
 ```
@@ -138,6 +138,8 @@ serve-emu --running-avds
 | `--running-avds` | false | List currently running emulator serials and AVD names |
 | `--emulator` | auto | Android Emulator binary path; defaults to PATH or Android SDK env vars |
 | `--emulator-port` | auto | Android Emulator console port for `--avd`; must be an even port from 5554 through 5682 |
+| `--camera` | false | Feed the emulator cameras from PNG files serve-emu owns, so the picture can change while the emulator runs. Requires `--avd`; see [Camera Image](#camera-image) |
+| `--camera-image` | none | Implies `--camera` and preloads this PNG as the back camera |
 
 By default, `serve-emu` attaches to the only online device. If more than one device is online, pass `-s <serial>` or select another running device later through the HTTP API/UI.
 
@@ -428,6 +430,54 @@ zoom, simplifies the line to at most 1,024 screen-space points, and pans it with
 one CSS transform per animation frame. The interaction target is one 16.7 ms
 frame at 60 Hz. Follow route is explicit; manually panning turns it off so the
 one-second status poll does not force the map center back onto the route.
+
+### Camera Image
+
+Camera image passthrough replaces the emulator's camera feed with a PNG you
+supply, so an app under test sees a known picture in both its preview and its
+captures. It is emulator-only, and it must be requested at launch:
+
+```sh
+serve-emu --avd Pixel_8 --camera
+serve-emu --avd Pixel_8 --camera-image ~/fixtures/id-card.png
+```
+
+`--camera` starts the emulator with `-camera-back` and `-camera-front` pointed
+at two PNG files under `~/.cache/serve-emu/camera/` (override the directory with
+`SERVE_EMU_CAMERA_DIR`). The emulator only reads its camera source at startup,
+which is why there is no way to add this to an emulator that is already running.
+
+Once wired, changing the picture is a plain file write, so no restart is needed:
+
+```sh
+curl "$BASE/api/camera"
+curl -X POST "$BASE/api/camera/image?facing=back" \
+  -H 'Content-Type: image/png' --data-binary @fixture.png
+curl -X DELETE "$BASE/api/camera/image?facing=front"
+```
+
+`GET /api/camera` reports, per facing, the feed path and the current image's
+size, byte count, and sha256. `wiredAtLaunch` is true only when serve-emu itself
+started the emulator with the feeds attached; when it is false the response
+still lists the `launchArgs` that would attach them. `DELETE` restores a
+generated checkerboard test card that means "no image set".
+
+Three constraints come from the emulator, not from serve-emu:
+
+- **PNG only.** The emulator's `imagefile` camera loads PNG and nothing else; a
+  JPEG body is rejected with `400`. Convert first with `sips -s format png
+  in.jpg --out out.png` or `magick in.jpg out.png`.
+- **The guest re-reads the file when it opens the camera device.** An app
+  already showing a preview keeps the old picture. Reopen the camera screen, or
+  restart the app with `POST /api/apps/force-stop` and `POST /api/apps/launch`.
+- **4:3 landscape is the sensor's shape.** The emulator scales a source to fill
+  a 4:3 frame and crops the overflow, then the app crops that again for its own
+  preview aspect, exactly as it would crop a real sensor. A 4:3 image reaches
+  the guest uncropped.
+
+An absent or unparsable feed file makes the emulator render a solid magenta
+frame, so serve-emu keeps a valid PNG at both paths from the moment it wires
+them.
 
 ### Sessions
 

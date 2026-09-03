@@ -312,6 +312,36 @@ export type RoutePlaybackSnapshot = {
 };
 export type RouteMutationResponse = ApiSuccess<{ route: RoutePlaybackSnapshot }>;
 
+export const CAMERA_FACINGS = ["back", "front"] as const;
+export type CameraFacing = (typeof CAMERA_FACINGS)[number];
+/**
+ * One emulator camera fed from a PNG on the host. The emulator re-reads `path`
+ * whenever the guest opens the camera device, so rewriting the file changes the
+ * picture without restarting the emulator.
+ */
+export type CameraFeedStatus = {
+  facing: CameraFacing;
+  path: string;
+  present: boolean;
+  /** True while the feed still holds serve-emu's "no image set" test card. */
+  placeholder: boolean;
+  width: number | null;
+  height: number | null;
+  bytes: number | null;
+  digest: string | null;
+  updatedAt: string | null;
+};
+export type CameraStatus = {
+  serial: string;
+  supported: boolean;
+  /** True when serve-emu started this emulator with the feed paths attached. */
+  wiredAtLaunch: boolean;
+  /** Emulator flags that attach these feeds, for a launch serve-emu did not own. */
+  launchArgs: string[];
+  feeds: CameraFeedStatus[];
+};
+export type CameraStatusResponse = ApiSuccess<{ camera: CameraStatus }>;
+
 export type GestureSessionEvent = {
   id: number;
   at: string;
@@ -473,7 +503,10 @@ export type ApiContractMap = {
     PATCH: EndpointContract<StreamEncoderSettingsPatch, StreamEncoderSettingsResponse>;
   };
   "/api/avds/start": {
-    POST: EndpointContract<{ avd: string; select?: boolean }, AvdStartResponse>;
+    POST: EndpointContract<
+      { avd: string; select?: boolean; camera?: boolean },
+      AvdStartResponse
+    >;
   };
   "/api/avds/stop": {
     POST: EndpointContract<{ serial?: string; avd?: string }, AvdStopResponse>;
@@ -547,6 +580,11 @@ export type ApiContractMap = {
   "/api/route/control": {
     POST: EndpointContract<{ action: "pause" | "resume" | "stop" }, RouteMutationResponse>;
   };
+  "/api/camera": { GET: EndpointContract<undefined, CameraStatusResponse> };
+  "/api/camera/image": {
+    POST: EndpointContract<BinaryPngResponse, CameraStatusResponse>;
+    DELETE: EndpointContract<undefined, CameraStatusResponse>;
+  };
 };
 
 export type ApiPath = keyof ApiContractMap;
@@ -594,6 +632,10 @@ function number(value: unknown, name: string): number {
   return typeof value === "number" && Number.isFinite(value)
     ? value
     : fail(`${name} must be a finite number`);
+}
+
+function nullableNumber(value: unknown, name: string): number | null {
+  return value === null ? null : number(value, name);
 }
 
 function boolean(value: unknown, name: string): boolean {
@@ -1195,6 +1237,43 @@ export function parseRouteMutationResponse(value: unknown): RouteMutationRespons
   return { ok: true, route: parseRoutePlaybackSnapshot(root.route) };
 }
 
+function parseCameraFeedStatus(value: unknown, index: number): CameraFeedStatus {
+  const name = `camera.feeds[${index}]`;
+  const item = record(value, name);
+  return {
+    facing: oneOf(item.facing, CAMERA_FACINGS, `${name}.facing`),
+    path: string(item.path, `${name}.path`),
+    present: boolean(item.present, `${name}.present`),
+    placeholder: boolean(item.placeholder, `${name}.placeholder`),
+    width: nullableNumber(item.width, `${name}.width`),
+    height: nullableNumber(item.height, `${name}.height`),
+    bytes: nullableNumber(item.bytes, `${name}.bytes`),
+    digest: nullableString(item.digest, `${name}.digest`),
+    updatedAt: nullableString(item.updatedAt, `${name}.updatedAt`),
+  };
+}
+
+function parseCameraStatus(value: unknown): CameraStatus {
+  const root = record(value, "camera");
+  if (!Array.isArray(root.feeds)) fail("camera.feeds must be an array");
+  if (!Array.isArray(root.launchArgs)) fail("camera.launchArgs must be an array");
+  return {
+    serial: string(root.serial, "camera.serial"),
+    supported: boolean(root.supported, "camera.supported"),
+    wiredAtLaunch: boolean(root.wiredAtLaunch, "camera.wiredAtLaunch"),
+    launchArgs: root.launchArgs.map((arg, index) =>
+      string(arg, `camera.launchArgs[${index}]`),
+    ),
+    feeds: root.feeds.map(parseCameraFeedStatus),
+  };
+}
+
+export function parseCameraStatusResponse(value: unknown): CameraStatusResponse {
+  const root = record(value, "camera response");
+  if (root.ok !== true) fail("camera response.ok must be true");
+  return { ok: true, camera: parseCameraStatus(root.camera) };
+}
+
 function parseSessionEvent(value: unknown, index: number): SessionEvent {
   const item = record(value, `session.events[${index}]`);
   const base = {
@@ -1584,6 +1663,11 @@ export const API_SUCCESS_PARSERS = {
     DELETE: parseRouteMutationResponse,
   },
   "/api/route/control": { POST: parseRouteMutationResponse },
+  "/api/camera": { GET: parseCameraStatusResponse },
+  "/api/camera/image": {
+    POST: parseCameraStatusResponse,
+    DELETE: parseCameraStatusResponse,
+  },
 } satisfies ApiSuccessParserMap;
 
 export function parseApiSuccess<

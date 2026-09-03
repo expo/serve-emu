@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
 import { randomBytes } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { pickDevice } from "./adb.ts";
+import { setCameraImage } from "./camera.ts";
 import { listAvds, listRunningAvds, startEmulator } from "./emulator.ts";
 import { SCRCPY_DEFAULTS } from "./scrcpy.ts";
 import {
@@ -64,6 +66,8 @@ const { values } = parseArgs({
     emulator: { type: "string" },
     "emulator-port": { type: "string" },
     gpu: { type: "string", default: "host" },
+    camera: { type: "boolean" },
+    "camera-image": { type: "string" },
     help: { type: "boolean", short: "h" },
   },
   allowPositionals: true,
@@ -254,6 +258,12 @@ Options:
       --emulator <path>  Android Emulator binary (default: PATH or Android SDK)
       --emulator-port <n>
                          Emulator console port for --avd (even 5554-5682)
+      --camera           Feed the emulator cameras from PNG files serve-emu
+                         owns, so POST /api/camera/image can change the picture
+                         while the emulator runs. Requires --avd.
+      --camera-image <path>
+                         Implies --camera and preloads this PNG as the back
+                         camera. PNG only, 4:3 recommended.
   -h, --help             Show this help
 `);
   process.exit(0);
@@ -275,6 +285,14 @@ async function main() {
 
   if ((values["emulator-port"] || values["restart-avd"]) && !values.avd) {
     throw new Error("--emulator-port and --restart-avd require --avd.");
+  }
+
+  const cameraImagePath = stringOption("camera-image");
+  const camera = Boolean(values.camera) || cameraImagePath !== undefined;
+  if (camera && !values.avd) {
+    throw new Error(
+      "--camera and --camera-image require --avd; the emulator only reads its camera source at startup.",
+    );
   }
 
   if (values.avd && values.serial) {
@@ -308,8 +326,12 @@ async function main() {
         port: values["emulator-port"] ? Number(values["emulator-port"]) : undefined,
         restartAvd: values["restart-avd"],
         gpu: values.gpu,
+        camera,
       })).serial
     : await pickDevice(values.serial);
+  if (cameraImagePath !== undefined && emulatorLaunch?.cameraFeed) {
+    await setCameraImage(serial, "back", await readFile(cameraImagePath));
+  }
   const port = Number(values.port);
   const maxFps = numberOption("max-fps", SCRCPY_DEFAULTS.maxFps);
   const bitRate = numberOption("bit-rate", SCRCPY_DEFAULTS.bitRate);
@@ -390,6 +412,7 @@ async function main() {
     maxActiveUploads,
     maxQueuedUploads,
     uploadQueueTimeoutMs,
+    cameraSerial: emulatorLaunch?.cameraFeed ? serial : undefined,
   });
   try {
     activeServer = await startupTask;
