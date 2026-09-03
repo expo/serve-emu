@@ -1,0 +1,292 @@
+/**
+ * Still-image camera passthrough for the Android Emulator.
+ *
+ * The emulator's `-camera-back imagefile:<path>` mode renders a PNG as the
+ * camera feed, and it re-reads that file every time the guest opens the camera
+ * device. serve-emu therefore points a launch at a stable per-serial path and
+ * changes the picture by rewriting the file: no emulator restart, only a camera
+ * reopen in the app under test. The path has to be fixed at launch because the
+ * emulator exposes no console or gRPC command that re-points a running camera.
+ */
+import { createHash } from "node:crypto";
+import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { deflateSync } from "node:zlib";
+import { isEmulatorSerial } from "./device-capabilities.ts";
+import {
+  CAMERA_FACINGS,
+  type CameraFacing,
+  type CameraFeedStatus,
+  type CameraStatus,
+} from "./shared/api-contracts.ts";
+
+export type { CameraFacing, CameraFeedStatus, CameraStatus };
+
+export const MAX_CAMERA_IMAGE_BYTES = 32 * 1024 * 1024;
+
+const DEFAULT_FEED_ROOT = join(homedir(), ".cache", "serve-emu", "camera");
+
+/** Read per call so tests and read-only home directories can redirect it. */
+export function cameraFeedRoot(): string {
+  return process.env.SERVE_EMU_CAMERA_DIR ?? DEFAULT_FEED_ROOT;
+}
+const PLACEHOLDER_SIZE = { width: 1280, height: 960 };
+const PLACEHOLDER_CELL = 64;
+const PLACEHOLDER_DARK: Rgb = [0x1e, 0x22, 0x29];
+const PLACEHOLDER_LIGHT: Rgb = [0x49, 0x52, 0x60];
+const PNG_SIGNATURE = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
+
+type Rgb = readonly [number, number, number];
+
+function isCameraFacing(value: unknown): value is CameraFacing {
+  return typeof value === "string" && CAMERA_FACINGS.includes(value as CameraFacing);
+}
+
+export function parseCameraFacing(value: unknown): CameraFacing {
+  if (value === undefined || value === null || value === "") return "back";
+  if (!isCameraFacing(value)) {
+    throw new Error(`facing must be one of: ${CAMERA_FACINGS.join(", ")}`);
+  }
+  return value;
+}
+
+function feedFileName(serial: string, facing: CameraFacing): string {
+  return `${serial.replace(/[^A-Za-z0-9._-]/g, "_")}-${facing}.png`;
+}
+
+export function cameraFeedPath(serial: string, facing: CameraFacing): string {
+  return join(cameraFeedRoot(), feedFileName(serial, facing));
+}
+
+export function cameraLaunchArgs(serial: string): string[] {
+  return CAMERA_FACINGS.flatMap((facing) => [
+    `-camera-${facing}`,
+    `imagefile:${cameraFeedPath(serial, facing)}`,
+  ]);
+}
+
+export function assertCameraSupported(serial: string): void {
+  if (!isEmulatorSerial(serial)) {
+    throw new Error("camera image passthrough is supported for Android Emulator serials only");
+  }
+}
+
+export type PngSize = { width: number; height: number };
+
+function readPngSize(bytes: Uint8Array): PngSize {
+  if (bytes.length < 24 || !PNG_SIGNATURE.every((byte, i) => bytes[i] === byte)) {
+    throw new Error(
+      "camera image must be a PNG; the Android emulator imagefile camera loads PNG only",
+    );
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (String.fromCharCode(...bytes.subarray(12, 16)) !== "IHDR") {
+    throw new Error("camera image PNG is missing its IHDR header");
+  }
+  const width = view.getUint32(16);
+  const height = view.getUint32(20);
+  if (width < 1 || height < 1) throw new Error("camera image PNG has zero dimensions");
+  return { width, height };
+}
+
+export function assertCameraImage(bytes: Uint8Array): PngSize {
+  if (bytes.length > MAX_CAMERA_IMAGE_BYTES) {
+    throw new Error(`camera image exceeds ${MAX_CAMERA_IMAGE_BYTES} bytes`);
+  }
+  return readPngSize(bytes);
+}
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes: Uint8Array): number {
+  let c = 0xffffffff;
+  for (const byte of bytes) c = CRC_TABLE[(c ^ byte) & 0xff]! ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, body: Uint8Array): Buffer {
+  const chunk = Buffer.alloc(body.length + 12);
+  chunk.writeUInt32BE(body.length, 0);
+  chunk.write(type, 4, "ascii");
+  chunk.set(body, 8);
+  chunk.writeUInt32BE(crc32(chunk.subarray(4, 8 + body.length)), 8 + body.length);
+  return chunk;
+}
+
+function checkerboardScanlines(
+  width: number,
+  height: number,
+  cell: number,
+  dark: Rgb,
+  light: Rgb,
+): Buffer {
+  const stride = width * 3 + 1;
+  const templates = [Buffer.alloc(stride), Buffer.alloc(stride)];
+  for (const [phase, row] of templates.entries()) {
+    for (let x = 0; x < width; x += 1) {
+      const color = (Math.floor(x / cell) + phase) % 2 === 0 ? dark : light;
+      row.set(color, 1 + x * 3);
+    }
+  }
+  const raw = Buffer.alloc(stride * height);
+  for (let y = 0; y < height; y += 1) {
+    raw.set(templates[Math.floor(y / cell) % 2]!, y * stride);
+  }
+  return raw;
+}
+
+function encodeTruecolorPng(width: number, height: number, scanlines: Buffer): Buffer {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header.set([8, 2, 0, 0, 0], 8);
+  return Buffer.concat([
+    PNG_SIGNATURE,
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(scanlines, { level: 9 })),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+let placeholderCache: { png: Buffer; digest: string } | null = null;
+
+/** The "no image set" test card. Generated once, so its digest identifies it. */
+export function placeholderCameraImage(): { png: Buffer; digest: string } {
+  if (!placeholderCache) {
+    const png = encodeTruecolorPng(
+      PLACEHOLDER_SIZE.width,
+      PLACEHOLDER_SIZE.height,
+      checkerboardScanlines(
+        PLACEHOLDER_SIZE.width,
+        PLACEHOLDER_SIZE.height,
+        PLACEHOLDER_CELL,
+        PLACEHOLDER_DARK,
+        PLACEHOLDER_LIGHT,
+      ),
+    );
+    placeholderCache = { png, digest: digestOf(png) };
+  }
+  return placeholderCache;
+}
+
+function digestOf(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+/**
+ * Replace the feed file in one step. The emulator falls back to a solid magenta
+ * frame whenever it cannot parse the file, so a reader must never observe a
+ * partial write.
+ */
+async function writeFeedFile(path: string, png: Uint8Array): Promise<void> {
+  await mkdir(cameraFeedRoot(), { recursive: true });
+  const staging = `${path}.${process.pid}.tmp`;
+  try {
+    await writeFile(staging, png);
+    await rename(staging, path);
+  } catch (error) {
+    await unlink(staging).catch(() => {});
+    throw error;
+  }
+}
+
+export async function readCameraFeed(
+  serial: string,
+  facing: CameraFacing,
+): Promise<CameraFeedStatus> {
+  const path = cameraFeedPath(serial, facing);
+  let bytes: Buffer;
+  let stats: Awaited<ReturnType<typeof stat>>;
+  try {
+    [bytes, stats] = await Promise.all([readFile(path), stat(path)]);
+  } catch {
+    return {
+      facing,
+      path,
+      present: false,
+      placeholder: false,
+      width: null,
+      height: null,
+      bytes: null,
+      digest: null,
+      updatedAt: null,
+    };
+  }
+  const digest = digestOf(bytes);
+  let size: PngSize | null = null;
+  try {
+    size = readPngSize(bytes);
+  } catch {
+    size = null;
+  }
+  return {
+    facing,
+    path,
+    present: true,
+    placeholder: digest === placeholderCameraImage().digest,
+    width: size?.width ?? null,
+    height: size?.height ?? null,
+    bytes: bytes.byteLength,
+    digest,
+    updatedAt: stats.mtime.toISOString(),
+  };
+}
+
+export async function readCameraStatus(
+  serial: string,
+  wiredAtLaunch: boolean,
+): Promise<CameraStatus> {
+  return {
+    serial,
+    supported: isEmulatorSerial(serial),
+    wiredAtLaunch,
+    launchArgs: cameraLaunchArgs(serial),
+    feeds: await Promise.all(
+      CAMERA_FACINGS.map((facing) => readCameraFeed(serial, facing)),
+    ),
+  };
+}
+
+export async function setCameraImage(
+  serial: string,
+  facing: CameraFacing,
+  png: Uint8Array,
+): Promise<CameraFeedStatus> {
+  assertCameraSupported(serial);
+  assertCameraImage(png);
+  await writeFeedFile(cameraFeedPath(serial, facing), png);
+  return readCameraFeed(serial, facing);
+}
+
+export async function clearCameraImage(
+  serial: string,
+  facing: CameraFacing,
+): Promise<CameraFeedStatus> {
+  assertCameraSupported(serial);
+  await writeFeedFile(cameraFeedPath(serial, facing), placeholderCameraImage().png);
+  return readCameraFeed(serial, facing);
+}
+
+/**
+ * Give every facing a parsable PNG before the emulator starts. An absent or
+ * unparsable file renders as solid magenta, which reads as a broken camera.
+ */
+export async function seedCameraFeeds(serial: string): Promise<void> {
+  const { png } = placeholderCameraImage();
+  await Promise.all(
+    CAMERA_FACINGS.map(async (facing) => {
+      const feed = await readCameraFeed(serial, facing);
+      if (feed.present && feed.width !== null) return;
+      await writeFeedFile(cameraFeedPath(serial, facing), png);
+    }),
+  );
+}

@@ -8,6 +8,7 @@ import {
   type ApiMethod,
 } from "../src/api/router.ts";
 import { createApiRoutes } from "../src/api/routes/index.ts";
+import { placeholderCameraImage } from "../src/camera.ts";
 import {
   MAX_APK_MULTIPART_BYTES,
   MAX_MEDIA_MULTIPART_BYTES,
@@ -66,6 +67,9 @@ const EXPECTED_ROUTES = [
   ["DELETE", "/api/session"],
   ["POST", "/api/session/replay"],
   ["POST", "/api/session/replay/stop"],
+  ["GET", "/api/camera"],
+  ["POST", "/api/camera/image"],
+  ["DELETE", "/api/camera/image"],
 ] as const satisfies readonly (readonly [ApiMethod, string])[];
 
 const METHOD_ORDER: readonly ApiMethod[] = [
@@ -144,6 +148,26 @@ const sessionSnapshot = {
   replayStartedAt: null,
   replayCompletedAt: null,
   lastError: null,
+};
+
+const cameraStatus = {
+  serial: "emulator-5554",
+  supported: true,
+  wiredAtLaunch: true,
+  launchArgs: ["-camera-back", "imagefile:/tmp/back.png"],
+  feeds: [
+    {
+      facing: "back" as const,
+      path: "/tmp/back.png",
+      present: true,
+      placeholder: false,
+      width: 1280,
+      height: 960,
+      bytes: 1024,
+      digest: "a".repeat(64),
+      updatedAt: "2026-07-12T10:00:00.000Z",
+    },
+  ],
 };
 
 function fakeDependencies(
@@ -322,6 +346,9 @@ function fakeDependencies(
     startRoute: async () => routeSnapshot,
     stopRoute: () => routeSnapshot,
     controlRoute: () => routeSnapshot,
+    getCamera: async () => cameraStatus,
+    setCameraImage: async () => cameraStatus,
+    clearCameraImage: async () => cameraStatus,
   };
 
   return { ...dependencies, ...overrides };
@@ -344,6 +371,14 @@ function validRequest(method: ApiMethod, path: string): Request {
   }
   if (key === "POST /api/files/import") {
     return multipartRequest(method, path, "file");
+  }
+
+  if (key === "POST /api/camera/image") {
+    return new Request(`${BASE_URL}${path}?facing=back`, {
+      method,
+      body: placeholderCameraImage().png,
+      headers: { "Content-Type": "image/png" },
+    });
   }
 
   const body = VALID_JSON_BODIES[key];
@@ -393,14 +428,14 @@ const silentLogger: ApiLogger = {
 };
 
 describe("domain API route table", () => {
-  test("registers the exact 44 method/path pairs across 33 paths", () => {
+  test("registers the exact 47 method/path pairs across 35 paths", () => {
     const routes = createApiRoutes();
 
     expect(routes.map(({ method, path }) => [method, path])).toEqual(
       EXPECTED_ROUTES.map(([method, path]) => [method, path]),
     );
-    expect(routes).toHaveLength(44);
-    expect(new Set(routes.map((route) => route.path)).size).toBe(33);
+    expect(routes).toHaveLength(47);
+    expect(new Set(routes.map((route) => route.path)).size).toBe(35);
     const contractPairs = Object.entries(API_SUCCESS_PARSERS).flatMap(
       ([path, methods]) => Object.keys(methods).map((method) => `${method} ${path}`),
     );
@@ -430,12 +465,12 @@ describe("domain API route table", () => {
     );
   });
 
-  test("returns structured OPTIONS 405 with exact Allow for all 33 paths", async () => {
+  test("returns structured OPTIONS 405 with exact Allow for all 35 paths", async () => {
     const router = createApiRouter(createApiRoutes());
     const deps = fakeDependencies();
     const paths = [...new Set(EXPECTED_ROUTES.map((route) => route[1]))];
 
-    expect(paths).toHaveLength(33);
+    expect(paths).toHaveLength(35);
     for (const path of paths) {
       const response = await router.handle(
         new Request(`${BASE_URL}${path}`, { method: "OPTIONS" }),

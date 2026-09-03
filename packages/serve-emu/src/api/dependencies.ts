@@ -9,6 +9,8 @@ import type {
   AppliedGeoFix,
   AvdStartResponse,
   AvdStopResponse,
+  CameraFacing,
+  CameraStatus,
   DeviceGridResponse,
   DeviceListResponse,
   DeviceSelectionResponse,
@@ -97,4 +99,8 @@ export type ApiDependencies = {
   startRoute: (route: RoutePlaybackRequest) => Promise<RoutePlaybackSnapshot>;
   stopRoute: () => RoutePlaybackSnapshot;
   controlRoute: (action: RouteControlAction) => RoutePlaybackSnapshot;
+
+  getCamera: () => Promise<CameraStatus>;
+  setCameraImage: (facing: CameraFacing, png: Uint8Array) => Promise<CameraStatus>;
+  clearCameraImage: (facing: CameraFacing) => Promise<CameraStatus>;
 };
