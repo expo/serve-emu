@@ -347,8 +347,8 @@ function fakeDependencies(
     stopRoute: () => routeSnapshot,
     controlRoute: () => routeSnapshot,
     getCamera: async () => cameraStatus,
-    setCameraImage: async () => cameraStatus,
-    clearCameraImage: async () => cameraStatus,
+    setCameraImage: async () => {},
+    clearCameraImage: async () => {},
   };
 
   return { ...dependencies, ...overrides };

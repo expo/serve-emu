@@ -101,6 +101,11 @@ export type ApiDependencies = {
   controlRoute: (action: RouteControlAction) => RoutePlaybackSnapshot;
 
   getCamera: () => Promise<CameraStatus>;
-  setCameraImage: (facing: CameraFacing, png: Uint8Array) => Promise<CameraStatus>;
-  clearCameraImage: (facing: CameraFacing) => Promise<CameraStatus>;
+  /**
+   * Mutate only. The routes read the status back through `getCamera`, so these
+   * line up with the same-named functions in `camera.ts` rather than returning
+   * a wider shape a host would have to assemble.
+   */
+  setCameraImage: (facing: CameraFacing, png: Uint8Array) => Promise<void>;
+  clearCameraImage: (facing: CameraFacing) => Promise<void>;
 };

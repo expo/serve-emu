@@ -2217,19 +2217,29 @@ export async function startServer(
           const avd = (payload as Record<string, unknown>).avd;
           if (typeof avd !== "string" || !avd.trim())
             throw new Error("avd is required");
-          const camera =
-            (payload as Record<string, unknown>).camera === true;
+          const requestedCamera = (payload as Record<string, unknown>).camera;
+          if (requestedCamera !== undefined && typeof requestedCamera !== "boolean") {
+            throw new Error("camera must be a boolean");
+          }
+          const camera = requestedCamera === true;
           const launch = await launchEmulator({ avd: avd.trim(), camera });
+          // Authoritative in both directions, and before any early return:
+          // emulator serials are recycled, so a launch without feeds has to
+          // clear whatever claim an earlier launch left on the same serial.
+          if (launch.cameraFeed) cameraWiredSerials.add(launch.serial);
+          else cameraWiredSerials.delete(launch.serial);
+          // Only covers launches this server owns. An emulator started
+          // elsewhere, or this one killed after the server exits, is not
+          // observable here; see the camera docs.
+          launch.proc?.once("exit", () => {
+            cameraWiredSerials.delete(launch.serial);
+          });
           if (camera && !launch.cameraFeed) {
             throw new Error(
               `AVD "${avd.trim()}" is already running, so its camera source cannot be changed; ` +
                 "the emulator only reads that flag at startup. Stop it first, or start it with restartAvd.",
             );
           }
-          // Authoritative in both directions: emulator serials are recycled, so a
-          // launch without feeds must clear any stale claim on the same serial.
-          if (launch.cameraFeed) cameraWiredSerials.add(launch.serial);
-          else cameraWiredSerials.delete(launch.serial);
           try {
             sessions.assertPublished(requestContext);
           } catch (err) {
@@ -2835,10 +2845,14 @@ export async function startServer(
       if (url.pathname === "/api/camera") {
         if (req.method !== "GET")
           return new Response("method not allowed", { status: 405 });
-        return Response.json({
-          ok: true,
-          camera: await cameraStatus(requestContext.serial),
-        });
+        try {
+          return Response.json({
+            ok: true,
+            camera: await cameraStatus(requestContext.serial),
+          });
+        } catch (err) {
+          return errorResponse(err);
+        }
       }
 
       if (url.pathname === "/api/camera/image") {

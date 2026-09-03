@@ -210,6 +210,76 @@ describe("standalone server camera image API", () => {
     );
   });
 
+  test("clears a stale claim even when the reused-AVD launch is refused", async () => {
+    const RECYCLED = "emulator-5556";
+    const launches: EmulatorLaunch[] = [
+      { serial: RECYCLED, proc: null, ownsProcess: true, cameraFeed: true, stop: () => {} },
+      { serial: RECYCLED, proc: null, ownsProcess: false, cameraFeed: false, stop: () => {} },
+    ];
+    const readWired = async (captured: CapturedServer) =>
+      parseCameraStatusResponse(await (await request(captured, "/api/camera")).json())
+        .camera.wiredAtLaunch;
+
+    await withServer(
+      undefined,
+      async (captured) => {
+        const start = (avd: string) =>
+          request(captured, "/api/avds/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ avd, camera: true, select: true }),
+          });
+
+        expect((await start("WithCamera")).status).toBe(200);
+        expect(await readWired(captured)).toBe(true);
+
+        // Same serial, now already running so no feeds can be attached. The
+        // request is refused, and the stale claim must not survive the refusal.
+        const refused = await start("AlreadyUp");
+        expect(refused.status).toBe(400);
+        expect((await refused.json()).error).toContain("already running");
+        expect(await readWired(captured)).toBe(false);
+      },
+      {
+        listDevices: async () => [
+          { serial: SERIAL, state: "device" },
+          { serial: RECYCLED, state: "device" },
+        ],
+        startEmulator: async () => launches.shift()!,
+      },
+    );
+  });
+
+  test("refuses a non-boolean camera flag instead of quietly disabling it", async () => {
+    let launched = false;
+    await withServer(
+      undefined,
+      async (captured) => {
+        const response = await request(captured, "/api/avds/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ avd: "Pixel_8", camera: "true", select: false }),
+        });
+        expect(response.status).toBe(400);
+        expect((await response.json()).error).toContain("camera must be a boolean");
+        expect(launched).toBe(false);
+      },
+      {
+        listDevices: async () => [{ serial: SERIAL, state: "device" }],
+        startEmulator: async () => {
+          launched = true;
+          return {
+            serial: "emulator-5558",
+            proc: null,
+            ownsProcess: true,
+            cameraFeed: false,
+            stop: () => {},
+          };
+        },
+      },
+    );
+  });
+
   test("refuses a camera launch that reused an already running AVD", async () => {
     await withServer(
       undefined,

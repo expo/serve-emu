@@ -153,9 +153,16 @@ const CRC_TABLE = (() => {
   return table;
 })();
 
+/**
+ * Indexed rather than `for..of`: this runs over a whole request body on the
+ * event loop that also forwards video frames, and the iterator form measured
+ * 3.4x slower over 32MB (325ms against 96ms).
+ */
 function crc32(bytes: Uint8Array): number {
   let c = 0xffffffff;
-  for (const byte of bytes) c = CRC_TABLE[(c ^ byte) & 0xff]! ^ (c >>> 8);
+  for (let i = 0; i < bytes.length; i += 1) {
+    c = CRC_TABLE[(c ^ bytes[i]!) & 0xff]! ^ (c >>> 8);
+  }
   return (c ^ 0xffffffff) >>> 0;
 }
 

@@ -483,6 +483,12 @@ An absent or unparsable feed file makes the emulator render a solid magenta
 frame, so serve-emu keeps a valid PNG at both paths from the moment it wires
 them.
 
+Feed files outlive the process. They stay in `~/.cache/serve-emu/camera/`, named
+by emulator serial, holding whatever image was posted last, so delete them by
+hand if a fixture is sensitive. A launch always rewrites both feeds rather than
+adopting what it finds, because serials are recycled and the file left behind
+belongs to an unrelated earlier run.
+
 ### Sessions
 
 REST and WebSocket input events are recorded by default. Add `"record":false`

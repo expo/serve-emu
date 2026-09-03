@@ -28,11 +28,10 @@ export function cameraRoutes(): ContractApiRoute<ApiDependencies>[] {
         );
         const png = await readBodyBytes(request, MAX_CAMERA_IMAGE_BYTES);
         parseInput(() => assertCameraImage(png));
+        await downstream("set camera image", () => deps.setCameraImage(facing, png));
         return Response.json({
           ok: true,
-          camera: await downstream("set camera image", () =>
-            deps.setCameraImage(facing, png),
-          ),
+          camera: await downstream("read camera status", () => deps.getCamera()),
         });
       },
     },
@@ -43,11 +42,10 @@ export function cameraRoutes(): ContractApiRoute<ApiDependencies>[] {
         const facing = parseInput(() =>
           parseCameraFacing(url.searchParams.get("facing")),
         );
+        await downstream("clear camera image", () => deps.clearCameraImage(facing));
         return Response.json({
           ok: true,
-          camera: await downstream("clear camera image", () =>
-            deps.clearCameraImage(facing),
-          ),
+          camera: await downstream("read camera status", () => deps.getCamera()),
         });
       },
     },
