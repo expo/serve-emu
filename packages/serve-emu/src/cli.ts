@@ -25,9 +25,12 @@ import packageJson from "../package.json";
 import {
   DEFAULT_GRPC_INPUT_SOURCE,
   DEFAULT_GRPC_IMAGE_MODE,
+  DEFAULT_GRPC_VIDEO_CODEC,
   GRPC_IMAGE_MODES,
+  GRPC_VIDEO_CODECS,
   INPUT_SOURCES,
   isGrpcImageMode,
+  isGrpcVideoCodec,
   isInputSource,
   isStreamMode,
   STREAM_MODES,
@@ -50,6 +53,7 @@ const { values } = parseArgs({
     "stream-mode": { type: "string" },
     "grpc-image-mode": { type: "string", default: DEFAULT_GRPC_IMAGE_MODE },
     "input-source": { type: "string", default: DEFAULT_GRPC_INPUT_SOURCE },
+    "grpc-video-codec": { type: "string", default: DEFAULT_GRPC_VIDEO_CODEC },
     transport: { type: "string", default: "websocket" },
     "stun-url": { type: "string" },
     "turn-url": { type: "string" },
@@ -184,7 +188,7 @@ if (values.help) {
   console.log(`serve-emu — host an Android device over WebSocket/WebRTC
 
 Usage:
-  serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode <scrcpy|grpc-screenshot>] [--grpc-image-mode <png|mmap>] [--input-source <scrcpy|grpc>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms]
+  serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode <scrcpy|grpc-screenshot>] [--grpc-image-mode <png|mmap>] [--input-source <scrcpy|grpc>] [--grpc-video-codec <h264|vp8|vp9>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms]
   serve-emu --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
   serve-emu --avd <name> [--restart-avd]
   serve-emu --avd-list
@@ -205,9 +209,9 @@ Options:
                          Anyone who can reach the port can control the device.
   -s, --serial <serial>  adb device serial (defaults to the only booted device)
       --max-fps <n>      Cap source frame rate (default: ${SCRCPY_DEFAULTS.maxFps})
-      --bit-rate <bps>   H.264 bit rate (default: ${SCRCPY_DEFAULTS.bitRate})
+      --bit-rate <bps>   Target video bit rate (default: ${SCRCPY_DEFAULTS.bitRate})
       --max-size <px>    Cap longest screen edge in pixels; 0 = native. The
-                         gRPC screenshot source uses host-side software H.264
+                         gRPC screenshot source uses host-side software video
                          encoding; ${SCRCPY_DEFAULTS.maxSize} balances detail and steady frame
                          delivery for either source.
       --key-frame-interval <sec>
@@ -233,6 +237,10 @@ Options:
                          Input transport for gRPC streaming (default: scrcpy).
                          scrcpy runs a control-only server; grpc sends input
                          through the emulator's gRPC endpoint.
+      --grpc-video-codec <h264|vp8|vp9>
+                         Host encoder for gRPC screenshot streaming (default:
+                         ${DEFAULT_GRPC_VIDEO_CODEC}). H.264, VP8, and VP9 are
+                         delivered over WebSocket to WebCodecs-capable browsers.
       --transport <websocket|webrtc>
                          Initial browser video transport (default: websocket).
                          Each browser tab can switch transports in the UI.
@@ -315,6 +323,14 @@ async function main() {
     );
   }
   const inputSource = requestedInputSource;
+  const requestedGrpcVideoCodec =
+    stringOption("grpc-video-codec") ?? DEFAULT_GRPC_VIDEO_CODEC;
+  if (!isGrpcVideoCodec(requestedGrpcVideoCodec)) {
+    throw new Error(
+      `--grpc-video-codec must be one of: ${GRPC_VIDEO_CODECS.join(", ")}. Received "${requestedGrpcVideoCodec}".`,
+    );
+  }
+  const grpcVideoCodec = requestedGrpcVideoCodec;
 
   let emulatorLaunch: Awaited<ReturnType<typeof startEmulator>> | null = null;
   const serial = values.avd
@@ -401,6 +417,7 @@ async function main() {
     streamMode,
     grpcImageMode,
     inputSource,
+    grpcVideoCodec,
     streamSettings,
     maxApkUploadBytes,
     maxMediaUploadBytes,

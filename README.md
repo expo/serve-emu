@@ -19,8 +19,9 @@ Use `@latest` for one-off runs so Bun/npm fetches the newest published version i
 By default, `serve-emu` starts the vendored scrcpy server on the device and
 streams H.264 through an adb tunnel. Android Emulators can instead use the
 built-in emulator gRPC screenshot and input APIs, with H.264 encoded by ffmpeg
-on the host. Both sources feed the same WebSocket/WebCodecs or WebRTC browser
-pipeline, with a Media Source Extensions fallback. Neither input path shells
+on the host by default and VP8 or VP9 available as alternatives. Both sources
+feed the same WebSocket/WebCodecs browser pipeline; H.264 also supports WebRTC
+and a Media Source Extensions fallback. Neither input path shells
 out to `adb shell input`, keeping taps, swipes, text, and key events responsive
 enough for agents.
 
@@ -30,10 +31,10 @@ Current package version: see [`packages/serve-emu/package.json`](packages/serve-
 
 Working:
 
-- Live H.264 video over WebSocket/WebCodecs or WebRTC, with an MSE fallback
+- Live H.264 video over WebSocket/WebCodecs or WebRTC, with an MSE fallback; host-encoded VP8 and VP9 over WebSocket/WebCodecs
 - Per-tab switching between WebSocket and WebRTC, with lazy WebRTC startup
 - Runtime switching between scrcpy and host-side gRPC screenshot capture on Android Emulators, with scrcpy or gRPC input while gRPC video is active
-- Runtime PNG/MMAP selection and redacted JSON stream-stat downloads in the UI
+- Runtime PNG/MMAP and H.264/VP8/VP9 selection for gRPC capture, plus redacted JSON stream-stat downloads in the UI
 - Tap, swipe, text, keyevent, Back, Home, Recents, and Power input
 - Keyboard passthrough in the browser UI: editing/navigation keys, Ctrl/Cmd shortcuts (select all, copy, paste, cut, undo, redo), and IME composition for CJK text
 - Multi-client streaming, so multiple browser tabs can share one device
@@ -55,8 +56,8 @@ Planned:
 - Bun 1.3.13+
 - `adb` on PATH from Android platform-tools
 - A booted device/emulator from `adb devices`, or an AVD name passed with `--avd`
-- A modern browser with H.264 WebRTC support or WebCodecs; MSE is used when WebCodecs is unavailable
-- `ffmpeg` with `libx264` when using `--stream-mode grpc-screenshot`
+- A modern browser with H.264 WebRTC support or WebCodecs; VP8/VP9 WebSocket streaming requires WebCodecs, while H.264 can fall back to MSE
+- `ffmpeg` with `libx264`, `libvpx`, or `libvpx-vp9` for the selected gRPC video codec
 
 Node.js 18+ can invoke the published package through `npx`, but local development and server runtime use Bun.
 
@@ -65,7 +66,7 @@ Node.js 18+ can invoke the published package through `npx`, but local developmen
 The CLI remains the simplest entry point, and the fork also publishes a small
 typed integration surface:
 
-- `serve-emu` and `serve-emu/middleware`: `createApp`, `createRouter`, gRPC image-mode types/constants, and socket adapters for embedding the device router in another Bun/Node server
+- `serve-emu` and `serve-emu/middleware`: `createApp`, `createRouter`, gRPC image-mode and video-codec types/constants, and socket adapters for embedding the device router in another Bun/Node server
 - `serve-emu/stream-socket`: Bun and `ws` socket adapters
 - `serve-emu/stream-settings`: WebSocket/WebRTC settings, ICE types, defaults, and validation helpers
 
@@ -97,7 +98,7 @@ bun run packages/serve-emu/src/cli.ts
 ## CLI
 
 ```text
-serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode scrcpy|grpc-screenshot] [--grpc-image-mode png|mmap] [--input-source scrcpy|grpc] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms] [--max-apk-upload-bytes N] [--max-media-upload-bytes N]
+serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode scrcpy|grpc-screenshot] [--grpc-image-mode png|mmap] [--input-source scrcpy|grpc] [--grpc-video-codec h264|vp8|vp9] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms] [--max-apk-upload-bytes N] [--max-media-upload-bytes N]
 serve-emu --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
 serve-emu --avd <name> [--gpu <mode>] [--restart-avd]
 serve-emu --avd-list
@@ -114,8 +115,9 @@ serve-emu --running-avds
 | `--stream-mode` | `scrcpy` | Screen capture source: `scrcpy`, or emulator-only host capture through `grpc-screenshot` |
 | `--grpc-image-mode` | `png` | gRPC screenshot image delivery: compressed in-band `png`, or raw pixels through shared-memory `mmap`. The selected mode is strict; capture errors do not fall back to the other mode |
 | `--input-source` | `scrcpy` | Input transport for gRPC streaming: a control-only `scrcpy` server, or the emulator's `grpc` endpoint |
+| `--grpc-video-codec` | `h264` | Host encoder for gRPC screenshot streaming: `h264`, `vp8`, or `vp9`. VP8/VP9 require WebCodecs and are WebSocket-only |
 | `--max-fps` | `60` | Cap source frame rate |
-| `--bit-rate` | `8000000` | H.264 bit rate in bps |
+| `--bit-rate` | `8000000` | Target video bit rate in bps |
 | `--max-size` | `1280` | Downscale the longest edge to N pixels; `0` keeps native size. The default balances detail and throughput, especially for the host-side software encoder used by `grpc-screenshot` |
 | `--key-frame-interval` | `10` | Ask the encoder for regular keyframes; `0` disables this codec option. Late joiners get keyframes on demand, so a long interval avoids periodic keyframe bursts |
 | `--repeat-frame-ms` | `0` | Re-encode the previous frame after N ms without screen changes (`16` ≈ steady 60fps on static screens, at extra CPU/bandwidth cost); `0` keeps the source default: 100ms for scrcpy and 500ms for `grpc-screenshot` |
@@ -196,7 +198,7 @@ Open `http://localhost:3300` after starting the CLI. The UI streams the device i
 
 - Pointer input, keyboard passthrough (typing, navigation keys, shortcuts, IME composition), hardware buttons, and screenshots
 - Device selection plus AVD start/stop
-- Stream-source switching between scrcpy and gRPC screenshot capture on emulators, with an explicit PNG/MMAP image-mode selector for gRPC
+- Stream-source switching between scrcpy and gRPC screenshot capture on emulators, with explicit PNG/MMAP and H.264/VP8/VP9 selectors for gRPC
 - Per-tab WebSocket/WebRTC selection and redacted stream-stat downloads
 - Orientation, night mode, font scale, network, GPS location, and route playback
 - Logcat filtering, pause/copy controls, app management, file import, and session replay
@@ -228,19 +230,20 @@ curl "$BASE/api/device-grid"
 curl "$BASE/api/stream-mode"
 curl -X PUT "$BASE/api/stream-mode" \
   -H 'Content-Type: application/json' \
-  -d '{"mode":"grpc-screenshot","grpcImageMode":"mmap","inputSource":"scrcpy"}'
+  -d '{"mode":"grpc-screenshot","grpcImageMode":"mmap","inputSource":"scrcpy","grpcVideoCodec":"vp9"}'
 curl -X POST "$BASE/api/devices/select" \
   -H 'Content-Type: application/json' \
   -d '{"serial":"emulator-5554"}'
 ```
 
-`GET /api/stream-mode` reports `mode`, `grpcImageMode`, `inputSource`, the
-available stream and input sources, and the active session generation. `PUT
-/api/stream-mode` accepts an optional `grpcImageMode` of `png` or `mmap` and an
-optional `inputSource` of `scrcpy` or `grpc` when `mode` is `grpc-screenshot`.
-gRPC streaming defaults to the control-only scrcpy input transport.
-Changing either value stages one replacement capture atomically; an MMAP error
-is returned to the caller and never retried as PNG.
+`GET /api/stream-mode` reports `mode`, `grpcImageMode`, `inputSource`,
+`grpcVideoCodec`, the available stream and input sources, and the active session
+generation. When `mode` is `grpc-screenshot`, `PUT /api/stream-mode` accepts
+optional `grpcImageMode` (`png` or `mmap`), `inputSource` (`scrcpy` or `grpc`),
+and `grpcVideoCodec` (`h264`, `vp8`, or `vp9`). gRPC streaming defaults to the
+control-only scrcpy input transport. Changing any value stages one replacement
+capture atomically; an MMAP or encoder error is returned to the caller without
+changing the current stream.
 
 `/health` includes bounded subprocess executor activity, queue depth, lane
 counts, deadlines, overload rejections, and output-limit totals. Device-grid
@@ -280,8 +283,8 @@ must be integers within these bounds:
 | Field | Range | Meaning |
 | --- | ---: | --- |
 | `maxDimension` | 0–4096 | Longest encoded edge; `0` disables the size cap |
-| `h264Bitrate` | 100000–50000000 | Target H.264 bitrate in bits per second |
-| `h264Fps` | 1–120 | Maximum encoded frames per second |
+| `h264Bitrate` | 100000–50000000 | Target video bitrate in bits per second (legacy field name) |
+| `h264Fps` | 1–120 | Maximum encoded frames per second (legacy field name) |
 
 A changed setting restarts only the active capture while keeping the device's
 recorded-session state. Middleware clients remain attached and resynchronize on
@@ -493,7 +496,7 @@ JSON responses. `/health` includes current upload queue metrics.
 
 ## WebSocket API
 
-Connect to `/ws` for the raw Annex-B H.264 stream. Send JSON control messages over the same socket:
+Connect to `/ws` for encoded video and JSON control messages on the same socket:
 
 ```json
 {"type":"tap","x":0.5,"y":0.5}
@@ -506,10 +509,20 @@ Connect to `/ws` for the raw Annex-B H.264 stream. Send JSON control messages ov
 {"type":"reset-video"}
 ```
 
-Use `/ws?frame-meta=1` to receive a 24-byte `SEMU` v2 frame metadata header before each H.264 access unit: magic `SEMU` (4B), version=2 (1B), flags (1B, bit 0 = keyframe), reserved (2B), PTS (8B BE, µs), and the server send time (8B BE, epoch µs). Same-host clients can compare the send time against their own clock to measure transit and glass-to-glass latency. The bundled UI uses this mode to avoid per-frame NAL scans and to track PTS/keyframe/latency state.
+The server first sends a `video-session` JSON message containing `size` and
+`codec`. Subsequent binary messages are raw Annex-B access units for H.264 or
+complete raw frames for VP8/VP9 until the next session message. Use
+`/ws?frame-meta=1` to receive a 24-byte `SEMU` v2 metadata header before each
+payload: magic `SEMU` (4B), version=2 (1B), flags (1B, bit 0 = keyframe),
+reserved (2B), PTS (8B BE, µs), and server send time (8B BE, epoch µs).
+Same-host clients can compare the send time against their own clock to measure
+transit and glass-to-glass latency. The bundled UI uses this mode to avoid
+per-frame bitstream scans and to track PTS/keyframe/latency state.
 
-For H.264 sources, each browser tab can independently select WebSocket or
-WebRTC; `--transport` chooses only the initial selection for tabs without a
+Each browser tab can independently select WebSocket or WebRTC for an H.264
+source. VP8 and VP9 are WebSocket-only; switch back to H.264 before selecting
+WebRTC.
+`--transport` chooses only the initial selection for tabs without a
 saved preference. The server starts its WebRTC publisher lazily on the first
 authenticated, same-origin `POST /webrtc/offer`, and releases a viewer through
 `POST /webrtc/close`. A WebRTC viewer keeps `/ws?video=0` open as a control-only
@@ -538,7 +551,7 @@ See the [protocol reference](packages/serve-emu/docs/protocol.md) for the comple
 ## How It Works
 
 ```text
-+------------------+ adb forward  +-------------+ H.264 WS/RTC +---------+
++------------------+ adb forward  +-------------+ video WS/RTC +--------+
 | scrcpy-server.jar| <----------> | serve-emu  | ------------> | Browser |
 | on device        | TCP tunnel   |   (Bun)     | WebCodecs/MSE | canvas/ |
 |                  |              |             | or WebRTC     | video   |
@@ -550,7 +563,7 @@ See the [protocol reference](packages/serve-emu/docs/protocol.md) for the comple
 1. The CLI pushes `scrcpy-server-v4.0` to `/data/local/tmp/scrcpy-server.jar`.
 2. It opens `adb forward tcp:<localPort> localabstract:scrcpy_<scid>`.
 3. It spawns `app_process` with the scrcpy server class on the device, then connects video and control sockets through the tunnel.
-4. The Bun server reads scrcpy's framed H.264 stream and publishes each access unit to active WebSocket viewers and, once requested, WebRTC viewers. Raw `/ws` clients receive Annex-B payloads unchanged; the built-in WebSocket UI opts into the 24-byte frame metadata header.
+4. The Bun server reads scrcpy's framed H.264 stream and publishes each access unit to active WebSocket viewers and, once requested, WebRTC viewers. The gRPC source can instead publish host-encoded H.264, VP8, or VP9 over WebSocket. Raw `/ws` clients receive codec payloads unchanged; the built-in WebSocket UI opts into the 24-byte frame metadata header.
 5. The browser uses WebCodecs in a worker, falls back to MSE where necessary, or renders the WebRTC track into a `<video>`. Pointer events are normalized to unit coordinates and dispatched through the active source's ordered control channel.
 
 With `--stream-mode grpc-screenshot`, the emulator's gRPC endpoint provides
@@ -564,11 +577,14 @@ when one is present. If an explicitly selected emulator exposes an endpoint
 without a token, `serve-emu` prints a warning before using that local endpoint;
 only select this mode for an emulator you trust.
 
-`serve-emu` encodes either mode with ffmpeg/libx264 into the same Annex-B H.264
-packet shape, so browser streaming, backpressure recovery, recording, and the
-REST and WebSocket control APIs remain unchanged. The selected gRPC image mode
-never falls back automatically. The UI can replace either source or gRPC image
-mode at runtime; the current stream stays live until the replacement is ready.
+`serve-emu` encodes either image mode with the selected ffmpeg encoder:
+libx264/Annex-B for H.264, or libvpx/IVF for VP8 and VP9. IVF framing is removed
+before WebSocket delivery, so every message still contains one complete video
+frame. Browser streaming, backpressure recovery, recording, and the REST and
+WebSocket control APIs remain unchanged. The selected gRPC image mode and codec
+never fall back automatically. The UI can replace the source, gRPC image mode,
+or codec at runtime; the current stream stays live until the replacement is
+ready.
 
 For MMAP, `--max-size 0` allocates the fixed shared region from the display's
 native size at session startup. Rotation remains native-size, but a foldable or

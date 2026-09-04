@@ -82,6 +82,7 @@ const VALID_JSON_BODIES: Readonly<Record<string, unknown>> = {
   "PUT /api/stream-mode": {
     mode: "grpc-screenshot",
     grpcImageMode: "mmap",
+    grpcVideoCodec: "vp9",
   },
   "PATCH /api/stream-settings": { maxDimension: 720 },
   "POST /api/devices/select": { serial: "emulator-5554" },
@@ -165,6 +166,9 @@ function fakeDependencies(
       serial: "emulator-5554",
       mode: "scrcpy",
       grpcImageMode: "png",
+      inputSource: "scrcpy",
+      availableInputSources: ["scrcpy"],
+      grpcVideoCodec: "h264",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 0,
     }),
@@ -175,6 +179,15 @@ function fakeDependencies(
       grpcImageMode: request.mode === "grpc-screenshot"
         ? request.grpcImageMode ?? "png"
         : "png",
+      inputSource: request.mode === "grpc-screenshot"
+        ? request.inputSource ?? "scrcpy"
+        : "scrcpy",
+      availableInputSources: request.mode === "grpc-screenshot"
+        ? ["scrcpy", "grpc"]
+        : ["scrcpy"],
+      grpcVideoCodec: request.mode === "grpc-screenshot"
+        ? request.grpcVideoCodec ?? "h264"
+        : "h264",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 1,
     }),

@@ -1,5 +1,9 @@
 import { parseGesture, type Gesture } from "./control-contracts.ts";
-import type { DeviceSize } from "./api-contracts.ts";
+import {
+  GRPC_VIDEO_CODECS,
+  type DeviceSize,
+  type GrpcVideoCodec,
+} from "./api-contracts.ts";
 
 export type WsMessageOptions = {
   /** Set false when the sender does not need a JSON acknowledgement. */
@@ -15,7 +19,12 @@ export type WsClientMessage = WsGestureMessage | WsResetVideoMessage;
 export type WsAckMessage = { ok: true };
 /** Kept as a string for compatibility with the existing WebSocket wire format. */
 export type WsFailureMessage = { ok: false; error: string };
-export type WsVideoSessionMessage = { type: "video-session"; size: DeviceSize };
+export type WsVideoSessionMessage = {
+  type: "video-session";
+  size: DeviceSize;
+  /** Codec for every binary frame until the next video-session message. */
+  codec: GrpcVideoCodec;
+};
 export type WsServerMessage = WsAckMessage | WsFailureMessage | WsVideoSessionMessage;
 
 function record(value: unknown, name: string): Record<string, unknown> {
@@ -79,7 +88,17 @@ export function parseWsServerMessage(value: unknown): WsServerMessage {
     ) {
       throw new TypeError("video session dimensions must be positive finite numbers");
     }
-    return { type: "video-session", size: { width: size.width, height: size.height } };
+    if (
+      typeof source.codec !== "string" ||
+      !GRPC_VIDEO_CODECS.some((codec) => codec === source.codec)
+    ) {
+      throw new TypeError("video session codec is invalid");
+    }
+    return {
+      type: "video-session",
+      size: { width: size.width, height: size.height },
+      codec: source.codec as GrpcVideoCodec,
+    };
   }
   if (source.ok === true) return { ok: true };
   if (source.ok === false && typeof source.error === "string") {

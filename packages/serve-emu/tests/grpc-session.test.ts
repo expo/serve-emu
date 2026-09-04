@@ -33,12 +33,13 @@ import {
   type GrpcScreenshotImageSource,
   type KeyboardEventRequest,
 } from "../src/emulator-grpc.ts";
-import type { H264EncoderOpts, QuarterTurn } from "../src/h264-encoder.ts";
+import type { QuarterTurn, VideoEncoderOpts } from "../src/h264-encoder.ts";
 import { compileGesture, parseGesture } from "../src/input.ts";
 import type {
   ScrcpyControlSession,
   VideoFrame,
 } from "../src/scrcpy.ts";
+import type { GrpcVideoCodec } from "../src/shared/api-contracts.ts";
 
 const CONFIG_FRAME: VideoFrame = {
   type: "frame",
@@ -251,6 +252,16 @@ describe("gRPC screenshot session helpers", () => {
     expect(mmapBehavior.predecodeMaxFps).toBeUndefined();
     expect(mmapBehavior.needsEncoderFollowUp(false, true)).toBe(true);
     expect(mmapBehavior.needsEncoderFollowUp(true, false)).toBe(false);
+
+    for (const codec of ["vp8", "vp9"] as const) {
+      for (const imageMode of ["png", "mmap"] as const) {
+        const behavior = grpcImageModeBehavior(imageMode, 60, codec);
+        expect(behavior.needsEncoderFollowUp(false, false)).toBe(false);
+        expect(behavior.needsEncoderFollowUp(false, true)).toBe(false);
+        expect(behavior.needsEncoderFollowUp(true, false)).toBe(false);
+        expect(behavior.needsEncoderFollowUp(true, true)).toBe(false);
+      }
+    }
   });
 
   test("treats an empty 0x0 MMAP notification as an inactive-display marker", () => {
@@ -636,6 +647,36 @@ describe("gRPC screenshot session helpers", () => {
     expect(queue.shift()).toBe(config);
     expect(queue.shift()).toBe(key);
     expect(queue.shift()).toBeUndefined();
+  });
+
+  test("recovers VP8 and VP9 queues at a keyframe without codec config", () => {
+    const delta: VideoFrame = {
+      ...KEY_FRAME,
+      data: Buffer.alloc(5, 0x41),
+      isKey: false,
+    };
+    const key: VideoFrame = {
+      ...KEY_FRAME,
+      data: Buffer.from([0x10, 0x20]),
+    };
+
+    for (const codec of ["vp8", "vp9"] as const) {
+      const queue = new GrpcVideoPacketQueue(8, codec);
+      expect(queue.push(delta)).toEqual({
+        queued: true,
+        needsKeyFrame: false,
+      });
+      expect(queue.push(delta)).toEqual({
+        queued: false,
+        needsKeyFrame: true,
+      });
+      expect(queue.push(key)).toEqual({
+        queued: true,
+        needsKeyFrame: false,
+      });
+      expect(queue.shift()).toBe(key);
+      expect(queue.shift()).toBeUndefined();
+    }
   });
 
   test("reports cumulative gRPC capture loss, source timing, and encoder writes", () => {
@@ -1086,7 +1127,7 @@ class FakeGrpcEncoder implements GrpcSessionEncoder {
   #published = false;
 
   constructor(
-    readonly options: H264EncoderOpts,
+    readonly options: VideoEncoderOpts,
     readonly behavior: {
       writeResults?: boolean[];
       publishAfterAcceptedWrites?: number;
@@ -1137,9 +1178,12 @@ function integrationRuntime(
     writeResults?: boolean[];
     publishAfterAcceptedWrites?: number;
   } = {},
+  assertedCodecs?: GrpcVideoCodec[],
 ): GrpcSessionRuntime {
   return {
-    async assertFfmpeg() {},
+    async assertFfmpeg(_signal, codec) {
+      assertedCodecs?.push(codec);
+    },
     async ensureEndpoint() {
       return { port: 8554, token: "token", avdName: "Pixel_9" };
     },
@@ -1231,6 +1275,38 @@ describe("startGrpcSession integration", () => {
     expect(client.keys).toEqual([]);
     await session.close();
     expect(controlCloseCalls).toBe(1);
+  });
+
+  test("passes VP8 and VP9 through ffmpeg startup, encoder creation, and metadata", async () => {
+    for (const codec of ["vp8", "vp9"] as const) {
+      const client = new FakeGrpcClient(integrationImage());
+      const encoders: FakeGrpcEncoder[] = [];
+      const assertedCodecs: GrpcVideoCodec[] = [];
+      const session = await startGrpcSession(
+        {
+          serial: "emulator-5554",
+          mode: "grpc-screenshot",
+          grpcImageMode: "png",
+          inputSource: "grpc",
+          grpcVideoCodec: codec,
+        },
+        {
+          readDisplaySizeSignal: async () => "physical:4x6",
+          runtime: integrationRuntime(
+            client,
+            encoders,
+            {},
+            assertedCodecs,
+          ),
+        },
+      );
+
+      expect(assertedCodecs).toEqual([codec]);
+      expect(encoders).toHaveLength(1);
+      expect(encoders[0]!.options.codec).toBe(codec);
+      expect(session.meta.codecId).toBe(codec);
+      await session.close();
+    }
   });
 
   test("starts, routes hardware controls through gRPC keys, and closes resources", async () => {

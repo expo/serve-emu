@@ -2,6 +2,7 @@ import {
   spawn,
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
+import { availableParallelism } from "node:os";
 import {
   execText,
   type ExecOpts,
@@ -9,31 +10,37 @@ import {
 } from "./exec.ts";
 import type { VideoFrame } from "./scrcpy.ts";
 
-/**
- * Host-side H.264 encoder used by the emulator gRPC screenshot source.
- *
- * RGB frames or complete PNG images enter through stdin and ffmpeg/libx264
- * writes Annex-B H.264 to stdout. `aud=1` gives the parser an explicit
- * access-unit boundary, while zerolatency and disabled B-frames keep input
- * timestamps paired with output access units in submission order.
- */
+/** Host-side codecs supported by the emulator gRPC screenshot source. */
+export const VIDEO_CODECS = ["h264", "vp8", "vp9"] as const;
+export type VideoCodec = (typeof VIDEO_CODECS)[number];
 
-export type H264EncoderInputFormat = "rgb24" | "png";
+export type VideoEncoderInputFormat = "rgb24" | "png";
+/** @deprecated Use VideoEncoderInputFormat. */
+export type H264EncoderInputFormat = VideoEncoderInputFormat;
 
-export type H264EncoderOpts = {
+type BaseVideoEncoderOpts = {
   width: number;
   height: number;
   /** Input written to ffmpeg. Defaults to fixed-size raw RGB frames. */
-  inputFormat?: H264EncoderInputFormat;
+  inputFormat?: VideoEncoderInputFormat;
   /** Android display rotation quarter turns applied before encoding. */
   quarterTurn?: QuarterTurn;
   fps: number;
   bitRate: number;
-  /** Seconds between forced keyframes; 0 uses libx264's default keyint. */
+  /** Seconds between forced keyframes; 0 uses the encoder's default interval. */
   keyFrameInterval: number;
   onFrame: (frame: VideoFrame) => void;
   /** Called once when ffmpeg or its output parser fails unexpectedly. */
   onExit: (reason: string) => void;
+};
+
+export type VideoEncoderOpts = BaseVideoEncoderOpts & {
+  codec: VideoCodec;
+};
+
+/** Backwards-compatible H.264-only options accepted by H264Encoder. */
+export type H264EncoderOpts = BaseVideoEncoderOpts & {
+  codec?: "h264";
 };
 
 export type QuarterTurn = 0 | 1 | 2 | 3;
@@ -44,6 +51,10 @@ const NAL_PPS = 8;
 const NAL_AUD = 9;
 const START_CODE = Buffer.from([0, 0, 0, 1]);
 const MAX_PENDING_OUTPUT_BYTES = 64 * 1024 * 1024;
+const IVF_FILE_HEADER_BYTES = 32;
+const IVF_FRAME_HEADER_BYTES = 12;
+const MAX_IVF_HEADER_BYTES = 4 * 1024;
+const MAX_IVF_FRAME_BYTES = MAX_PENDING_OUTPUT_BYTES - IVF_FRAME_HEADER_BYTES;
 const MAX_RAW_FRAME_BYTES = 512 * 1024 * 1024;
 const MAX_PNG_FRAME_BYTES = 64 * 1024 * 1024;
 const MAX_DIMENSION = 16_384;
@@ -85,9 +96,14 @@ export class FfmpegStderrTail {
 
 type Nal = { pos: number; dataPos: number; type: number };
 
-type H264OutputParserOpts = {
+type VideoOutputParserOpts = {
   fps: number;
   onFrame: (frame: VideoFrame) => void;
+};
+
+type VideoOutputParser = {
+  enqueuePts(ptsUs: bigint): void;
+  push(chunk: Uint8Array): void;
 };
 
 function finitePositive(value: number, name: string, max: number): number {
@@ -105,7 +121,14 @@ function positiveInteger(value: number, name: string, max: number): number {
   return value;
 }
 
-function validateOptions(opts: H264EncoderOpts): number | null {
+function isVideoCodec(value: unknown): value is VideoCodec {
+  return VIDEO_CODECS.some((codec) => codec === value);
+}
+
+function validateOptions(opts: VideoEncoderOpts): number | null {
+  if (!isVideoCodec(opts.codec)) {
+    throw new RangeError(`unsupported video codec ${String(opts.codec)}`);
+  }
   const width = positiveInteger(opts.width, "width", MAX_DIMENSION);
   const height = positiveInteger(opts.height, "height", MAX_DIMENSION);
   if (width < 2 || height < 2) {
@@ -133,7 +156,7 @@ function validateOptions(opts: H264EncoderOpts): number | null {
 
   const inputFormat = opts.inputFormat ?? "rgb24";
   if (inputFormat !== "rgb24" && inputFormat !== "png") {
-    throw new RangeError(`unsupported H.264 encoder input format ${inputFormat}`);
+    throw new RangeError(`unsupported video encoder input format ${inputFormat}`);
   }
 
   const bytes = width * height * 3;
@@ -146,7 +169,7 @@ function validateOptions(opts: H264EncoderOpts): number | null {
 }
 
 export function ffmpegInputArgs(
-  inputFormat: H264EncoderInputFormat,
+  inputFormat: VideoEncoderInputFormat,
   width: number,
   height: number,
   fps: number,
@@ -170,7 +193,7 @@ export function ffmpegInputArgs(
     ];
   }
   if (inputFormat !== "rgb24") {
-    throw new RangeError(`unsupported H.264 encoder input format ${inputFormat}`);
+    throw new RangeError(`unsupported video encoder input format ${inputFormat}`);
   }
   return [
     "-f",
@@ -218,7 +241,7 @@ export class H264OutputParser {
   #lastPts = 0n;
   #lastConfig: Buffer | null = null;
 
-  constructor(opts: H264OutputParserOpts) {
+  constructor(opts: VideoOutputParserOpts) {
     finitePositive(opts.fps, "fps", MAX_FPS);
     if (typeof opts.onFrame !== "function") {
       throw new TypeError("onFrame must be a function");
@@ -357,8 +380,311 @@ export class H264OutputParser {
   }
 }
 
+const IVF_CODEC_FOURCC: Record<Exclude<VideoCodec, "h264">, string> = {
+  vp8: "VP80",
+  vp9: "VP90",
+};
+
+function readBitMsb(data: Uint8Array, position: number): number | null {
+  const byte = data[position >> 3];
+  return byte === undefined ? null : (byte >> (7 - (position & 7))) & 1;
+}
+
+/** Return whether one complete VP8 or VP9 payload is independently decodable. */
+export function isVpxKeyFrame(
+  codec: Exclude<VideoCodec, "h264">,
+  frame: Uint8Array,
+): boolean {
+  if (codec === "vp8") {
+    return (
+      frame.length >= 6 &&
+      (frame[0]! & 1) === 0 &&
+      frame[3] === 0x9d &&
+      frame[4] === 0x01 &&
+      frame[5] === 0x2a
+    );
+  }
+  if (codec !== "vp9" || frame.length === 0) return false;
+
+  let position = 0;
+  const bit = () => readBitMsb(frame, position++);
+  const markerHigh = bit();
+  const markerLow = bit();
+  if (markerHigh !== 1 || markerLow !== 0) return false;
+  const profileLow = bit();
+  const profileHigh = bit();
+  if (profileLow === null || profileHigh === null) return false;
+  const profile = profileLow | (profileHigh << 1);
+  if (profile === 3 && bit() !== 0) return false;
+  const showExistingFrame = bit();
+  if (showExistingFrame === null || showExistingFrame === 1) return false;
+  return bit() === 0;
+}
+
+export type IvfOutputParserOpts = VideoOutputParserOpts & {
+  codec: Exclude<VideoCodec, "h264">;
+};
+
+/**
+ * Bounded incremental parser for FFmpeg's IVF output.
+ *
+ * IVF contributes one file header and a length-prefixed header for every VPx
+ * frame. Only the encoded payload is published; submitted PTS values remain
+ * authoritative so all codecs expose the same microsecond timestamp contract.
+ */
+export class IvfOutputParser implements VideoOutputParser {
+  readonly #codec: Exclude<VideoCodec, "h264">;
+  readonly #onFrame: (frame: VideoFrame) => void;
+  readonly #frameDurationUs: bigint;
+  #pending: Buffer = Buffer.alloc(0);
+  #headerParsed = false;
+  #ptsQueue: bigint[] = [];
+  #lastPts = 0n;
+
+  constructor(opts: IvfOutputParserOpts) {
+    if (opts.codec !== "vp8" && opts.codec !== "vp9") {
+      throw new RangeError(`IVF does not support codec ${String(opts.codec)}`);
+    }
+    finitePositive(opts.fps, "fps", MAX_FPS);
+    if (typeof opts.onFrame !== "function") {
+      throw new TypeError("onFrame must be a function");
+    }
+    this.#codec = opts.codec;
+    this.#onFrame = opts.onFrame;
+    this.#frameDurationUs = BigInt(Math.max(1, Math.round(1_000_000 / opts.fps)));
+  }
+
+  enqueuePts(ptsUs: bigint): void {
+    if (typeof ptsUs !== "bigint" || ptsUs < 0n) {
+      throw new RangeError("ptsUs must be a non-negative bigint");
+    }
+    this.#ptsQueue.push(ptsUs);
+  }
+
+  push(chunk: Uint8Array): void {
+    if (chunk.byteLength === 0) return;
+    const incoming = Buffer.isBuffer(chunk)
+      ? chunk
+      : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    if (this.#pending.length + incoming.length > MAX_PENDING_OUTPUT_BYTES) {
+      throw new Error(
+        `ffmpeg ${this.#codec.toUpperCase()} IVF output exceeded ${MAX_PENDING_OUTPUT_BYTES} buffered bytes`,
+      );
+    }
+    this.#pending = this.#pending.length
+      ? Buffer.concat([this.#pending, incoming])
+      : incoming;
+    this.#parse();
+  }
+
+  #parse(): void {
+    if (!this.#headerParsed) {
+      if (this.#pending.length < IVF_FILE_HEADER_BYTES) return;
+      if (this.#pending.toString("ascii", 0, 4) !== "DKIF") {
+        throw new Error("invalid IVF signature");
+      }
+      const version = this.#pending.readUInt16LE(4);
+      if (version !== 0) throw new Error(`unsupported IVF version ${version}`);
+      const headerBytes = this.#pending.readUInt16LE(6);
+      if (
+        headerBytes < IVF_FILE_HEADER_BYTES ||
+        headerBytes > MAX_IVF_HEADER_BYTES
+      ) {
+        throw new Error(`invalid IVF header length ${headerBytes}`);
+      }
+      const fourcc = this.#pending.toString("ascii", 8, 12);
+      const expected = IVF_CODEC_FOURCC[this.#codec];
+      if (fourcc !== expected) {
+        throw new Error(
+          `IVF codec mismatch: expected ${expected}, received ${fourcc}`,
+        );
+      }
+      if (this.#pending.length < headerBytes) return;
+      this.#pending = this.#pending.subarray(headerBytes);
+      this.#headerParsed = true;
+    }
+
+    while (this.#pending.length >= IVF_FRAME_HEADER_BYTES) {
+      const frameBytes = this.#pending.readUInt32LE(0);
+      if (frameBytes === 0 || frameBytes > MAX_IVF_FRAME_BYTES) {
+        throw new Error(`invalid IVF frame size ${frameBytes}`);
+      }
+      const packetBytes = IVF_FRAME_HEADER_BYTES + frameBytes;
+      if (this.#pending.length < packetBytes) return;
+      const data = Buffer.from(
+        this.#pending.subarray(IVF_FRAME_HEADER_BYTES, packetBytes),
+      );
+      this.#pending = this.#pending.subarray(packetBytes);
+      const pts =
+        this.#ptsQueue.shift() ?? this.#lastPts + this.#frameDurationUs;
+      this.#lastPts = pts;
+      this.#onFrame({
+        type: "frame",
+        data,
+        pts,
+        isConfig: false,
+        isKey: isVpxKeyFrame(this.#codec, data),
+      });
+    }
+  }
+}
+
 export function resolveFfmpeg(): string {
   return process.env.SERVE_EMU_FFMPEG?.trim() || "ffmpeg";
+}
+
+export const FFMPEG_ENCODER_FOR_CODEC: Readonly<Record<VideoCodec, string>> = {
+  h264: "libx264",
+  vp8: "libvpx",
+  vp9: "libvpx-vp9",
+};
+
+/**
+ * Match WebRTC's VP8 area/core tiers instead of oversubscribing libvpx's
+ * row-based workers on small portrait streams.
+ */
+export function vp8ThreadCount(
+  width: number,
+  height: number,
+  parallelism = availableParallelism(),
+): number {
+  positiveInteger(width, "VP8 width", MAX_DIMENSION);
+  positiveInteger(height, "VP8 height", MAX_DIMENSION);
+  positiveInteger(parallelism, "VP8 parallelism", MAX_DIMENSION);
+  const pixels = width * height;
+  if (pixels >= 1_920 * 1_080 && parallelism > 8) return 8;
+  if (pixels > 1_280 * 960 && parallelism >= 6) return 3;
+  if (pixels > 640 * 480 && parallelism >= 3) {
+    return parallelism >= 6 ? 3 : 2;
+  }
+  return 1;
+}
+
+export type FfmpegOutputArgsOptions = {
+  codec: VideoCodec;
+  fps: number;
+  bitRate: number;
+  keyFrameInterval: number;
+  encodedWidth: number;
+  encodedHeight: number;
+  /** Deterministic override for tests; production uses host availability. */
+  parallelism?: number;
+};
+
+export function ffmpegOutputArgs(
+  options: FfmpegOutputArgsOptions,
+): string[] {
+  const {
+    codec,
+    fps,
+    bitRate,
+    keyFrameInterval,
+    encodedWidth,
+    encodedHeight,
+    parallelism,
+  } = options;
+  if (!isVideoCodec(codec)) {
+    throw new RangeError(`unsupported video codec ${String(codec)}`);
+  }
+  finitePositive(fps, "fps", MAX_FPS);
+  positiveInteger(bitRate, "bitRate", MAX_BIT_RATE);
+  if (!Number.isFinite(keyFrameInterval) || keyFrameInterval < 0) {
+    throw new RangeError("keyFrameInterval must be a non-negative number");
+  }
+  const keyint = keyFrameInterval > 0
+    ? Math.max(1, Math.round(fps * keyFrameInterval))
+    : 250;
+  if (!Number.isSafeInteger(keyint) || keyint > MAX_BIT_RATE) {
+    throw new RangeError("fps × keyFrameInterval is too large");
+  }
+  const rateControl = [
+    "-b:v",
+    String(bitRate),
+    "-maxrate",
+    String(bitRate),
+    "-bufsize",
+    String(bitRate),
+  ];
+
+  if (codec === "h264") {
+    const x264Params = [
+      `keyint=${keyint}`,
+      `min-keyint=${keyint}`,
+      "scenecut=0",
+      "repeat-headers=1",
+      "aud=1",
+    ].join(":");
+    return [
+      "-c:v",
+      FFMPEG_ENCODER_FOR_CODEC.h264,
+      "-preset",
+      "ultrafast",
+      "-tune",
+      "zerolatency",
+      "-profile:v",
+      "baseline",
+      ...rateControl,
+      "-x264-params",
+      x264Params,
+      "-f",
+      "h264",
+      "-flush_packets",
+      "1",
+      "pipe:1",
+    ];
+  }
+
+  if (codec === "vp8") {
+    return [
+      "-c:v",
+      FFMPEG_ENCODER_FOR_CODEC.vp8,
+      "-threads",
+      String(vp8ThreadCount(encodedWidth, encodedHeight, parallelism)),
+      "-deadline",
+      "realtime",
+      "-cpu-used",
+      "16",
+      "-static-thresh",
+      "1000",
+      "-lag-in-frames",
+      "0",
+      "-auto-alt-ref",
+      "0",
+      "-error-resilient",
+      "1",
+      "-g",
+      String(keyint),
+      ...rateControl,
+      "-f",
+      "ivf",
+      "-flush_packets",
+      "1",
+      "pipe:1",
+    ];
+  }
+
+  return [
+    "-c:v",
+    FFMPEG_ENCODER_FOR_CODEC.vp9,
+    "-deadline",
+    "realtime",
+    "-cpu-used",
+    "8",
+    "-lag-in-frames",
+    "0",
+    "-auto-alt-ref",
+    "0",
+    "-error-resilient",
+    "1",
+    "-g",
+    String(keyint),
+    ...rateControl,
+    "-f",
+    "ivf",
+    "-flush_packets",
+    "1",
+    "pipe:1",
+  ];
 }
 
 export type FfmpegProbeRunner = (
@@ -370,6 +696,13 @@ export type FfmpegProbeRunner = (
 export type FfmpegAvailabilityProbeOptions = {
   resolveBinary?: () => string;
   runExec?: FfmpegProbeRunner;
+};
+
+export type FfmpegAvailabilityProbe = {
+  /** Backwards-compatible H.264 probe. */
+  (signal?: AbortSignal): Promise<void>;
+  /** Probe the FFmpeg encoder required for one selected video codec. */
+  (codec: VideoCodec, signal?: AbortSignal): Promise<void>;
 };
 
 function probeAbortReason(signal: AbortSignal): Error {
@@ -385,15 +718,26 @@ function probeAbortReason(signal: AbortSignal): Error {
  */
 export function createFfmpegAvailabilityProbe(
   options: FfmpegAvailabilityProbeOptions = {},
-): (signal?: AbortSignal) => Promise<void> {
+): FfmpegAvailabilityProbe {
   const resolveBinary = options.resolveBinary ?? resolveFfmpeg;
   const runExec = options.runExec ?? execText;
   const available = new Set<string>();
 
-  return async (signal?: AbortSignal): Promise<void> => {
+  return (async (
+    codecOrSignal?: VideoCodec | AbortSignal,
+    selectedSignal?: AbortSignal,
+  ): Promise<void> => {
+    const codec = typeof codecOrSignal === "string" ? codecOrSignal : "h264";
+    if (!isVideoCodec(codec)) {
+      throw new RangeError(`unsupported video codec ${String(codec)}`);
+    }
+    const signal = typeof codecOrSignal === "string"
+      ? selectedSignal
+      : codecOrSignal;
     if (signal?.aborted) throw probeAbortReason(signal);
     const binary = resolveBinary();
-    if (available.has(binary)) return;
+    const cacheKey = `${binary}\0${codec}`;
+    if (available.has(cacheKey)) return;
 
     const result = await runExec(
       binary,
@@ -416,27 +760,38 @@ export function createFfmpegAvailabilityProbe(
         `ffmpeg not found or unusable (tried "${binary}"): ${detail}`,
       );
     }
-    if (!/\blibx264\b/.test(`${result.stdout}\n${result.stderr}`)) {
+    const encoder = FFMPEG_ENCODER_FOR_CODEC[codec];
+    const encoderPattern = new RegExp(
+      `(?:^|\\s)${encoder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|$)`,
+      "m",
+    );
+    if (!encoderPattern.test(`${result.stdout}\n${result.stderr}`)) {
       throw new Error(
-        `ffmpeg at "${binary}" does not include the libx264 encoder required by the grpc backend`,
+        `ffmpeg at "${binary}" does not include the ${encoder} encoder required for ${codec.toUpperCase()} gRPC streaming`,
       );
     }
-    available.add(binary);
-  };
+    available.add(cacheKey);
+  }) as FfmpegAvailabilityProbe;
 }
 
 export const assertFfmpegAvailable = createFfmpegAvailabilityProbe();
 
-export class H264Encoder {
+/**
+ * Host-side low-latency encoder used by the emulator gRPC screenshot source.
+ * H.264 is emitted as Annex-B; VP8 and VP9 are unwrapped from IVF before their
+ * complete frame payloads are delivered to the shared VideoFrame contract.
+ */
+export class VideoEncoder {
+  readonly codec: VideoCodec;
   readonly width: number;
   readonly height: number;
   readonly quarterTurn: QuarterTurn;
   readonly encodedWidth: number;
   readonly encodedHeight: number;
-  readonly inputFormat: H264EncoderInputFormat;
-  readonly #opts: H264EncoderOpts;
+  readonly inputFormat: VideoEncoderInputFormat;
+  readonly #opts: VideoEncoderOpts;
   readonly #proc: ChildProcessWithoutNullStreams;
-  readonly #parser: H264OutputParser;
+  readonly #parser: VideoOutputParser;
   readonly #inputFrameBytes: number | null;
   readonly #processDone: Promise<void>;
   readonly #stderr = new FfmpegStderrTail();
@@ -445,9 +800,10 @@ export class H264Encoder {
   #failureReported = false;
   #closeTask: Promise<void> | null = null;
 
-  constructor(opts: H264EncoderOpts) {
+  constructor(opts: VideoEncoderOpts) {
     this.#inputFrameBytes = validateOptions(opts);
     this.#opts = opts;
+    this.codec = opts.codec;
     this.width = opts.width;
     this.height = opts.height;
     this.inputFormat = opts.inputFormat ?? "rgb24";
@@ -457,24 +813,19 @@ export class H264Encoder {
     const transposed = this.quarterTurn === 1 || this.quarterTurn === 3;
     this.encodedWidth = transposed ? croppedHeight : croppedWidth;
     this.encodedHeight = transposed ? croppedWidth : croppedHeight;
-    this.#parser = new H264OutputParser({
-      fps: opts.fps,
-      onFrame: opts.onFrame,
-    });
+    this.#parser = opts.codec === "h264"
+      ? new H264OutputParser({
+          fps: opts.fps,
+          onFrame: opts.onFrame,
+        })
+      : new IvfOutputParser({
+          codec: opts.codec,
+          fps: opts.fps,
+          onFrame: opts.onFrame,
+        });
     this.#processDone = new Promise((resolve) => {
       this.#resolveProcessDone = resolve;
     });
-
-    const keyint = opts.keyFrameInterval > 0
-      ? Math.max(1, Math.round(opts.fps * opts.keyFrameInterval))
-      : 250;
-    const x264Params = [
-      `keyint=${keyint}`,
-      `min-keyint=${keyint}`,
-      "scenecut=0",
-      "repeat-headers=1",
-      "aud=1",
-    ].join(":");
 
     this.#proc = spawn(
       resolveFfmpeg(),
@@ -493,27 +844,14 @@ export class H264Encoder {
         videoFilter(this.quarterTurn),
         "-pix_fmt",
         "yuv420p",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-tune",
-        "zerolatency",
-        "-profile:v",
-        "baseline",
-        "-b:v",
-        String(opts.bitRate),
-        "-maxrate",
-        String(opts.bitRate),
-        "-bufsize",
-        String(opts.bitRate),
-        "-x264-params",
-        x264Params,
-        "-f",
-        "h264",
-        "-flush_packets",
-        "1",
-        "pipe:1",
+        ...ffmpegOutputArgs({
+          codec: opts.codec,
+          fps: opts.fps,
+          bitRate: opts.bitRate,
+          keyFrameInterval: opts.keyFrameInterval,
+          encodedWidth: this.encodedWidth,
+          encodedHeight: this.encodedHeight,
+        }),
       ],
       { stdio: ["pipe", "pipe", "pipe"] },
     );
@@ -608,7 +946,7 @@ export class H264Encoder {
       this.#parser.push(chunk);
     } catch (error) {
       this.#reportFailure(
-        `failed to parse ffmpeg H.264 output: ${error instanceof Error ? error.message : String(error)}`,
+        `failed to parse ffmpeg ${this.codec.toUpperCase()} output: ${error instanceof Error ? error.message : String(error)}`,
       );
       void this.close();
     }
@@ -653,5 +991,12 @@ export class H264Encoder {
       wait(timeoutMs),
     ]);
     return exited;
+  }
+}
+
+/** Backwards-compatible H.264 encoder facade. */
+export class H264Encoder extends VideoEncoder {
+  constructor(opts: H264EncoderOpts) {
+    super({ ...opts, codec: "h264" });
   }
 }

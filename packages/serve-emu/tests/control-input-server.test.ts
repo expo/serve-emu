@@ -378,6 +378,11 @@ describe("server control input integration", () => {
         () => writer.packets.length === 1 && queue.snapshot().depth === 0,
         "initial reset-video packet did not drain",
       );
+      expect(ws.sent.shift()).toEqual({
+        type: "video-session",
+        size: { width: 1080, height: 1920 },
+        codec: "h264",
+      });
 
       harness.handlers.websocket.message(
         ws,
@@ -458,6 +463,11 @@ describe("server control input integration", () => {
         () => writer.packets.length === 1 && queue.snapshot().depth === 0,
         "initial reset-video packet did not drain",
       );
+      expect(ws.sent.shift()).toEqual({
+        type: "video-session",
+        size: { width: 1080, height: 1920 },
+        codec: "h264",
+      });
 
       writer.failNextWrite();
       harness.handlers.websocket.message(

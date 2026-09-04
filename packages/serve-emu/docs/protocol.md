@@ -57,9 +57,10 @@ Recognized FourCC values are:
 | `0x68323635` | H.265 (`h265`) |
 | `0x00617631` | AV1 (`av1`) |
 
-The bundled browser UI currently supports H.264 only. A valid H.265 or AV1
-preamble is therefore reported as an unsupported-codec error rather than passed
-to WebCodecs.
+For the scrcpy transport, the bundled browser UI currently supports H.264 only.
+A valid H.265 or AV1 preamble is therefore reported as an unsupported-codec
+error rather than passed to WebCodecs. The separate gRPC source supports the
+host-encoded codecs described below.
 
 ## Video packets
 
@@ -110,6 +111,21 @@ configuration and prepends it to key frames so that a browser joining or
 refreshing mid-stream can initialize its decoder. Slow clients drop frames until
 the next key frame and may request a video reset.
 
+## gRPC screenshot video
+
+Android Emulator gRPC capture supplies PNG images in-band or RGB pixels through
+MMAP. The host encodes those images with ffmpeg as H.264, VP8, or VP9. H.264 is
+published as Annex-B configuration/access-unit payloads. FFmpeg's VP8/VP9 IVF
+container is parsed on the host; its file and per-frame headers are removed so
+each published payload is exactly one complete raw VPx frame. The same
+`VideoPacket` fields carry microsecond PTS and the encoder-derived key-frame
+flag for all three codecs.
+
+H.264 readiness and queue recovery require cached SPS/PPS plus an IDR frame.
+VP8/VP9 have no separate configuration packet, so their recovery boundary is a
+key frame. The selected codec is source-global and applies to every WebSocket
+viewer until capture is atomically replaced.
+
 ## Control socket packets
 
 The current scrcpy 4.0 server accepts the following messages written by
@@ -133,9 +149,17 @@ significant latency.
 
 ## `SEMU` WebSocket frame metadata
 
-Plain `/ws` clients receive the raw Annex-B access unit in each binary WebSocket
+After a video WebSocket opens, and whenever its source generation or dimensions
+change, the server sends this text message before further video payloads:
+
+```json
+{"type":"video-session","size":{"width":1080,"height":1920},"codec":"h264"}
+```
+
+`codec` is `h264`, `vp8`, or `vp9`. Plain `/ws` clients then receive one raw
+Annex-B H.264 access unit or one raw VP8/VP9 frame in each binary WebSocket
 message. Clients connecting to `/ws?frame-meta=1` receive one `SEMU` header
-followed by the Annex-B access unit. There is no payload-length field because the
+followed by that encoded payload. There is no payload-length field because the
 WebSocket message boundary supplies it.
 
 ### v1 (16 bytes)
@@ -157,8 +181,8 @@ v2 keeps all v1 fields and appends:
 | 16-23 | `u64` server send time as Unix-epoch microseconds |
 
 The server writer always emits v2. The shared browser/server parser accepts v1,
-v2, and raw Annex-B messages. Unknown magic or version values are treated as raw
-payloads. A PTS larger than JavaScript's safe integer range is exposed as
+v2, and metadata-free payloads. Unknown magic or version values are treated as
+raw payloads. A PTS larger than JavaScript's safe integer range is exposed as
 `null`; v1 and raw messages have no server send time.
 
 ## Golden byte sequences

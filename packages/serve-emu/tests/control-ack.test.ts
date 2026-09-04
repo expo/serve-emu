@@ -29,7 +29,7 @@ describe("browser control acknowledgements", () => {
     expect(controlAcknowledgementError('{"ok":true}')).toBeNull();
     expect(
       controlAcknowledgementError(
-        '{"type":"video-session","size":{"width":720,"height":1280}}',
+        '{"type":"video-session","size":{"width":720,"height":1280},"codec":"vp8"}',
       ),
     ).toBeNull();
     expect(controlAcknowledgementError('{"ok":false,"error":"   "}')).toBeNull();
@@ -42,6 +42,7 @@ describe("browser control acknowledgements", () => {
         JSON.stringify({
           type: "video-session",
           size: { width: 720, height: 1280 },
+          codec: "vp9",
           ok: false,
           error: "not a control rejection",
         }),
