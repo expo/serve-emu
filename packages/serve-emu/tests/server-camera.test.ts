@@ -318,15 +318,30 @@ describe("standalone server camera image API", () => {
     });
   });
 
-  test("rejects an unknown facing and an unsupported method", async () => {
+  test("serves the stored PNG back and rejects an unknown facing or method", async () => {
     await withServer(SERIAL, async (captured) => {
+      const missing = await request(captured, "/api/camera/image?facing=front");
+      expect(missing.status).toBe(404);
+
+      const png = solidPng(48, 36, [9, 8, 7]);
+      expect(
+        (await postImage(captured, Uint8Array.from(png), "?facing=front")).status,
+      ).toBe(200);
+
+      const served = await request(captured, "/api/camera/image?facing=front");
+      expect(served.status).toBe(200);
+      expect(served.headers.get("Content-Type")).toBe("image/png");
+      expect(new Uint8Array(await served.arrayBuffer())).toEqual(
+        Uint8Array.from(png),
+      );
+
       const bad = await postImage(captured, Uint8Array.from(placeholderCameraImage().png), "?facing=selfie");
       expect(bad.status).toBe(400);
       expect((await bad.json()).error).toContain("facing must be one of");
 
       expect((await request(captured, "/api/camera", { method: "POST" })).status).toBe(405);
       expect(
-        (await request(captured, "/api/camera/image", { method: "GET" })).status,
+        (await request(captured, "/api/camera/image", { method: "PUT" })).status,
       ).toBe(405);
     });
   });

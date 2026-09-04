@@ -2,13 +2,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import type { ServerWebSocket } from "bun";
-import {
-  clearCameraImage,
-  MAX_CAMERA_IMAGE_BYTES,
-  parseCameraFacing,
-  readCameraStatus,
-  setCameraImage,
-} from "./camera.ts";
+import { handleCameraRequest } from "./camera.ts";
 import { getExecSnapshot } from "./exec.ts";
 import {
   getFontScale,
@@ -120,11 +114,7 @@ import {
   MultipartUploadError,
   stageMultipartUpload,
 } from "./multipart-upload.ts";
-import {
-  HttpBodyError,
-  readBodyLimited,
-  readJsonLimited,
-} from "./request-body.ts";
+import { HttpBodyError, readJsonLimited } from "./request-body.ts";
 import {
   MAX_UPLOAD_QUEUE_TIMEOUT_MS,
   UploadManager,
@@ -649,8 +639,6 @@ export async function startServer(
   const cameraWiredSerials = new Set<string>(
     opts.cameraSerial ? [opts.cameraSerial] : [],
   );
-  const cameraStatus = (serial: string) =>
-    readCameraStatus(serial, cameraWiredSerials.has(serial));
 
   const health = (context = sessions.current) => {
     const now = recoveryClock.now();
@@ -2842,40 +2830,13 @@ export async function startServer(
         }
       }
 
-      if (url.pathname === "/api/camera") {
-        if (req.method !== "GET")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          return Response.json({
-            ok: true,
-            camera: await cameraStatus(requestContext.serial),
-          });
-        } catch (err) {
-          return errorResponse(err);
-        }
-      }
-
-      if (url.pathname === "/api/camera/image") {
-        if (req.method !== "POST" && req.method !== "DELETE")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          const facing = parseCameraFacing(url.searchParams.get("facing"));
-          if (req.method === "POST") {
-            const png = await readBodyLimited(req, MAX_CAMERA_IMAGE_BYTES);
-            sessions.assertCurrent(requestContext);
-            await setCameraImage(requestContext.serial, facing, png);
-          } else {
-            sessions.assertCurrent(requestContext);
-            await clearCameraImage(requestContext.serial, facing);
-          }
-          return Response.json({
-            ok: true,
-            camera: await cameraStatus(requestContext.serial),
-          });
-        } catch (err) {
-          return errorResponse(err);
-        }
-      }
+      const cameraResponse = await handleCameraRequest(req, url, {
+        serial: requestContext.serial,
+        wiredAtLaunch: cameraWiredSerials.has(requestContext.serial),
+        beforeMutation: () => sessions.assertCurrent(requestContext),
+        errorResponse,
+      });
+      if (cameraResponse) return cameraResponse;
 
       if (url.pathname === "/ws") {
         if (requestContext.status !== "streaming") {
