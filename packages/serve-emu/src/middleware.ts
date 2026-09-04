@@ -14,6 +14,7 @@ import {
   type OrientationMode,
 } from "./adb.ts";
 import { getAccessibilitySnapshot } from "./accessibility.ts";
+import { handleCameraRequest, isCameraPath } from "./camera.ts";
 import {
   clearAppData,
   forceStopApp,
@@ -131,6 +132,9 @@ export type {
 } from "./stream-settings.ts";
 export { STREAM_TRANSPORTS } from "./stream-settings.ts";
 export type { StreamTransport } from "./stream-settings.ts";
+export { cameraLaunchArgs, handleCameraRequest, seedCameraFeeds } from "./camera.ts";
+export { CAMERA_FACINGS } from "./shared/api-contracts.ts";
+export type { CameraFacing, CameraFeedStatus, CameraStatus } from "./shared/api-contracts.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // `src/middleware.ts` and `dist/middleware.mjs` both resolve to `<pkg>/dist/ui`.
@@ -1867,6 +1871,7 @@ export function createRouter(
   const sessionGenerations = new Map<string, number>();
   const operationControllers = new Map<string, Set<AbortController>>();
   const stoppingSerials = new Set<string>();
+  const cameraWiredSerials = new Set<string>();
   let selectedSerial = defaults.serial ?? null;
   let selectionRevision = 0;
   let stopped = false;
@@ -2357,6 +2362,16 @@ export function createRouter(
     return streamingApps[0] ?? null;
   };
 
+  /**
+   * Hosts that boot their own emulators own the wiring truth: the router never
+   * sees a launch it did not make, so it cannot infer whether the feeds are
+   * attached.
+   */
+  const setCameraWired = (serial: string, wired: boolean): void => {
+    if (wired) cameraWiredSerials.add(serial);
+    else cameraWiredSerials.delete(serial);
+  };
+
   const handleRequest = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
     if (
@@ -2529,15 +2544,30 @@ export function createRouter(
         const payload = await readRouterPayload(req);
         const avd = typeof payload.avd === "string" ? payload.avd.trim() : "";
         if (!avd) throw new Error("avd is required");
-        if ((payload as Record<string, unknown>).camera !== undefined) {
-          // The middleware serves no /api/camera routes and cannot attach feeds,
-          // so accepting the field would report success for nothing.
+        const requestedCamera = payload.camera;
+        if (requestedCamera !== undefined && typeof requestedCamera !== "boolean") {
+          throw new Error("camera must be a boolean");
+        }
+        const camera = requestedCamera === true;
+        const launch = await launchEmulator({ avd, camera });
+        stoppingSerials.delete(launch.serial);
+        // Authoritative in both directions, and before any early return:
+        // emulator serials are recycled, so a launch without feeds has to
+        // clear whatever claim an earlier launch left on the same serial.
+        if (launch.cameraFeed) cameraWiredSerials.add(launch.serial);
+        else cameraWiredSerials.delete(launch.serial);
+        // Only covers launches this router owns. An emulator started
+        // elsewhere, or this one killed after the host exits, is not
+        // observable here; see the camera docs.
+        launch.proc?.once("exit", () => {
+          cameraWiredSerials.delete(launch.serial);
+        });
+        if (camera && !launch.cameraFeed) {
           throw new Error(
-            "camera is not supported by the serve-emu middleware; use the standalone server",
+            `AVD "${avd}" is already running, so its camera source cannot be changed; ` +
+              "the emulator only reads that flag at startup. Stop it first, or start it with restartAvd.",
           );
         }
-        const launch = await launchEmulator({ avd });
-        stoppingSerials.delete(launch.serial);
         const select = payload.select !== false;
         if (!select) {
           return Response.json({ ok: true, serial: launch.serial, avd });
@@ -2552,6 +2582,7 @@ export function createRouter(
           });
         } catch (err) {
           launch.stop();
+          cameraWiredSerials.delete(launch.serial);
           throw err;
         }
       } catch (err) {
@@ -2589,6 +2620,7 @@ export function createRouter(
           stoppingSerials.delete(serial);
           throw err;
         }
+        cameraWiredSerials.delete(serial);
         if (selectedSerial === serial) {
           selectionRevision++;
           selectedSerial = null;
@@ -2600,6 +2632,22 @@ export function createRouter(
           { status: 400 },
         );
       }
+    }
+
+    // Camera feeds are files on the host, not device state, so these routes
+    // must never start a stream session the way `ensure` would.
+    if (isCameraPath(url.pathname)) {
+      let serial: string;
+      try {
+        serial = await resolveSerial(url.searchParams.get("device"));
+      } catch (err) {
+        return Response.json({ ok: false, error: errMsg(err) }, { status: 503 });
+      }
+      const response = await handleCameraRequest(req, url, {
+        serial,
+        wiredAtLaunch: cameraWiredSerials.has(serial),
+      });
+      if (response) return response;
     }
 
     // Device-scoped endpoints are `/api`, `/api/*` (other than the fleet listing
@@ -2672,6 +2720,7 @@ export function createRouter(
       streamModeQueues.clear();
       sessionGenerations.clear();
       operationControllers.clear();
+      cameraWiredSerials.clear();
     })();
     return stopAllTask;
   };
@@ -2682,6 +2731,7 @@ export function createRouter(
     ensure,
     handleRequest,
     attachWebSocket,
+    setCameraWired,
     stopAll,
   };
 }
