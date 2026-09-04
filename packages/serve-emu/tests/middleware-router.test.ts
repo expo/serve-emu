@@ -132,6 +132,7 @@ function routerDependencies(state: {
         serial,
         proc: null,
         ownsProcess: false,
+        cameraFeed: false,
         stop: () => {},
       };
     },
@@ -390,6 +391,16 @@ describe("createRouter DevicePanel compatibility", () => {
       stopped: [] as string[],
     };
     const router = createRouter({}, routerDependencies(state));
+
+    const cameraResponse = await router.handleRequest(
+      post("/api/avds/start", { avd: "Pixel_9", camera: true }),
+    );
+    expect(cameraResponse.status).toBe(400);
+    expect(await responseJson(cameraResponse)).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("not supported by the serve-emu middleware"),
+    });
+    expect(state.created).toEqual([]);
 
     const startResponse = await router.handleRequest(
       post("/api/avds/start", { avd: "Pixel_9" }),

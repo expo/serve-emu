@@ -14,6 +14,7 @@
 - ADB helpers: `packages/serve-emu/src/adb.ts`.
 - App install/launch/clear/grant/import helpers: `packages/serve-emu/src/app-management.ts`.
 - Location and route playback: `packages/serve-emu/src/location.ts` and `packages/serve-emu/src/route-playback.ts`.
+- Still-image camera passthrough for the emulator: `packages/serve-emu/src/camera.ts`.
 - Session recording/replay: `packages/serve-emu/src/session-recorder.ts`.
 - React UI: `packages/serve-emu/src/ui`.
 - Vendored scrcpy downloader and pinned version: `packages/serve-emu/scripts/fetch-scrcpy.ts`.
@@ -47,6 +48,9 @@ scrcpy setup lazily on first start.
 - Default device selection should remain the only booted device. If multiple devices are connected, require or pass `-s <serial>`.
 - Do not shell out to `adb shell input` for input events. Write directly to scrcpy's control socket via `src/input.ts`; this keeps latency low enough for agent workflows.
 - Location control is emulator-only and uses Android Emulator `geo fix`.
+- Camera image passthrough is emulator-only. The [Camera Image](README.md#camera-image)
+  section is the source of truth for the mechanism and its constraints. In code, wire feeds
+  through `startEmulator({ camera: true })`, and keep a valid PNG at every wired feed path.
 - WebCodecs support matters for the bundled UI, so test streaming changes in a browser that supports it.
 
 ## scrcpy Protocol Notes

@@ -2633,6 +2633,13 @@ export function createRouter(
         const payload = await readRouterPayload(req);
         const avd = typeof payload.avd === "string" ? payload.avd.trim() : "";
         if (!avd) throw new Error("avd is required");
+        if ((payload as Record<string, unknown>).camera !== undefined) {
+          // The middleware serves no /api/camera routes and cannot attach feeds,
+          // so accepting the field would report success for nothing.
+          throw new Error(
+            "camera is not supported by the serve-emu middleware; use the standalone server",
+          );
+        }
         const launch = await launchEmulator({ avd });
         stoppingSerials.delete(launch.serial);
         const select = payload.select !== false;
