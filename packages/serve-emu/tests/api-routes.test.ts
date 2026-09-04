@@ -68,6 +68,7 @@ const EXPECTED_ROUTES = [
   ["POST", "/api/session/replay"],
   ["POST", "/api/session/replay/stop"],
   ["GET", "/api/camera"],
+  ["GET", "/api/camera/image"],
   ["POST", "/api/camera/image"],
   ["DELETE", "/api/camera/image"],
 ] as const satisfies readonly (readonly [ApiMethod, string])[];
@@ -349,6 +350,7 @@ function fakeDependencies(
     getCamera: async () => cameraStatus,
     setCameraImage: async () => {},
     clearCameraImage: async () => {},
+    readCameraImage: async () => placeholderCameraImage().png,
   };
 
   return { ...dependencies, ...overrides };
@@ -428,13 +430,13 @@ const silentLogger: ApiLogger = {
 };
 
 describe("domain API route table", () => {
-  test("registers the exact 47 method/path pairs across 35 paths", () => {
+  test("registers the exact 48 method/path pairs across 35 paths", () => {
     const routes = createApiRoutes();
 
     expect(routes.map(({ method, path }) => [method, path])).toEqual(
       EXPECTED_ROUTES.map(([method, path]) => [method, path]),
     );
-    expect(routes).toHaveLength(47);
+    expect(routes).toHaveLength(48);
     expect(new Set(routes.map((route) => route.path)).size).toBe(35);
     const contractPairs = Object.entries(API_SUCCESS_PARSERS).flatMap(
       ([path, methods]) => Object.keys(methods).map((method) => `${method} ${path}`),

@@ -3,6 +3,7 @@ import {
   MAX_CAMERA_IMAGE_BYTES,
   parseCameraFacing,
 } from "../../camera.ts";
+import { ApiError } from "../api-error.ts";
 import { readBodyBytes } from "../body.ts";
 import type { ApiDependencies } from "../dependencies.ts";
 import type { ContractApiRoute } from "./types.ts";
@@ -18,6 +19,24 @@ export function cameraRoutes(): ContractApiRoute<ApiDependencies>[] {
           ok: true,
           camera: await downstream("read camera status", () => deps.getCamera()),
         }),
+    },
+    {
+      method: "GET",
+      path: "/api/camera/image",
+      handler: async ({ url, deps }) => {
+        const facing = parseInput(() =>
+          parseCameraFacing(url.searchParams.get("facing")),
+        );
+        const png = await downstream("read camera image", () =>
+          deps.readCameraImage(facing),
+        );
+        if (!png) {
+          throw new ApiError(404, "not_found", "no camera image is set for this facing");
+        }
+        return new Response(Uint8Array.from(png).buffer, {
+          headers: { "Content-Type": "image/png", "Cache-Control": "no-store" },
+        });
+      },
     },
     {
       method: "POST",
