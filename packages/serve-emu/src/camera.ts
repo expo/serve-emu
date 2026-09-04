@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import { isEmulatorSerial } from "./device-capabilities.ts";
+import { HttpBodyError, readBodyLimited } from "./request-body.ts";
 import {
   CAMERA_FACINGS,
   type CameraFacing,
@@ -366,4 +367,108 @@ export async function seedCameraFeeds(serial: string): Promise<void> {
       writeFeedFile(cameraFeedPath(serial, facing), png),
     ),
   );
+}
+
+export async function readCameraImage(
+  serial: string,
+  facing: CameraFacing,
+): Promise<Buffer | null> {
+  try {
+    return await readFile(cameraFeedPath(serial, facing));
+  } catch {
+    return null;
+  }
+}
+
+export type CameraRequestContext = {
+  serial: string;
+  wiredAtLaunch: boolean;
+  /**
+   * Runs after the body is read and before the feed file changes, so a host can
+   * refuse a mutation whose device session moved on while the body streamed in.
+   */
+  beforeMutation?: () => void;
+  errorResponse?: (error: unknown) => Response;
+};
+
+function defaultCameraErrorResponse(error: unknown): Response {
+  if (error instanceof HttpBodyError) {
+    return Response.json(
+      { ok: false, code: error.code, error: error.message },
+      { status: error.status },
+    );
+  }
+  return Response.json(
+    { ok: false, error: error instanceof Error ? error.message : String(error) },
+    { status: 400 },
+  );
+}
+
+const methodNotAllowed = () => new Response("method not allowed", { status: 405 });
+
+/**
+ * A host that must resolve a device serial before it can build the context asks
+ * this first, so a non-camera request never pays for that resolve.
+ */
+export function isCameraPath(pathname: string): boolean {
+  return pathname === "/api/camera" || pathname === "/api/camera/image";
+}
+
+/**
+ * The one camera HTTP handler. Both the standalone server and the middleware
+ * router mount it, so the routes cannot drift apart; each supplies only the
+ * serial, the wiring claim, and its own session and error policy.
+ */
+export async function handleCameraRequest(
+  request: Request,
+  url: URL,
+  context: CameraRequestContext,
+): Promise<Response | null> {
+  if (!isCameraPath(url.pathname)) return null;
+  const isStatusPath = url.pathname === "/api/camera";
+
+  const { serial, wiredAtLaunch } = context;
+  const errorResponse = context.errorResponse ?? defaultCameraErrorResponse;
+  const statusResponse = async () =>
+    Response.json({ ok: true, camera: await readCameraStatus(serial, wiredAtLaunch) });
+
+  if (isStatusPath) {
+    if (request.method !== "GET") return methodNotAllowed();
+    try {
+      return await statusResponse();
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  if (request.method !== "GET" && request.method !== "POST" && request.method !== "DELETE") {
+    return methodNotAllowed();
+  }
+
+  try {
+    const facing = parseCameraFacing(url.searchParams.get("facing"));
+    if (request.method === "GET") {
+      const png = await readCameraImage(serial, facing);
+      if (!png) {
+        return Response.json(
+          { ok: false, error: `no camera image is set for ${facing}` },
+          { status: 404 },
+        );
+      }
+      return new Response(Uint8Array.from(png).buffer, {
+        headers: { "Content-Type": "image/png", "Cache-Control": "no-store" },
+      });
+    }
+    if (request.method === "POST") {
+      const png = await readBodyLimited(request, MAX_CAMERA_IMAGE_BYTES);
+      context.beforeMutation?.();
+      await setCameraImage(serial, facing, png);
+    } else {
+      context.beforeMutation?.();
+      await clearCameraImage(serial, facing);
+    }
+    return await statusResponse();
+  } catch (error) {
+    return errorResponse(error);
+  }
 }
