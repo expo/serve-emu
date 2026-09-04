@@ -83,6 +83,11 @@ const MAX_DISPLAY_SIZE_OUTPUT_BYTES = 4_096;
 const INPUT_RELEASE_TIMEOUT_MS = 500;
 const TOUCH_PRESSURE = 1;
 const CAPTURE_DIAGNOSTIC_WINDOW = 240;
+// Retain one extra frame of fractional pacing credit so a source running at
+// the configured cadence does not lose every other notification to ordinary
+// arrival jitter. Synchronous notification bursts still collapse to one
+// pending snapshot before any credit is consumed.
+const MMAP_NOTIFICATION_MAX_FRAME_CREDIT = 2;
 // A two-second gap is at least 120 missing slots at the normal 60 FPS target
 // and four times the idle-repeat period. Treat the next source frame as the
 // start of a new active burst so one static-screen pause cannot depress the
@@ -732,7 +737,8 @@ export class GrpcMmapNotificationScheduler {
   readonly #onError: (error: unknown) => void;
   readonly #clock: GrpcMmapNotificationSchedulerClock;
   readonly #signal: AbortSignal | undefined;
-  #nextEmitAtMs: number | null = null;
+  #availableFrameCredit = 1;
+  #lastCreditUpdateAtMs: number | null = null;
   #pending: PendingMmapNotification | null = null;
   #microtaskQueued = false;
   #closed = false;
@@ -763,7 +769,8 @@ export class GrpcMmapNotificationScheduler {
   push(image: EmuImage, receivedAtMs: number): void {
     if (this.#closed) return;
     const now = this.#clock.now();
-    if (this.#nextEmitAtMs !== null && now < this.#nextEmitAtMs) {
+    this.#refillFrameCredit(now);
+    if (this.#availableFrameCredit < 1) {
       this.#onPacingEvent("coalesced");
       return;
     }
@@ -793,11 +800,6 @@ export class GrpcMmapNotificationScheduler {
       this.#microtaskQueued = false;
       if (this.#closed || !this.#pending) return;
       const now = this.#clock.now();
-      if (this.#nextEmitAtMs !== null && now < this.#nextEmitAtMs) {
-        this.#pending = null;
-        this.#onPacingEvent("coalesced");
-        return;
-      }
       const pending = this.#pending;
       this.#pending = null;
       this.#emit(pending, now);
@@ -806,7 +808,11 @@ export class GrpcMmapNotificationScheduler {
 
   #emit(notification: PendingMmapNotification, now: number): void {
     if (this.#closed) return;
-    this.#nextEmitAtMs = now + this.#frameIntervalMs;
+    this.#refillFrameCredit(now);
+    this.#availableFrameCredit = Math.max(
+      0,
+      this.#availableFrameCredit - 1,
+    );
     try {
       this.#onPacingEvent("emitted");
       // Intentionally synchronous: this is the ownership boundary where the
@@ -817,6 +823,17 @@ export class GrpcMmapNotificationScheduler {
       this.#onError(error);
       return;
     }
+  }
+
+  #refillFrameCredit(now: number): void {
+    if (this.#lastCreditUpdateAtMs !== null) {
+      const elapsedMs = Math.max(0, now - this.#lastCreditUpdateAtMs);
+      this.#availableFrameCredit = Math.min(
+        MMAP_NOTIFICATION_MAX_FRAME_CREDIT,
+        this.#availableFrameCredit + elapsedMs / this.#frameIntervalMs,
+      );
+    }
+    this.#lastCreditUpdateAtMs = now;
   }
 }
 
@@ -993,10 +1010,17 @@ export class GrpcFrameWritePacer {
 
   recordWrite(now: number, repeat: boolean, accepted = true): void {
     if (repeat || !accepted) return;
-    this.#nextFreshWriteAt = Math.max(
-      this.#nextFreshWriteAt + this.#frameIntervalMs,
-      now + this.#frameIntervalMs,
-    );
+    // Keep ordinary timer lateness from becoming permanent cadence drift. A
+    // long pause skips elapsed grid slots instead of issuing a catch-up loop.
+    const nextGridAt = this.#nextFreshWriteAt + this.#frameIntervalMs;
+    if (nextGridAt > now) {
+      this.#nextFreshWriteAt = nextGridAt;
+      return;
+    }
+    const missedIntervals =
+      Math.floor((now - nextGridAt) / this.#frameIntervalMs) + 1;
+    this.#nextFreshWriteAt =
+      nextGridAt + missedIntervals * this.#frameIntervalMs;
   }
 
   waitMs(now: number): number {
