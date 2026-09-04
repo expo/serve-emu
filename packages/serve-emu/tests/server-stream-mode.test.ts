@@ -5,6 +5,7 @@ import { GrpcCaptureDiagnosticsTracker } from "../src/grpc-session.ts";
 import { startServer } from "../src/server.ts";
 import type {
   GrpcImageMode,
+  InputSource,
   StreamMode,
 } from "../src/shared/api-contracts.ts";
 import type {
@@ -29,6 +30,7 @@ function fakeSession(
   serial: string,
   mode: StreamMode,
   grpcImageMode?: GrpcImageMode,
+  inputSource: InputSource = "scrcpy",
 ) {
   const end = deferred<null>();
   let closeCalls = 0;
@@ -40,6 +42,7 @@ function fakeSession(
   });
   const session: EmuSession = {
     mode,
+    inputSource,
     serial,
     meta: {
       deviceName: `${mode}:${serial}`,
@@ -107,6 +110,7 @@ const putMode = (
   captured: CapturedServer,
   mode: StreamMode,
   grpcImageMode?: GrpcImageMode,
+  inputSource?: InputSource,
 ): Promise<Response> =>
   request(captured, "/api/stream-mode", {
     method: "PUT",
@@ -114,6 +118,7 @@ const putMode = (
     body: JSON.stringify({
       mode,
       ...(grpcImageMode === undefined ? {} : { grpcImageMode }),
+      ...(inputSource === undefined ? {} : { inputSource }),
     }),
   });
 
@@ -391,6 +396,92 @@ describe("server stream source switching", () => {
     await started.stop();
   });
 
+  test("switches gRPC input atomically and preserves it through an encoder restart", async () => {
+    const opened: Array<{
+      mode: StreamMode;
+      inputSource: InputSource;
+      maxSize: number | undefined;
+    }> = [];
+    const captured: CapturedServer = { options: null };
+    const started = await startServer(
+      {
+        serial: "emulator-5554",
+        port: 3300,
+        streamMode: "grpc-screenshot",
+      },
+      {
+        openSession: async (options) => {
+          opened.push({
+            mode: options.mode,
+            inputSource: options.inputSource,
+            maxSize: options.maxSize,
+          });
+          return fakeSession(
+            options.serial,
+            options.mode,
+            options.grpcImageMode,
+            options.inputSource,
+          ).session;
+        },
+        serve: capturingServe(captured),
+      },
+    );
+
+    try {
+      expect(
+        await (await request(captured, "/api/stream-mode")).json(),
+      ).toMatchObject({
+        mode: "grpc-screenshot",
+        inputSource: "scrcpy",
+        sessionGeneration: 0,
+      });
+
+      const switched = await putMode(
+        captured,
+        "grpc-screenshot",
+        undefined,
+        "grpc",
+      );
+      expect(switched.status).toBe(200);
+      expect(await switched.json()).toMatchObject({
+        mode: "grpc-screenshot",
+        inputSource: "grpc",
+        sessionGeneration: 1,
+      });
+
+      const resized = await patchStreamSettings(captured, {
+        maxDimension: 720,
+      });
+      expect(resized.status).toBe(200);
+      expect(
+        await (await request(captured, "/api/stream-mode")).json(),
+      ).toMatchObject({
+        mode: "grpc-screenshot",
+        inputSource: "grpc",
+        sessionGeneration: 2,
+      });
+      expect(opened).toEqual([
+        {
+          mode: "grpc-screenshot",
+          inputSource: "scrcpy",
+          maxSize: SCRCPY_DEFAULTS.maxSize,
+        },
+        {
+          mode: "grpc-screenshot",
+          inputSource: "grpc",
+          maxSize: SCRCPY_DEFAULTS.maxSize,
+        },
+        {
+          mode: "grpc-screenshot",
+          inputSource: "grpc",
+          maxSize: 720,
+        },
+      ]);
+    } finally {
+      await started.stop();
+    }
+  });
+
   test("stages, publishes, rolls back, and idempotently reports a source", async () => {
     const initial = fakeSession("emulator-5554", "scrcpy");
     const grpc = fakeSession("emulator-5554", "grpc-screenshot");
@@ -421,6 +512,8 @@ describe("server stream source switching", () => {
       serial: "emulator-5554",
       mode: "scrcpy",
       grpcImageMode: "png",
+      inputSource: "scrcpy",
+      availableInputSources: ["scrcpy"],
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 0,
     });

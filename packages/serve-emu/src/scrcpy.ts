@@ -19,18 +19,26 @@ type ScrcpyMeta = {
 
 type ScrcpyProtocol = 3 | 4;
 
-export type ScrcpySession = {
-  transport: "scrcpy";
-  meta: ScrcpyMeta;
-  protocol: ScrcpyProtocol;
-  videoReader: FramedReader;
+type ScrcpyControlTransport = {
   controlSocket: Socket;
   proc: ChildProcess;
   scid: string;
   localPort: number;
   serial: string;
-  readFrame: () => Promise<VideoPacket | null>;
   close: () => Promise<void>;
+};
+
+export type ScrcpySession = ScrcpyControlTransport & {
+  transport: "scrcpy";
+  meta: ScrcpyMeta;
+  protocol: ScrcpyProtocol;
+  videoReader: FramedReader;
+  readFrame: () => Promise<VideoPacket | null>;
+};
+
+/** A scrcpy server with video and audio disabled, exposing only device control. */
+export type ScrcpyControlSession = ScrcpyControlTransport & {
+  transport: "scrcpy-control";
 };
 
 export type ScrcpyErrorCode =
@@ -884,10 +892,11 @@ export function parseVideoPreamble(buf: Buffer): {
   );
 }
 
-export async function startScrcpy(
+async function startScrcpyTransport(
   opts: StartOpts,
-  deps: ScrcpyDependencies = {},
-): Promise<ScrcpySession> {
+  deps: ScrcpyDependencies,
+  video: boolean,
+): Promise<ScrcpySession | ScrcpyControlSession> {
   const runtime = runtimeFor(deps);
   const timeouts = { ...DEFAULT_TIMEOUTS, ...deps.timeouts };
   const { serial } = opts;
@@ -1062,18 +1071,24 @@ export async function startScrcpy(
       `scid=${scid}`,
       "log_level=info",
       "audio=false",
+      `video=${video}`,
       "tunnel_forward=true",
       "control=true",
-      "send_dummy_byte=true",
-      "send_stream_meta=true",
-      "send_frame_meta=true",
-      "send_device_meta=true",
-      `max_size=${maxSize}`,
-      `video_bit_rate=${bitRate}`,
-      `max_fps=${maxFps}`,
-      ...(codecOptions.length > 0
-        ? [`video_codec_options=${codecOptions.join(",")}`]
+      `send_dummy_byte=${video}`,
+      `send_stream_meta=${video}`,
+      `send_frame_meta=${video}`,
+      `send_device_meta=${video}`,
+      ...(video
+        ? [
+            `max_size=${maxSize}`,
+            `video_bit_rate=${bitRate}`,
+            `max_fps=${maxFps}`,
+            ...(codecOptions.length > 0
+              ? [`video_codec_options=${codecOptions.join(",")}`]
+              : []),
+          ]
         : []),
+      "clipboard_autosync=false",
       "cleanup=true",
     ]);
     childSettled = false;
@@ -1118,14 +1133,16 @@ export async function startScrcpy(
         ),
     );
 
-    videoSock = await withDeadline(
-      runtime,
-      startupController.signal,
-      timeouts.connectMs,
-      "connecting scrcpy video socket",
-      (signal) => runtime.connect(localPort!, timeouts.connectMs, signal),
-    );
-    throwIfAborted(startupController.signal, "scrcpy startup aborted");
+    if (video) {
+      videoSock = await withDeadline(
+        runtime,
+        startupController.signal,
+        timeouts.connectMs,
+        "connecting scrcpy video socket",
+        (signal) => runtime.connect(localPort!, timeouts.connectMs, signal),
+      );
+      throwIfAborted(startupController.signal, "scrcpy startup aborted");
+    }
     controlSock = await withDeadline(
       runtime,
       startupController.signal,
@@ -1136,7 +1153,21 @@ export async function startScrcpy(
     throwIfAborted(startupController.signal, "scrcpy startup aborted");
     controlSock.on("data", () => {});
 
-    const reader = new FramedReader(videoSock);
+    if (!video) {
+      startupComplete = true;
+      return {
+        transport: "scrcpy-control",
+        controlSocket: controlSock,
+        proc,
+        scid,
+        localPort,
+        serial,
+        close: () =>
+          closeWithReason(new Error("scrcpy control session closed")),
+      };
+    }
+
+    const reader = new FramedReader(videoSock!);
     const preambleBytes = await withDeadline(
       runtime,
       startupController.signal,
@@ -1188,6 +1219,24 @@ export async function startScrcpy(
     }
     throw err;
   }
+}
+
+export async function startScrcpy(
+  opts: StartOpts,
+  deps: ScrcpyDependencies = {},
+): Promise<ScrcpySession> {
+  return (await startScrcpyTransport(opts, deps, true)) as ScrcpySession;
+}
+
+export async function startScrcpyControl(
+  opts: StartOpts,
+  deps: ScrcpyDependencies = {},
+): Promise<ScrcpyControlSession> {
+  return (await startScrcpyTransport(
+    opts,
+    deps,
+    false,
+  )) as ScrcpyControlSession;
 }
 
 /**

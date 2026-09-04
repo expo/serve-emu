@@ -11,7 +11,10 @@ import {
 } from "../src/middleware.ts";
 import type { RunningAvd } from "../src/emulator.ts";
 import type { ScrcpySession } from "../src/scrcpy.ts";
-import type { StreamMode } from "../src/shared/api-contracts.ts";
+import type {
+  InputSource,
+  StreamMode,
+} from "../src/shared/api-contracts.ts";
 import type { EmuSession } from "../src/stream-session.ts";
 
 type JsonObject = Record<string, unknown>;
@@ -44,9 +47,11 @@ function fakeApp(
   stopped: string[],
   mode: StreamMode = "scrcpy",
   statsSessionId = SESSION_ID,
+  inputSource: InputSource = "scrcpy",
 ): EmuApp {
   return {
-    session: { mode, meta: { deviceName: `Device ${serial}` } },
+    session: { mode, inputSource, meta: { deviceName: `Device ${serial}` } },
+    getInputSource: () => inputSource,
     isStreaming: () => true,
     health: () => ({ status: "streaming" }),
     webRtcStats: (sessionId: string) =>
@@ -96,6 +101,7 @@ function routerDependencies(state: {
   created: string[];
   stopped: string[];
   createdModes?: StreamMode[];
+  createdInputSources?: InputSource[];
 }): RouterDependencies {
   return {
     listDevices: async () =>
@@ -110,11 +116,13 @@ function routerDependencies(state: {
         .filter((running) => serials.has(running.serial))
         .map((running) => ({ ...running }));
     },
-    createApp: async ({ serial, streamMode }) => {
+    createApp: async ({ serial, streamMode, inputSource }) => {
       state.created.push(serial);
       const mode = streamMode ?? "scrcpy";
       state.createdModes?.push(mode);
-      return fakeApp(serial, state.stopped, mode);
+      const source = inputSource ?? "scrcpy";
+      state.createdInputSources?.push(source);
+      return fakeApp(serial, state.stopped, mode, SESSION_ID, source);
     },
     startEmulator: async ({ avd }) => {
       const serial = "emulator-5556";
@@ -481,6 +489,7 @@ function liveStreamSession(
   });
   return {
     mode,
+    inputSource: "scrcpy",
     serial: "emulator-5554",
     meta: {
       deviceName: `Pixel_8 (${mode})`,
@@ -702,6 +711,7 @@ describe("createRouter stream mode", () => {
       created: [] as string[],
       stopped: [] as string[],
       createdModes: [] as StreamMode[],
+      createdInputSources: [] as InputSource[],
     };
     const router = createRouter(
       { serial: "emulator-5554" },
@@ -731,6 +741,7 @@ describe("createRouter stream mode", () => {
       created: [] as string[],
       stopped: [] as string[],
       createdModes: [] as StreamMode[],
+      createdInputSources: [] as InputSource[],
     };
     const router = createRouter(
       { serial: "emulator-5554" },
@@ -746,6 +757,8 @@ describe("createRouter stream mode", () => {
       serial: "emulator-5554",
       mode: "scrcpy",
       grpcImageMode: "png",
+      inputSource: "scrcpy",
+      availableInputSources: ["scrcpy"],
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 0,
     });
@@ -771,14 +784,36 @@ describe("createRouter stream mode", () => {
       serial: "emulator-5554",
       mode: "grpc-screenshot",
       grpcImageMode: "png",
+      inputSource: "scrcpy",
+      availableInputSources: ["scrcpy", "grpc"],
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 1,
     });
     expect(state.createdModes).toEqual(["scrcpy", "grpc-screenshot"]);
+    expect(state.createdInputSources).toEqual(["scrcpy", "scrcpy"]);
     expect(state.stopped).toEqual(["emulator-5554"]);
+
+    const changedInput = await router.handleRequest(
+      put("/api/stream-mode", {
+        mode: "grpc-screenshot",
+        inputSource: "grpc",
+      }),
+    );
+    expect(changedInput.status).toBe(200);
+    expect(await responseJson(changedInput)).toMatchObject({
+      mode: "grpc-screenshot",
+      inputSource: "grpc",
+      sessionGeneration: 2,
+    });
+    expect(state.createdInputSources).toEqual([
+      "scrcpy",
+      "scrcpy",
+      "grpc",
+    ]);
 
     await router.stopAll();
     expect(state.stopped).toEqual([
+      "emulator-5554",
       "emulator-5554",
       "emulator-5554",
     ]);

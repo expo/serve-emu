@@ -34,7 +34,7 @@ Working:
 
 - Live H.264 video over WebSocket/WebCodecs or WebRTC, with an MSE fallback
 - Per-tab switching between WebSocket and WebRTC, with lazy WebRTC startup
-- Runtime switching between scrcpy and host-side gRPC screenshot capture on Android Emulators
+- Runtime switching between scrcpy and host-side gRPC screenshot capture on Android Emulators, with scrcpy or gRPC input while gRPC video is active
 - Runtime PNG/MMAP selection and redacted JSON stream-stat downloads in the UI
 - Tap, swipe, text, keyevent, Back, Home, Recents, and Power input
 - Keyboard passthrough in the browser UI: editing/navigation keys, Ctrl/Cmd shortcuts (select all, copy, paste, cut, undo, redo), and IME composition for CJK text
@@ -99,7 +99,7 @@ bun run packages/serve-emu/src/cli.ts
 ## CLI
 
 ```text
-serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode scrcpy|grpc-screenshot] [--grpc-image-mode png|mmap] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms] [--max-apk-upload-bytes N] [--max-media-upload-bytes N]
+serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode scrcpy|grpc-screenshot] [--grpc-image-mode png|mmap] [--input-source scrcpy|grpc] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms] [--max-apk-upload-bytes N] [--max-media-upload-bytes N]
 serve-emu --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
 serve-emu --avd <name> [--gpu <mode>] [--restart-avd]
 serve-emu --avd-list
@@ -113,8 +113,9 @@ serve-emu --running-avds
 | `--token` | none | Shared secret required on every data-bearing request. Auto-generated for non-loopback binds if omitted |
 | `--unsafe-no-auth` | false | Allow a non-loopback bind with **no** authentication (dangerous) |
 | `-s, --serial` | auto | adb device serial; required when multiple devices are online |
-| `--stream-mode` | `scrcpy` | Screen and input source: `scrcpy`, or emulator-only host capture through `grpc-screenshot` |
+| `--stream-mode` | `scrcpy` | Screen capture source: `scrcpy`, or emulator-only host capture through `grpc-screenshot` |
 | `--grpc-image-mode` | `png` | gRPC screenshot image delivery: compressed in-band `png`, or raw pixels through shared-memory `mmap`. The selected mode is strict; capture errors do not fall back to the other mode |
+| `--input-source` | `scrcpy` | Input transport for gRPC streaming: a control-only `scrcpy` server, or the emulator's `grpc` endpoint |
 | `--max-fps` | `60` | Cap source frame rate |
 | `--bit-rate` | `8000000` | H.264 bit rate in bps |
 | `--max-size` | `1280` | Downscale the longest edge to N pixels; `0` keeps native size. The default balances detail and throughput, especially for the host-side software encoder used by `grpc-screenshot` |
@@ -229,15 +230,17 @@ curl "$BASE/api/device-grid"
 curl "$BASE/api/stream-mode"
 curl -X PUT "$BASE/api/stream-mode" \
   -H 'Content-Type: application/json' \
-  -d '{"mode":"grpc-screenshot","grpcImageMode":"mmap"}'
+  -d '{"mode":"grpc-screenshot","grpcImageMode":"mmap","inputSource":"scrcpy"}'
 curl -X POST "$BASE/api/devices/select" \
   -H 'Content-Type: application/json' \
   -d '{"serial":"emulator-5554"}'
 ```
 
-`GET /api/stream-mode` reports `mode`, `grpcImageMode`, the available stream
-sources, and the active session generation. `PUT /api/stream-mode` accepts an
-optional `grpcImageMode` of `png` or `mmap` when `mode` is `grpc-screenshot`.
+`GET /api/stream-mode` reports `mode`, `grpcImageMode`, `inputSource`, the
+available stream and input sources, and the active session generation. `PUT
+/api/stream-mode` accepts an optional `grpcImageMode` of `png` or `mmap` and an
+optional `inputSource` of `scrcpy` or `grpc` when `mode` is `grpc-screenshot`.
+gRPC streaming defaults to the control-only scrcpy input transport.
 Changing either value stages one replacement capture atomically; an MMAP error
 is returned to the caller and never retried as PNG.
 
@@ -552,8 +555,10 @@ See the [protocol reference](docs/protocol.md) for the complete scrcpy v3/v4 fra
 4. The Bun server reads scrcpy's framed H.264 stream and publishes each access unit to active WebSocket viewers and, once requested, WebRTC viewers. Raw `/ws` clients receive Annex-B payloads unchanged; the built-in WebSocket UI opts into the 24-byte frame metadata header.
 5. The browser uses WebCodecs in a worker, falls back to MSE where necessary, or renders the WebRTC track into a `<video>`. Pointer events are normalized to unit coordinates and dispatched through the active source's ordered control channel.
 
-With `--stream-mode grpc-screenshot`, the emulator's gRPC endpoint
-provides images and accepts touch/key input on the host. `--grpc-image-mode png`
+With `--stream-mode grpc-screenshot`, the emulator's gRPC endpoint provides
+images while input defaults to a control-only scrcpy session and can be switched
+to emulator gRPC. Set the initial choice with `--input-source scrcpy|grpc`.
+`--grpc-image-mode png`
 requests compressed images in the gRPC stream, while `--grpc-image-mode mmap`
 requests raw RGB pixels through the emulator's shared-memory side channel.
 `serve-emu` uses the bearer token advertised by the emulator's discovery file

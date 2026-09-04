@@ -87,6 +87,17 @@ export function isStreamMode(value: unknown): value is StreamMode {
   );
 }
 
+/** Input transport used while the Android Emulator gRPC source provides video. */
+export const INPUT_SOURCES = ["scrcpy", "grpc"] as const;
+export type InputSource = (typeof INPUT_SOURCES)[number];
+export const DEFAULT_GRPC_INPUT_SOURCE: InputSource = "scrcpy";
+export function isInputSource(value: unknown): value is InputSource {
+  return (
+    typeof value === "string" &&
+    INPUT_SOURCES.some((source) => source === value)
+  );
+}
+
 /** Exact image delivery mode used by the emulator gRPC screenshot source. */
 export const GRPC_IMAGE_MODES = ["png", "mmap"] as const;
 export type GrpcImageMode = (typeof GRPC_IMAGE_MODES)[number];
@@ -166,11 +177,15 @@ export type StreamModeRequest =
       mode: "grpc-screenshot";
       /** Optional for backwards compatibility; omitted means keep the configured mode. */
       grpcImageMode?: GrpcImageMode;
+      /** Optional for backwards compatibility; omitted means keep the configured source. */
+      inputSource?: InputSource;
     };
 export type StreamModeResponse = ApiSuccess<{
   serial: string;
   mode: StreamMode;
   grpcImageMode: GrpcImageMode;
+  inputSource: InputSource;
+  availableInputSources: InputSource[];
   availableModes: StreamMode[];
   sessionGeneration: number;
 }>;
@@ -389,6 +404,7 @@ export type HealthResponse = {
   device: string;
   streamMode?: StreamMode;
   grpcImageMode?: GrpcImageMode;
+  inputSource?: InputSource;
   grpcCapture?: GrpcCaptureDiagnostics | null;
   codec: string;
   size: DeviceSize;
@@ -843,18 +859,33 @@ export function parseStreamModeRequest(value: unknown): StreamModeRequest {
         "stream mode request.grpcImageMode is available only with mode grpc-screenshot",
       );
     }
-    return { mode };
-  }
-  if (root.grpcImageMode === undefined) {
+    if (root.inputSource !== undefined) {
+      fail(
+        "stream mode request.inputSource is available only with mode grpc-screenshot",
+      );
+    }
     return { mode };
   }
   return {
     mode,
-    grpcImageMode: oneOf(
-      root.grpcImageMode,
-      GRPC_IMAGE_MODES,
-      "stream mode request.grpcImageMode",
-    ),
+    ...(root.grpcImageMode === undefined
+      ? {}
+      : {
+          grpcImageMode: oneOf(
+            root.grpcImageMode,
+            GRPC_IMAGE_MODES,
+            "stream mode request.grpcImageMode",
+          ),
+        }),
+    ...(root.inputSource === undefined
+      ? {}
+      : {
+          inputSource: oneOf(
+            root.inputSource,
+            INPUT_SOURCES,
+            "stream mode request.inputSource",
+          ),
+        }),
   };
 }
 
@@ -869,6 +900,30 @@ export function parseStreamModeResponse(value: unknown): StreamModeResponse {
     GRPC_IMAGE_MODES,
     "stream mode response.grpcImageMode",
   );
+  const inputSource = oneOf(
+    root.inputSource,
+    INPUT_SOURCES,
+    "stream mode response.inputSource",
+  );
+  if (!Array.isArray(root.availableInputSources)) {
+    fail("stream mode response.availableInputSources must be an array");
+  }
+  const availableInputSources = root.availableInputSources.map((value, index) =>
+    oneOf(
+      value,
+      INPUT_SOURCES,
+      `stream mode response.availableInputSources[${index}]`,
+    ),
+  );
+  if (availableInputSources.length === 0) {
+    fail("stream mode response.availableInputSources must not be empty");
+  }
+  if (new Set(availableInputSources).size !== availableInputSources.length) {
+    fail("stream mode response.availableInputSources must not contain duplicates");
+  }
+  if (!availableInputSources.includes(inputSource)) {
+    fail("stream mode response.inputSource must be available");
+  }
   if (!Array.isArray(root.availableModes)) {
     fail("stream mode response.availableModes must be an array");
   }
@@ -902,6 +957,8 @@ export function parseStreamModeResponse(value: unknown): StreamModeResponse {
     serial,
     mode,
     grpcImageMode,
+    inputSource,
+    availableInputSources,
     availableModes,
     sessionGeneration,
   };
@@ -1470,6 +1527,15 @@ export function parseHealthResponse(value: unknown): HealthResponse {
             root.grpcImageMode,
             GRPC_IMAGE_MODES,
             "health response.grpcImageMode",
+          ),
+        }),
+    ...(root.inputSource === undefined
+      ? {}
+      : {
+          inputSource: oneOf(
+            root.inputSource,
+            INPUT_SOURCES,
+            "health response.inputSource",
           ),
         }),
     ...(root.grpcCapture === undefined

@@ -11,6 +11,7 @@ import {
 import type {
   GrpcCaptureDiagnostics,
   GrpcImageMode,
+  InputSource,
   StreamMode,
 } from "./shared/api-contracts.ts";
 import { isAbnormalExit, procExitDetail } from "./session-status.ts";
@@ -45,6 +46,7 @@ export type EmuSessionDiagnostics = {
  */
 export type EmuSession = {
   readonly mode: StreamMode;
+  readonly inputSource: InputSource;
   readonly serial: string;
   readonly meta: StreamMeta;
   readonly controls: ControlInputQueue;
@@ -63,6 +65,8 @@ export type StartEmuSessionOptions = StartOpts & {
   mode: StreamMode;
   /** Exact emulator screenshot image mode. Capture never silently falls back. */
   grpcImageMode: GrpcImageMode;
+  /** Exact input source. scrcpy capture always requires scrcpy input. */
+  inputSource: InputSource;
 };
 
 export async function startEmuSession(
@@ -79,6 +83,9 @@ export async function startEmuSession(
   if (options.mode !== "scrcpy") {
     const exhaustive: never = options.mode;
     throw new Error(`unsupported stream mode ${String(exhaustive)}`);
+  }
+  if (options.inputSource !== "scrcpy") {
+    throw new Error("scrcpy streaming requires scrcpy input");
   }
   return prepareDecodableScrcpySession(
     await startScrcpy(options),
@@ -172,6 +179,7 @@ export function adaptScrcpySession(
 
   return {
     mode: "scrcpy",
+    inputSource: "scrcpy",
     serial: raw.serial,
     meta: raw.meta,
     controls,
