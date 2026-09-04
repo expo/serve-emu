@@ -1754,6 +1754,13 @@ export async function startGrpcSession(
   let scrcpyControl: ScrcpyControlSession | null = null;
   let removeScrcpyControlListeners: (() => void) | null = null;
   let controls: ControlInputQueue | null = null;
+  const scrcpyControlStartup =
+    inputSource === "scrcpy"
+      ? openScrcpyControl({ serial, signal: lifetime.signal })
+      : null;
+  // A later gRPC startup step may fail before this promise is awaited. Keep
+  // the speculative startup rejection handled while preserving it for await.
+  void scrcpyControlStartup?.catch(() => {});
 
   const wakeReaders = () => {
     while (waiters.length) waiters.shift()!(null);
@@ -2210,7 +2217,13 @@ export async function startGrpcSession(
     const encoderClose = encoderLifecycle?.close() ?? Promise.resolve();
     removeScrcpyControlListeners?.();
     removeScrcpyControlListeners = null;
-    const scrcpyControlClose = scrcpyControl?.close() ?? Promise.resolve();
+    const scrcpyControlClose =
+      scrcpyControl?.close() ??
+      scrcpyControlStartup?.then(
+        (session) => session.close(),
+        () => {},
+      ) ??
+      Promise.resolve();
     scrcpyControl = null;
     listeners.clear();
     packetQueue.clear();
@@ -2296,10 +2309,11 @@ export async function startGrpcSession(
       },
     });
     if (inputSource === "scrcpy") {
-      const controlSession = await openScrcpyControl({
-        serial,
-        signal: lifetime.signal,
-      });
+      if (!scrcpyControlStartup) {
+        throw new Error("scrcpy control startup was not initialized");
+      }
+      const controlSession = await scrcpyControlStartup;
+      throwIfAborted(lifetime.signal, "gRPC screenshot startup aborted");
       scrcpyControl = controlSession;
       const onControlError = (error: Error) =>
         emitFatal({

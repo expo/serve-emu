@@ -1087,7 +1087,8 @@ async function startScrcpyTransport(
               ? [`video_codec_options=${codecOptions.join(",")}`]
               : []),
           ]
-        : ["clipboard_autosync=false"]),
+        : []),
+      "clipboard_autosync=false",
       "cleanup=true",
     ]);
     childSettled = false;

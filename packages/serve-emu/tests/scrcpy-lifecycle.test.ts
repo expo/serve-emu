@@ -420,6 +420,7 @@ describe("scrcpy async lifecycle", () => {
       "video_bit_rate=8000000",
       "max_fps=60",
       "video_codec_options=i-frame-interval=10",
+      "clipboard_autosync=false",
       "cleanup=true",
     ]);
     expect(harness.state.pushCount).toBe(1);

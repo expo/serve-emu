@@ -23,9 +23,12 @@ import {
 } from "./stream-settings.ts";
 import packageJson from "../package.json";
 import {
+  DEFAULT_GRPC_INPUT_SOURCE,
   DEFAULT_GRPC_IMAGE_MODE,
   GRPC_IMAGE_MODES,
+  INPUT_SOURCES,
   isGrpcImageMode,
+  isInputSource,
   isStreamMode,
   STREAM_MODES,
 } from "./shared/api-contracts.ts";
@@ -46,6 +49,7 @@ const { values } = parseArgs({
     "repeat-frame-ms": { type: "string", default: String(SCRCPY_DEFAULTS.repeatFrameMs) },
     "stream-mode": { type: "string" },
     "grpc-image-mode": { type: "string", default: DEFAULT_GRPC_IMAGE_MODE },
+    "input-source": { type: "string", default: DEFAULT_GRPC_INPUT_SOURCE },
     transport: { type: "string", default: "websocket" },
     "stun-url": { type: "string" },
     "turn-url": { type: "string" },
@@ -180,7 +184,7 @@ if (values.help) {
   console.log(`serve-emu — host an Android device over WebSocket/WebRTC
 
 Usage:
-  serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode <scrcpy|grpc-screenshot>] [--grpc-image-mode <png|mmap>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms]
+  serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--stream-mode <scrcpy|grpc-screenshot>] [--grpc-image-mode <png|mmap>] [--input-source <scrcpy|grpc>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms]
   serve-emu --transport webrtc [--stun-url url[,url...]] [--turn-url url[,url...] --turn-username user --turn-credential pass]
   serve-emu --avd <name> [--restart-avd]
   serve-emu --avd-list
@@ -217,7 +221,7 @@ Options:
                          (16 ≈ steady 60fps at the cost of extra CPU/bandwidth;
                          0 keeps source defaults: scrcpy 100ms, gRPC 500ms)
       --stream-mode <scrcpy|grpc-screenshot>
-                         Screen and input source (default: scrcpy). The gRPC
+                         Screen capture source (default: scrcpy). The gRPC
                          screenshot source captures and encodes on the emulator
                          host and is available only for Android Emulators.
       --grpc-image-mode <png|mmap>
@@ -225,6 +229,10 @@ Options:
                          compressed images in-band; MMAP uses shared memory for
                          raw pixels. The selected mode is strict: capture errors
                          do not fall back to the other mode.
+      --input-source <scrcpy|grpc>
+                         Input transport for gRPC streaming (default: scrcpy).
+                         scrcpy runs a control-only server; grpc sends input
+                         through the emulator's gRPC endpoint.
       --transport <websocket|webrtc>
                          Initial browser video transport (default: websocket).
                          Each browser tab can switch transports in the UI.
@@ -299,6 +307,14 @@ async function main() {
     );
   }
   const grpcImageMode = requestedGrpcImageMode;
+  const requestedInputSource =
+    stringOption("input-source") ?? DEFAULT_GRPC_INPUT_SOURCE;
+  if (!isInputSource(requestedInputSource)) {
+    throw new Error(
+      `--input-source must be one of: ${INPUT_SOURCES.join(", ")}. Received "${requestedInputSource}".`,
+    );
+  }
+  const inputSource = requestedInputSource;
 
   let emulatorLaunch: Awaited<ReturnType<typeof startEmulator>> | null = null;
   const serial = values.avd
@@ -384,6 +400,7 @@ async function main() {
     repeatFrameMs,
     streamMode,
     grpcImageMode,
+    inputSource,
     streamSettings,
     maxApkUploadBytes,
     maxMediaUploadBytes,

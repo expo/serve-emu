@@ -1171,6 +1171,11 @@ describe("startGrpcSession integration", () => {
     const encoders: FakeGrpcEncoder[] = [];
     const packets: Buffer[] = [];
     let controlCloseCalls = 0;
+    let probeStarted = false;
+    client.getScreenshot = async () => {
+      probeStarted = true;
+      return client.probe;
+    };
     const controlSocket = Object.assign(new EventEmitter(), {
       destroyed: false,
       writable: true,
@@ -1181,7 +1186,22 @@ describe("startGrpcSession integration", () => {
       },
     });
     const controlProcess = new EventEmitter();
-    const session = await startGrpcSession(
+    const controlSession = {
+      transport: "scrcpy-control",
+      serial: "emulator-5554",
+      scid: "00000001",
+      localPort: 27_183,
+      controlSocket,
+      proc: controlProcess,
+      async close() {
+        controlCloseCalls++;
+      },
+    } as unknown as ScrcpyControlSession;
+    let resolveControl!: (session: ScrcpyControlSession) => void;
+    const controlReady = new Promise<ScrcpyControlSession>((resolve) => {
+      resolveControl = resolve;
+    });
+    const starting = startGrpcSession(
       {
         serial: "emulator-5554",
         mode: "grpc-screenshot",
@@ -1191,20 +1211,13 @@ describe("startGrpcSession integration", () => {
       {
         readDisplaySizeSignal: async () => "physical:4x6",
         runtime: integrationRuntime(client, encoders),
-        startScrcpyControl: async () =>
-          ({
-            transport: "scrcpy-control",
-            serial: "emulator-5554",
-            scid: "00000001",
-            localPort: 27_183,
-            controlSocket,
-            proc: controlProcess,
-            async close() {
-              controlCloseCalls++;
-            },
-          }) as unknown as ScrcpyControlSession,
+        startScrcpyControl: () => controlReady,
       },
     );
+    await waitFor(() => probeStarted);
+    expect(controlCloseCalls).toBe(0);
+    resolveControl(controlSession);
+    const session = await starting;
 
     const gesture = { type: "tap", x: 0.25, y: 0.5 } as const;
     await session.controls.enqueue(gesture, { width: 2, height: 3 }).completion;

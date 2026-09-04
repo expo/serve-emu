@@ -47,7 +47,7 @@ function fakeApp(
   stopped: string[],
   mode: StreamMode = "scrcpy",
   statsSessionId = SESSION_ID,
-  inputSource: InputSource = mode === "grpc-screenshot" ? "grpc" : "scrcpy",
+  inputSource: InputSource = "scrcpy",
 ): EmuApp {
   return {
     session: { mode, inputSource, meta: { deviceName: `Device ${serial}` } },
@@ -489,7 +489,7 @@ function liveStreamSession(
   });
   return {
     mode,
-    inputSource: mode === "grpc-screenshot" ? "grpc" : "scrcpy",
+    inputSource: "scrcpy",
     serial: "emulator-5554",
     meta: {
       deviceName: `Pixel_8 (${mode})`,

@@ -1850,16 +1850,13 @@ function grpcImageModeForApp(
   return readMode?.() ?? fallback;
 }
 
-function inputSourceForApp(
-  app: EmuApp,
-  fallback: InputSource,
-): InputSource {
+function inputSourceForApp(app: EmuApp): InputSource {
   const readSource = (
     app as EmuApp & {
       getInputSource?: () => InputSource;
     }
   ).getInputSource;
-  return readSource?.() ?? streamSessionForApp(app).inputSource ?? fallback;
+  return readSource?.() ?? streamSessionForApp(app).inputSource;
 }
 
 export function createApp(
@@ -2218,10 +2215,7 @@ export function createRouter(
       defaults.inputSource ??
       DEFAULT_GRPC_INPUT_SOURCE;
     const currentInputSource = current
-      ? inputSourceForApp(
-          current,
-          currentMode === "grpc-screenshot" ? configuredInputSource : "scrcpy",
-        )
+      ? inputSourceForApp(current)
       : currentMode === "grpc-screenshot"
         ? configuredInputSource
         : "scrcpy";
@@ -2374,14 +2368,7 @@ export function createRouter(
         defaults.grpcImageMode ??
         DEFAULT_GRPC_IMAGE_MODE,
     ),
-    inputSource: inputSourceForApp(
-      app,
-      streamSessionForApp(app).mode === "grpc-screenshot"
-        ? inputSourceOverrides.get(serial) ??
-          defaults.inputSource ??
-          DEFAULT_GRPC_INPUT_SOURCE
-        : "scrcpy",
-    ),
+    inputSource: inputSourceForApp(app),
     availableInputSources:
       streamSessionForApp(app).mode === "grpc-screenshot"
         ? [...INPUT_SOURCES]

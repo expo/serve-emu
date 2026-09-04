@@ -16,6 +16,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
   a CLI source flag, a runtime HTTP API, and a browser UI source selector.
 - Add strict PNG and shared-memory MMAP image modes for gRPC capture, selectable
   through configuration, the CLI, runtime API, and browser UI.
+- Add selectable scrcpy and emulator gRPC input transports for gRPC screenshot
+  streams through configuration, the CLI, runtime API, and browser UI.
 
 ### Changed
 
@@ -23,6 +25,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
   while integrating upstream runtime and tooling improvements.
 - Restore the documented root, middleware, stream-socket, and stream-settings
   package exports for the Expo integration.
+- Default gRPC screenshot streams to a control-only scrcpy process (video and
+  audio disabled) because its input protocol supports the established control
+  semantics; emulator gRPC input remains available when avoiding that extra
+  process is preferable.
 
 ## 0.0.5 - 2026-07-12
 
