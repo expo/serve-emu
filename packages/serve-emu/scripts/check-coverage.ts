@@ -1,6 +1,5 @@
 const CRITICAL_SOURCE_FILES = [
   "src/server.ts",
-  "src/server/api-boundary.ts",
   "src/server/backpressure.ts",
   "src/server/session-cache.ts",
   "src/server/session-scope.ts",
