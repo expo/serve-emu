@@ -2551,21 +2551,23 @@ export function createRouter(
         const camera = requestedCamera === true;
         const launch = await launchEmulator({ avd, camera });
         stoppingSerials.delete(launch.serial);
-        // Authoritative in both directions, and before any early return:
-        // emulator serials are recycled, so a launch without feeds has to
-        // clear whatever claim an earlier launch left on the same serial.
-        if (launch.cameraFeed) cameraWiredSerials.add(launch.serial);
-        else cameraWiredSerials.delete(launch.serial);
-        // Only covers launches this router owns. An emulator started
-        // elsewhere, or this one killed after the host exits, is not
-        // observable here; see the camera docs.
-        launch.proc?.once("exit", () => {
-          cameraWiredSerials.delete(launch.serial);
-        });
+        // Only a launch this router owns tells us anything. Emulator serials
+        // are recycled, so an owned launch without feeds clears whatever claim
+        // an earlier one left on the same serial, while a reattach to a
+        // running emulator knows nothing about the flags it started with.
+        // Neither sees an emulator started elsewhere, or this one killed after
+        // the host exits; see the camera docs.
+        if (launch.ownsProcess) {
+          if (launch.cameraFeed) cameraWiredSerials.add(launch.serial);
+          else cameraWiredSerials.delete(launch.serial);
+          launch.proc?.once("exit", () => {
+            cameraWiredSerials.delete(launch.serial);
+          });
+        }
         if (camera && !launch.cameraFeed) {
           throw new Error(
             `AVD "${avd}" is already running, so its camera source cannot be changed; ` +
-              "the emulator only reads that flag at startup. Stop it first, or start it with restartAvd.",
+              "the emulator only reads that flag at startup. Stop it with POST /api/avds/stop first.",
           );
         }
         const select = payload.select !== false;
@@ -2582,7 +2584,7 @@ export function createRouter(
           });
         } catch (err) {
           launch.stop();
-          cameraWiredSerials.delete(launch.serial);
+          if (launch.ownsProcess) cameraWiredSerials.delete(launch.serial);
           throw err;
         }
       } catch (err) {
