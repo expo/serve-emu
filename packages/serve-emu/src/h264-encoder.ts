@@ -2,6 +2,7 @@ import {
   spawn,
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
+import { availableParallelism } from "node:os";
 import {
   execText,
   type ExecOpts,
@@ -538,12 +539,50 @@ export const FFMPEG_ENCODER_FOR_CODEC: Readonly<Record<VideoCodec, string>> = {
   vp9: "libvpx-vp9",
 };
 
+/**
+ * Match WebRTC's VP8 area/core tiers instead of oversubscribing libvpx's
+ * row-based workers on small portrait streams.
+ */
+export function vp8ThreadCount(
+  width: number,
+  height: number,
+  parallelism = availableParallelism(),
+): number {
+  positiveInteger(width, "VP8 width", MAX_DIMENSION);
+  positiveInteger(height, "VP8 height", MAX_DIMENSION);
+  positiveInteger(parallelism, "VP8 parallelism", MAX_DIMENSION);
+  const pixels = width * height;
+  if (pixels >= 1_920 * 1_080 && parallelism > 8) return 8;
+  if (pixels > 1_280 * 960 && parallelism >= 6) return 3;
+  if (pixels > 640 * 480 && parallelism >= 3) {
+    return parallelism >= 6 ? 3 : 2;
+  }
+  return 1;
+}
+
+export type FfmpegOutputArgsOptions = {
+  codec: VideoCodec;
+  fps: number;
+  bitRate: number;
+  keyFrameInterval: number;
+  encodedWidth: number;
+  encodedHeight: number;
+  /** Deterministic override for tests; production uses host availability. */
+  parallelism?: number;
+};
+
 export function ffmpegOutputArgs(
-  codec: VideoCodec,
-  fps: number,
-  bitRate: number,
-  keyFrameInterval: number,
+  options: FfmpegOutputArgsOptions,
 ): string[] {
+  const {
+    codec,
+    fps,
+    bitRate,
+    keyFrameInterval,
+    encodedWidth,
+    encodedHeight,
+    parallelism,
+  } = options;
   if (!isVideoCodec(codec)) {
     throw new RangeError(`unsupported video codec ${String(codec)}`);
   }
@@ -595,9 +634,38 @@ export function ffmpegOutputArgs(
     ];
   }
 
+  if (codec === "vp8") {
+    return [
+      "-c:v",
+      FFMPEG_ENCODER_FOR_CODEC.vp8,
+      "-threads",
+      String(vp8ThreadCount(encodedWidth, encodedHeight, parallelism)),
+      "-deadline",
+      "realtime",
+      "-cpu-used",
+      "16",
+      "-static-thresh",
+      "1000",
+      "-lag-in-frames",
+      "0",
+      "-auto-alt-ref",
+      "0",
+      "-error-resilient",
+      "1",
+      "-g",
+      String(keyint),
+      ...rateControl,
+      "-f",
+      "ivf",
+      "-flush_packets",
+      "1",
+      "pipe:1",
+    ];
+  }
+
   return [
     "-c:v",
-    FFMPEG_ENCODER_FOR_CODEC[codec],
+    FFMPEG_ENCODER_FOR_CODEC.vp9,
     "-deadline",
     "realtime",
     "-cpu-used",
@@ -776,12 +844,14 @@ export class VideoEncoder {
         videoFilter(this.quarterTurn),
         "-pix_fmt",
         "yuv420p",
-        ...ffmpegOutputArgs(
-          opts.codec,
-          opts.fps,
-          opts.bitRate,
-          opts.keyFrameInterval,
-        ),
+        ...ffmpegOutputArgs({
+          codec: opts.codec,
+          fps: opts.fps,
+          bitRate: opts.bitRate,
+          keyFrameInterval: opts.keyFrameInterval,
+          encodedWidth: this.encodedWidth,
+          encodedHeight: this.encodedHeight,
+        }),
       ],
       { stdio: ["pipe", "pipe", "pipe"] },
     );

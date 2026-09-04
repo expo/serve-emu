@@ -13,6 +13,7 @@ import {
   resolveFfmpeg,
   VideoEncoder,
   videoFilter,
+  vp8ThreadCount,
   type H264EncoderOpts,
   type VideoCodec,
 } from "../src/h264-encoder.ts";
@@ -599,7 +600,15 @@ describe("H264Encoder validation", () => {
   });
 
   test("selects codec-specific low-latency FFmpeg output", () => {
-    const h264 = ffmpegOutputArgs("h264", 60, 8_000_000, 10);
+    const base = {
+      fps: 60,
+      bitRate: 8_000_000,
+      keyFrameInterval: 10,
+      encodedWidth: 436,
+      encodedHeight: 980,
+      parallelism: 8,
+    };
+    const h264 = ffmpegOutputArgs({ codec: "h264", ...base });
     expect(h264.join(" ")).toContain(
       "-c:v libx264 -preset ultrafast -tune zerolatency",
     );
@@ -608,14 +617,33 @@ describe("H264Encoder validation", () => {
       "keyint=600:min-keyint=600:scenecut=0:repeat-headers=1:aud=1",
     );
 
-    for (const codec of ["vp8", "vp9"] as const) {
-      const args = ffmpegOutputArgs(codec, 60, 8_000_000, 10);
-      expect(args.join(" ")).toContain(
-        `-c:v ${FFMPEG_ENCODER_FOR_CODEC[codec]} -deadline realtime -cpu-used 8 -lag-in-frames 0 -auto-alt-ref 0 -error-resilient 1 -g 600`,
-      );
-      expect(args.join(" ")).toContain("-f ivf -flush_packets 1");
-    }
+    const vp8 = ffmpegOutputArgs({ codec: "vp8", ...base });
+    expect(vp8.join(" ")).toContain(
+      "-c:v libvpx -threads 3 -deadline realtime -cpu-used 16 -static-thresh 1000 -lag-in-frames 0 -auto-alt-ref 0 -error-resilient 1 -g 600",
+    );
+    expect(vp8.join(" ")).toContain("-f ivf -flush_packets 1");
+
+    const vp9 = ffmpegOutputArgs({ codec: "vp9", ...base });
+    expect(vp9.join(" ")).toContain(
+      "-c:v libvpx-vp9 -deadline realtime -cpu-used 8 -lag-in-frames 0 -auto-alt-ref 0 -error-resilient 1 -g 600",
+    );
+    expect(vp9.join(" ")).not.toContain("-threads");
+    expect(vp9.join(" ")).not.toContain("-static-thresh");
+    expect(vp9.join(" ")).toContain("-f ivf -flush_packets 1");
   });
+
+  test.each([
+    { width: 640, height: 480, parallelism: 8, expected: 1 },
+    { width: 436, height: 980, parallelism: 8, expected: 3 },
+    { width: 436, height: 980, parallelism: 3, expected: 2 },
+    { width: 1281, height: 961, parallelism: 6, expected: 3 },
+    { width: 1920, height: 1080, parallelism: 9, expected: 8 },
+  ])(
+    "selects $expected VP8 thread(s) for width=$width height=$height parallelism=$parallelism",
+    ({ width, height, parallelism, expected }) => {
+      expect(vp8ThreadCount(width, height, parallelism)).toBe(expected);
+    },
+  );
 
   test("validates PNG frame boundaries before writing to ffmpeg", async () => {
     const encoder = new H264Encoder({
