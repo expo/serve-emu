@@ -504,7 +504,7 @@ export type ApiContractMap = {
   };
   "/api/avds/start": {
     POST: EndpointContract<
-      /** `camera` is honoured by the standalone server; the middleware ignores it. */
+      /** `camera` is honoured by the standalone server and by the middleware. */
       { avd: string; select?: boolean; camera?: boolean },
       AvdStartResponse
     >;
@@ -583,6 +583,7 @@ export type ApiContractMap = {
   };
   "/api/camera": { GET: EndpointContract<undefined, CameraStatusResponse> };
   "/api/camera/image": {
+    GET: EndpointContract<undefined, BinaryPngResponse>;
     POST: EndpointContract<BinaryPngResponse, CameraStatusResponse>;
     DELETE: EndpointContract<undefined, CameraStatusResponse>;
   };
@@ -1396,6 +1397,11 @@ function parseScreenshotResponse(value: unknown): ScreenshotBase64Response | Bin
   return value instanceof Uint8Array ? value : parseScreenshotBase64Response(value);
 }
 
+function parseCameraImageResponse(value: unknown): BinaryPngResponse {
+  if (value instanceof Uint8Array) return value;
+  return fail("camera image response must be PNG bytes");
+}
+
 function parseFrameStatsSummary(value: unknown): FrameStatsSummary | null {
   if (value === null) return null;
   const item = record(value, "health response.frameStats");
@@ -1666,6 +1672,7 @@ export const API_SUCCESS_PARSERS = {
   "/api/route/control": { POST: parseRouteMutationResponse },
   "/api/camera": { GET: parseCameraStatusResponse },
   "/api/camera/image": {
+    GET: parseCameraImageResponse,
     POST: parseCameraStatusResponse,
     DELETE: parseCameraStatusResponse,
   },

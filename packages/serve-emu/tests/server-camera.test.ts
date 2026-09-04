@@ -71,6 +71,12 @@ function postImage(
   });
 }
 
+async function readWired(captured: CapturedServer): Promise<boolean> {
+  return parseCameraStatusResponse(
+    await (await request(captured, "/api/camera")).json(),
+  ).camera.wiredAtLaunch;
+}
+
 async function withServer(
   cameraSerial: string | undefined,
   run: (captured: CapturedServer) => Promise<void>,
@@ -178,9 +184,6 @@ describe("standalone server camera image API", () => {
       { serial: LAUNCHED, proc: null, ownsProcess: true, cameraFeed: true, stop: () => {} },
       { serial: LAUNCHED, proc: null, ownsProcess: true, cameraFeed: false, stop: () => {} },
     ];
-    const readWired = async (captured: CapturedServer) =>
-      parseCameraStatusResponse(await (await request(captured, "/api/camera")).json())
-        .camera.wiredAtLaunch;
 
     await withServer(
       undefined,
@@ -210,15 +213,12 @@ describe("standalone server camera image API", () => {
     );
   });
 
-  test("clears a stale claim even when the reused-AVD launch is refused", async () => {
-    const RECYCLED = "emulator-5556";
+  test("keeps the claim when the reused-AVD camera launch is refused", async () => {
+    const RUNNING = "emulator-5556";
     const launches: EmulatorLaunch[] = [
-      { serial: RECYCLED, proc: null, ownsProcess: true, cameraFeed: true, stop: () => {} },
-      { serial: RECYCLED, proc: null, ownsProcess: false, cameraFeed: false, stop: () => {} },
+      { serial: RUNNING, proc: null, ownsProcess: true, cameraFeed: true, stop: () => {} },
+      { serial: RUNNING, proc: null, ownsProcess: false, cameraFeed: false, stop: () => {} },
     ];
-    const readWired = async (captured: CapturedServer) =>
-      parseCameraStatusResponse(await (await request(captured, "/api/camera")).json())
-        .camera.wiredAtLaunch;
 
     await withServer(
       undefined,
@@ -233,17 +233,50 @@ describe("standalone server camera image API", () => {
         expect((await start("WithCamera")).status).toBe(200);
         expect(await readWired(captured)).toBe(true);
 
-        // Same serial, now already running so no feeds can be attached. The
-        // request is refused, and the stale claim must not survive the refusal.
+        // Same emulator, now reached by reattach, so no feeds can be attached.
+        // The refusal leaves the running instance's feeds and its claim alone.
         const refused = await start("AlreadyUp");
         expect(refused.status).toBe(400);
-        expect((await refused.json()).error).toContain("already running");
-        expect(await readWired(captured)).toBe(false);
+        expect((await refused.json()).error).toContain("POST /api/avds/stop");
+        expect(await readWired(captured)).toBe(true);
       },
       {
         listDevices: async () => [
           { serial: SERIAL, state: "device" },
-          { serial: RECYCLED, state: "device" },
+          { serial: RUNNING, state: "device" },
+        ],
+        startEmulator: async () => launches.shift()!,
+      },
+    );
+  });
+
+  test("keeps the claim when a plain start reattaches to a running AVD", async () => {
+    const RUNNING = "emulator-5556";
+    const launches: EmulatorLaunch[] = [
+      { serial: RUNNING, proc: null, ownsProcess: true, cameraFeed: true, stop: () => {} },
+      { serial: RUNNING, proc: null, ownsProcess: false, cameraFeed: false, stop: () => {} },
+    ];
+
+    await withServer(
+      undefined,
+      async (captured) => {
+        const start = (avd: string, camera: boolean) =>
+          request(captured, "/api/avds/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ avd, camera, select: true }),
+          });
+
+        expect((await start("WithCamera", true)).status).toBe(200);
+        expect(await readWired(captured)).toBe(true);
+
+        expect((await start("WithCamera", false)).status).toBe(200);
+        expect(await readWired(captured)).toBe(true);
+      },
+      {
+        listDevices: async () => [
+          { serial: SERIAL, state: "device" },
+          { serial: RUNNING, state: "device" },
         ],
         startEmulator: async () => launches.shift()!,
       },
@@ -318,15 +351,30 @@ describe("standalone server camera image API", () => {
     });
   });
 
-  test("rejects an unknown facing and an unsupported method", async () => {
+  test("serves the stored PNG back and rejects an unknown facing or method", async () => {
     await withServer(SERIAL, async (captured) => {
+      const missing = await request(captured, "/api/camera/image?facing=front");
+      expect(missing.status).toBe(404);
+
+      const png = solidPng(48, 36, [9, 8, 7]);
+      expect(
+        (await postImage(captured, Uint8Array.from(png), "?facing=front")).status,
+      ).toBe(200);
+
+      const served = await request(captured, "/api/camera/image?facing=front");
+      expect(served.status).toBe(200);
+      expect(served.headers.get("Content-Type")).toBe("image/png");
+      expect(new Uint8Array(await served.arrayBuffer())).toEqual(
+        Uint8Array.from(png),
+      );
+
       const bad = await postImage(captured, Uint8Array.from(placeholderCameraImage().png), "?facing=selfie");
       expect(bad.status).toBe(400);
       expect((await bad.json()).error).toContain("facing must be one of");
 
       expect((await request(captured, "/api/camera", { method: "POST" })).status).toBe(405);
       expect(
-        (await request(captured, "/api/camera/image", { method: "GET" })).status,
+        (await request(captured, "/api/camera/image", { method: "PUT" })).status,
       ).toBe(405);
     });
   });

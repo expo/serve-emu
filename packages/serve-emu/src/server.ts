@@ -2,13 +2,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import type { ServerWebSocket } from "bun";
-import {
-  clearCameraImage,
-  MAX_CAMERA_IMAGE_BYTES,
-  parseCameraFacing,
-  readCameraStatus,
-  setCameraImage,
-} from "./camera.ts";
+import { handleCameraRequest } from "./camera.ts";
 import { getExecSnapshot } from "./exec.ts";
 import {
   getFontScale,
@@ -120,11 +114,7 @@ import {
   MultipartUploadError,
   stageMultipartUpload,
 } from "./multipart-upload.ts";
-import {
-  HttpBodyError,
-  readBodyLimited,
-  readJsonLimited,
-} from "./request-body.ts";
+import { HttpBodyError, readJsonLimited } from "./request-body.ts";
 import {
   MAX_UPLOAD_QUEUE_TIMEOUT_MS,
   UploadManager,
@@ -649,8 +639,6 @@ export async function startServer(
   const cameraWiredSerials = new Set<string>(
     opts.cameraSerial ? [opts.cameraSerial] : [],
   );
-  const cameraStatus = (serial: string) =>
-    readCameraStatus(serial, cameraWiredSerials.has(serial));
 
   const health = (context = sessions.current) => {
     const now = recoveryClock.now();
@@ -2223,28 +2211,30 @@ export async function startServer(
           }
           const camera = requestedCamera === true;
           const launch = await launchEmulator({ avd: avd.trim(), camera });
-          // Authoritative in both directions, and before any early return:
-          // emulator serials are recycled, so a launch without feeds has to
-          // clear whatever claim an earlier launch left on the same serial.
-          if (launch.cameraFeed) cameraWiredSerials.add(launch.serial);
-          else cameraWiredSerials.delete(launch.serial);
-          // Only covers launches this server owns. An emulator started
-          // elsewhere, or this one killed after the server exits, is not
-          // observable here; see the camera docs.
-          launch.proc?.once("exit", () => {
-            cameraWiredSerials.delete(launch.serial);
-          });
+          // Only a launch this server owns tells us anything. Emulator serials
+          // are recycled, so an owned launch without feeds clears whatever
+          // claim an earlier one left on the same serial, while a reattach to
+          // a running emulator knows nothing about the flags it started with.
+          // Neither sees an emulator started elsewhere, or this one killed
+          // after the server exits; see the camera docs.
+          if (launch.ownsProcess) {
+            if (launch.cameraFeed) cameraWiredSerials.add(launch.serial);
+            else cameraWiredSerials.delete(launch.serial);
+            launch.proc?.once("exit", () => {
+              cameraWiredSerials.delete(launch.serial);
+            });
+          }
           if (camera && !launch.cameraFeed) {
             throw new Error(
               `AVD "${avd.trim()}" is already running, so its camera source cannot be changed; ` +
-                "the emulator only reads that flag at startup. Stop it first, or start it with restartAvd.",
+                "the emulator only reads that flag at startup. Stop it with POST /api/avds/stop first.",
             );
           }
           try {
             sessions.assertPublished(requestContext);
           } catch (err) {
             launch.stop();
-            cameraWiredSerials.delete(launch.serial);
+            if (launch.ownsProcess) cameraWiredSerials.delete(launch.serial);
             throw err;
           }
           const select = (payload as Record<string, unknown>).select !== false;
@@ -2254,7 +2244,7 @@ export async function startServer(
               return Response.json({ ...switched, avd: avd.trim() });
             } catch (err) {
               launch.stop();
-              cameraWiredSerials.delete(launch.serial);
+              if (launch.ownsProcess) cameraWiredSerials.delete(launch.serial);
               throw err;
             }
           }
@@ -2842,40 +2832,13 @@ export async function startServer(
         }
       }
 
-      if (url.pathname === "/api/camera") {
-        if (req.method !== "GET")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          return Response.json({
-            ok: true,
-            camera: await cameraStatus(requestContext.serial),
-          });
-        } catch (err) {
-          return errorResponse(err);
-        }
-      }
-
-      if (url.pathname === "/api/camera/image") {
-        if (req.method !== "POST" && req.method !== "DELETE")
-          return new Response("method not allowed", { status: 405 });
-        try {
-          const facing = parseCameraFacing(url.searchParams.get("facing"));
-          if (req.method === "POST") {
-            const png = await readBodyLimited(req, MAX_CAMERA_IMAGE_BYTES);
-            sessions.assertCurrent(requestContext);
-            await setCameraImage(requestContext.serial, facing, png);
-          } else {
-            sessions.assertCurrent(requestContext);
-            await clearCameraImage(requestContext.serial, facing);
-          }
-          return Response.json({
-            ok: true,
-            camera: await cameraStatus(requestContext.serial),
-          });
-        } catch (err) {
-          return errorResponse(err);
-        }
-      }
+      const cameraResponse = await handleCameraRequest(req, url, {
+        serial: requestContext.serial,
+        wiredAtLaunch: cameraWiredSerials.has(requestContext.serial),
+        beforeMutation: () => sessions.assertCurrent(requestContext),
+        errorResponse,
+      });
+      if (cameraResponse) return cameraResponse;
 
       if (url.pathname === "/ws") {
         if (requestContext.status !== "streaming") {

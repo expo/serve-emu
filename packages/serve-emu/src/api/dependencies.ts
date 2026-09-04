@@ -101,6 +101,8 @@ export type ApiDependencies = {
   controlRoute: (action: RouteControlAction) => RoutePlaybackSnapshot;
 
   getCamera: () => Promise<CameraStatus>;
+  /** `null` when that facing has no feed file yet. */
+  readCameraImage: (facing: CameraFacing) => Promise<Uint8Array | null>;
   /**
    * Mutate only. The routes read the status back through `getCamera`, so these
    * line up with the same-named functions in `camera.ts` rather than returning
