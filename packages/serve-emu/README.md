@@ -447,21 +447,27 @@ at two PNG files under `~/.cache/serve-emu/camera/` (override the directory with
 `SERVE_EMU_CAMERA_DIR`). The emulator only reads its camera source at startup,
 which is why there is no way to add this to an emulator that is already running.
 
-These endpoints live on the standalone server only. The embeddable middleware
-(`createApp` / `createRouter`, the package's default export) does not serve them
-yet, so a host that mounts serve-emu as middleware cannot drive the camera.
+The embeddable middleware (`createRouter`, the package's default export) serves
+the same routes, scoped per `?device=<serial>`. A host that launches the
+emulator itself calls `seedCameraFeeds(serial)` first, adds
+`cameraLaunchArgs(serial)` to its emulator command, and then calls
+`router.setCameraWired(serial, true)`. It calls `setCameraWired(serial, false)`
+when it stops that emulator. The router tracks its own launches, so a start
+through `POST /api/avds/start` with `"camera": true` needs no such call.
 
 Once wired, changing the picture is a plain file write, so no restart is needed:
 
 ```sh
 curl "$BASE/api/camera"
+curl "$BASE/api/camera/image?facing=back" --output current.png
 curl -X POST "$BASE/api/camera/image?facing=back" \
   -H 'Content-Type: image/png' --data-binary @fixture.png
 curl -X DELETE "$BASE/api/camera/image?facing=front"
 ```
 
 `GET /api/camera` reports, per facing, the feed path and the current image's
-size, byte count, and sha256. `wiredAtLaunch` is true only when serve-emu itself
+size, byte count, and sha256. `GET /api/camera/image?facing=` returns the
+current PNG for one facing. `wiredAtLaunch` is true only when serve-emu itself
 started the emulator with the feeds attached; when it is false the response
 still lists the `launchArgs` that would attach them. `DELETE` restores a
 generated checkerboard test card that means "no image set".
