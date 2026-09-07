@@ -14,20 +14,71 @@ import {
   placeholderCameraImage,
   readCameraFeed,
   readCameraStatus,
+  readCameraWiring,
   seedCameraFeeds,
   setCameraImage,
 } from "../src/camera.ts";
+import type { execText } from "../src/exec.ts";
 import { headerOnlyPng, solidPng } from "./fixtures/png.ts";
 
 async function stagingFiles(): Promise<string[]> {
   return (await readdir(cameraFeedRoot())).filter((name) => name.endsWith(".tmp"));
 }
 
+const unwired = async () => false;
+
+type ConsoleReply = Awaited<ReturnType<typeof execText>>;
+
+function consoleOk(stdout: string): ConsoleReply {
+  return { status: 0, signal: null, stdout, stderr: "", timedOut: false, error: null };
+}
+
+const CONSOLE_FAILURE: ConsoleReply = {
+  status: 1,
+  signal: null,
+  stdout: "",
+  stderr: "error: could not connect",
+  timedOut: false,
+  error: null,
+};
+
+/** Answers `emu avd path` for one serial and refuses anything else. */
+function fakeConsole(serial: string, reply: ConsoleReply) {
+  const calls: string[] = [];
+  const runExec = (async (command, args) => {
+    const line = [command, ...(args as string[])].join(" ");
+    calls.push(line);
+    if (line !== `adb -s ${serial} emu avd path`) {
+      throw new Error(`unexpected command: ${line}`);
+    }
+    return reply;
+  }) as typeof execText;
+  return { runExec, calls };
+}
+
+async function writeHardwareIni(dir: string, back: string, front: string): Promise<void> {
+  await writeFile(
+    join(dir, "hardware-qemu.ini"),
+    [
+      "# Android emulator hardware configuration",
+      "",
+      `hw.camera.back = ${back}`,
+      "hw.camera.back.orientation = 90",
+      `hw.camera.front = ${front}`,
+      "hw.camera.front.orientation = 90",
+      "hw.lcd.density = 440",
+      "",
+    ].join("\n"),
+  );
+}
+
 let root: string;
+let avdDir: string;
 const previousRoot = process.env.SERVE_EMU_CAMERA_DIR;
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "serve-emu-camera-test-"));
+  avdDir = await mkdtemp(join(tmpdir(), "serve-emu-camera-avd-"));
   process.env.SERVE_EMU_CAMERA_DIR = root;
 });
 
@@ -35,6 +86,7 @@ afterEach(async () => {
   if (previousRoot === undefined) delete process.env.SERVE_EMU_CAMERA_DIR;
   else process.env.SERVE_EMU_CAMERA_DIR = previousRoot;
   await rm(root, { recursive: true, force: true });
+  await rm(avdDir, { recursive: true, force: true });
 });
 
 describe("camera feed paths", () => {
@@ -215,7 +267,7 @@ describe("camera feed writes", () => {
 describe("seedCameraFeeds", () => {
   test("gives every facing a parsable PNG", async () => {
     await seedCameraFeeds("emulator-5554");
-    const status = await readCameraStatus("emulator-5554", true);
+    const status = await readCameraStatus("emulator-5554", unwired);
     expect(status.feeds.map((feed) => feed.facing)).toEqual(["back", "front"]);
     expect(status.feeds.every((feed) => feed.placeholder)).toBe(true);
   });
@@ -249,20 +301,75 @@ describe("seedCameraFeeds", () => {
 });
 
 describe("readCameraStatus", () => {
-  test("reports support and wiring without guessing", async () => {
-    await expect(readCameraStatus("emulator-5554", false)).resolves.toMatchObject({
+  test("reports support and the wiring the read yields", async () => {
+    await expect(readCameraStatus("emulator-5554", unwired)).resolves.toMatchObject({
       serial: "emulator-5554",
       supported: true,
       wiredAtLaunch: false,
     });
-    await expect(readCameraStatus("R3CN90ABCDE", false)).resolves.toMatchObject({
+    await expect(
+      readCameraStatus("emulator-5554", async () => true),
+    ).resolves.toMatchObject({ wiredAtLaunch: true });
+    await expect(readCameraStatus("R3CN90ABCDE", unwired)).resolves.toMatchObject({
       supported: false,
     });
   });
 
   test("reports a present file whose bytes are not a PNG", async () => {
     await writeFile(cameraFeedPath("emulator-5554", "back"), "still not a png");
-    const [back] = (await readCameraStatus("emulator-5554", true)).feeds;
+    const [back] = (await readCameraStatus("emulator-5554", unwired)).feeds;
     expect(back).toMatchObject({ present: true, placeholder: false, width: null });
+  });
+});
+
+describe("readCameraWiring", () => {
+  const serial = "emulator-5554";
+
+  test("reads serve-emu's feeds off the running emulator's effective config", async () => {
+    const { runExec, calls } = fakeConsole(serial, consoleOk(`${avdDir}\nOK\n`));
+    await writeHardwareIni(
+      avdDir,
+      `imagefile:${cameraFeedPath(serial, "back")}`,
+      `imagefile:${cameraFeedPath(serial, "front")}`,
+    );
+
+    expect(await readCameraWiring(serial, runExec)).toBe(true);
+    expect(calls).toEqual([`adb -s ${serial} emu avd path`]);
+    await expect(
+      readCameraStatus(serial, (target) => readCameraWiring(target, runExec)),
+    ).resolves.toMatchObject({ wiredAtLaunch: true });
+  });
+
+  test("reports unwired when the config names another camera source", async () => {
+    const { runExec } = fakeConsole(serial, consoleOk(`${avdDir}\nOK\n`));
+    await writeHardwareIni(avdDir, "emulated", "none");
+    expect(await readCameraWiring(serial, runExec)).toBe(false);
+  });
+
+  test("reports unwired when the emulator console does not answer", async () => {
+    const { runExec } = fakeConsole(serial, CONSOLE_FAILURE);
+    await writeHardwareIni(
+      avdDir,
+      `imagefile:${cameraFeedPath(serial, "back")}`,
+      `imagefile:${cameraFeedPath(serial, "front")}`,
+    );
+    expect(await readCameraWiring(serial, runExec)).toBe(false);
+  });
+
+  test("reports unwired when only one facing carries a feed", async () => {
+    const { runExec } = fakeConsole(serial, consoleOk(`${avdDir}\nOK\n`));
+    await writeHardwareIni(avdDir, `imagefile:${cameraFeedPath(serial, "back")}`, "none");
+    expect(await readCameraWiring(serial, runExec)).toBe(false);
+  });
+
+  test("reports unwired when the AVD directory holds no hardware config", async () => {
+    const { runExec } = fakeConsole(serial, consoleOk(`${avdDir}\nOK\n`));
+    expect(await readCameraWiring(serial, runExec)).toBe(false);
+  });
+
+  test("never opens a console for a physical serial", async () => {
+    const { runExec, calls } = fakeConsole("R3CN90ABCDE", consoleOk(`${avdDir}\nOK\n`));
+    expect(await readCameraWiring("R3CN90ABCDE", runExec)).toBe(false);
+    expect(calls).toEqual([]);
   });
 });

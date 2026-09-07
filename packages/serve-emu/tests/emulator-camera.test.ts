@@ -8,6 +8,8 @@ import { startEmulator } from "../src/emulator.ts";
 import { cameraLaunchArgs, readCameraStatus } from "../src/camera.ts";
 import type { execText } from "../src/exec.ts";
 
+const unwired = async () => false;
+
 function result(stdout = "") {
   return { status: 0, signal: null, stdout, stderr: "", timedOut: false, error: null };
 }
@@ -79,7 +81,7 @@ describe("startEmulator camera wiring", () => {
       ...cameraLaunchArgs("emulator-5560"),
     ]);
 
-    const status = await readCameraStatus("emulator-5560", launch.cameraFeed);
+    const status = await readCameraStatus("emulator-5560", unwired);
     expect(status.feeds.every((feed) => feed.placeholder)).toBe(true);
   });
 
@@ -96,7 +98,7 @@ describe("startEmulator camera wiring", () => {
 
     expect(launch.cameraFeed).toBe(false);
     expect(spawnCalls[0]?.[1]).toEqual(["@Pixel_8", "-port", "5560"]);
-    const status = await readCameraStatus("emulator-5560", launch.cameraFeed);
+    const status = await readCameraStatus("emulator-5560", unwired);
     expect(status.feeds.every((feed) => feed.present)).toBe(false);
   });
 

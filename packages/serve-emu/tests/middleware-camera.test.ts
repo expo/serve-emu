@@ -74,6 +74,7 @@ type FakeState = {
   stopped: string[];
   launches: number;
   cameraFeed: boolean;
+  cameraWired: boolean;
 };
 
 function fakeState(overrides: Partial<FakeState> = {}): FakeState {
@@ -85,6 +86,7 @@ function fakeState(overrides: Partial<FakeState> = {}): FakeState {
     stopped: [],
     launches: 0,
     cameraFeed: false,
+    cameraWired: false,
     ...overrides,
   };
 }
@@ -137,6 +139,7 @@ function routerDependencies(state: FakeState): RouterDependencies {
         (running) => running.serial !== serial,
       );
     },
+    readCameraWiring: async () => state.cameraWired,
   };
 }
 
@@ -204,17 +207,16 @@ describe("createRouter camera routes", () => {
     ]);
   });
 
-  test("setCameraWired flips the reported wiring in both directions", async () => {
-    const router = createRouter({}, routerDependencies(onlineState()));
-    const readWired = async () =>
-      (await cameraStatus(await router.handleRequest(get("/api/camera"))))
-        .wiredAtLaunch;
+  test("reports the wiring the running emulator's config yields", async () => {
+    const readWired = async (state: FakeState) => {
+      const router = createRouter({}, routerDependencies(state));
+      return (
+        await cameraStatus(await router.handleRequest(get("/api/camera")))
+      ).wiredAtLaunch;
+    };
 
-    router.setCameraWired(SERIAL, true);
-    expect(await readWired()).toBe(true);
-
-    router.setCameraWired(SERIAL, false);
-    expect(await readWired()).toBe(false);
+    expect(await readWired(onlineState({ cameraWired: true }))).toBe(true);
+    expect(await readWired(onlineState())).toBe(false);
   });
 
   test("a posted PNG becomes the reported feed for its facing", async () => {
@@ -329,26 +331,6 @@ describe("createRouter camera routes", () => {
     });
   });
 
-  test("a camera launch marks only the launched serial as wired", async () => {
-    const state = onlineState({ avds: ["Pixel_9"], cameraFeed: true });
-    const router = createRouter({}, routerDependencies(state));
-
-    const started = await router.handleRequest(
-      post("/api/avds/start", { avd: "Pixel_9", camera: true, select: false }),
-    );
-    expect(started.status).toBe(200);
-
-    const launched = await cameraStatus(
-      await router.handleRequest(get(`/api/camera?device=${LAUNCHED}`)),
-    );
-    expect(launched).toMatchObject({ serial: LAUNCHED, wiredAtLaunch: true });
-
-    const other = await cameraStatus(
-      await router.handleRequest(get(`/api/camera?device=${SERIAL}`)),
-    );
-    expect(other.wiredAtLaunch).toBe(false);
-  });
-
   test("refuses a non-boolean camera flag instead of launching without feeds", async () => {
     const state = onlineState({ avds: ["Pixel_9"], cameraFeed: true });
     const router = createRouter({}, routerDependencies(state));
@@ -377,88 +359,6 @@ describe("createRouter camera routes", () => {
     expect(await responseJson(response)).toMatchObject({
       ok: false,
       error: expect.stringContaining("already running"),
-    });
-    const status = await cameraStatus(
-      await router.handleRequest(get(`/api/camera?device=${LAUNCHED}`)),
-    );
-    expect(status.wiredAtLaunch).toBe(false);
-  });
-
-  test("a plain start that reattaches to a running AVD keeps the wiring claim", async () => {
-    const state = runningAvdState("Pixel_9");
-    const router = createRouter({}, routerDependencies(state));
-    router.setCameraWired(LAUNCHED, true);
-
-    const started = await router.handleRequest(
-      post("/api/avds/start", { avd: "Pixel_9", select: false }),
-    );
-    expect(started.status).toBe(200);
-
-    const status = await cameraStatus(
-      await router.handleRequest(get(`/api/camera?device=${LAUNCHED}`)),
-    );
-    expect(status).toMatchObject({ serial: LAUNCHED, wiredAtLaunch: true });
-  });
-
-  test("a refused camera start on a running AVD leaves the wiring claim alone", async () => {
-    const state = runningAvdState("Pixel_9");
-    const router = createRouter({}, routerDependencies(state));
-    router.setCameraWired(LAUNCHED, true);
-
-    const response = await router.handleRequest(
-      post("/api/avds/start", { avd: "Pixel_9", camera: true, select: false }),
-    );
-
-    expect(response.status).toBe(400);
-    expect(await responseJson(response)).toMatchObject({
-      ok: false,
-      error: expect.stringContaining("POST /api/avds/stop"),
-    });
-    const status = await cameraStatus(
-      await router.handleRequest(get(`/api/camera?device=${LAUNCHED}`)),
-    );
-    expect(status.wiredAtLaunch).toBe(true);
-  });
-
-  test("stopping an AVD clears its camera wiring", async () => {
-    const state = onlineState({ avds: ["Pixel_9"], cameraFeed: true });
-    const router = createRouter({}, routerDependencies(state));
-    const readLaunched = async () =>
-      cameraStatus(
-        await router.handleRequest(get(`/api/camera?device=${LAUNCHED}`)),
-      );
-
-    expect(
-      (
-        await router.handleRequest(
-          post("/api/avds/start", {
-            avd: "Pixel_9",
-            camera: true,
-            select: false,
-          }),
-        )
-      ).status,
-    ).toBe(200);
-    expect(await readLaunched()).toMatchObject({
-      serial: LAUNCHED,
-      wiredAtLaunch: true,
-    });
-
-    const stopped = await router.handleRequest(
-      post("/api/avds/stop", { serial: LAUNCHED }),
-    );
-    expect(stopped.status).toBe(200);
-
-    // A stopping serial stays unroutable until adb stops listing it, so read
-    // another device to retire that claim before the emulator comes back.
-    expect(
-      (await router.handleRequest(get(`/api/camera?device=${SERIAL}`))).status,
-    ).toBe(200);
-    state.devices.push({ serial: LAUNCHED, state: "device" });
-
-    expect(await readLaunched()).toMatchObject({
-      serial: LAUNCHED,
-      wiredAtLaunch: false,
     });
   });
 

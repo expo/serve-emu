@@ -21,7 +21,9 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
+import { readEmuConsoleValue } from "./adb.ts";
 import { isEmulatorSerial } from "./device-capabilities.ts";
+import { execText } from "./exec.ts";
 import { HttpBodyError, readBodyLimited } from "./request-body.ts";
 import {
   CAMERA_FACINGS,
@@ -296,18 +298,62 @@ export async function readCameraFeed(
   };
 }
 
+/** Minimal `key = value` reader. The emulator writes one pair per line. */
+function iniValues(text: string): Map<string, string> {
+  const values = new Map<string, string>();
+  for (const line of text.split(/\r?\n/)) {
+    const separator = line.indexOf("=");
+    if (separator === -1) continue;
+    values.set(line.slice(0, separator).trim(), line.slice(separator + 1).trim());
+  }
+  return values;
+}
+
+/**
+ * Ask the running emulator whether serve-emu's feeds are its camera source.
+ *
+ * `hardware-qemu.ini` in the AVD data directory is the effective hardware
+ * config the emulator writes at launch, so it merges the static `config.ini`
+ * with the launch flags and reports the truth for either wiring route. The
+ * serial resolves to that directory through the console at read time, so a
+ * recycled serial cannot report an earlier run's wiring, and the answer
+ * survives a serve-emu restart. Anything unreadable means unwired.
+ */
+export async function readCameraWiring(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<boolean> {
+  if (!isEmulatorSerial(serial)) return false;
+  const avdPath = await readEmuConsoleValue(serial, ["avd", "path"], runExec);
+  if (!avdPath) return false;
+  let config: string;
+  try {
+    config = await readFile(join(avdPath, "hardware-qemu.ini"), "utf8");
+  } catch {
+    return false;
+  }
+  const values = iniValues(config);
+  return CAMERA_FACINGS.every(
+    (facing) =>
+      values.get(`hw.camera.${facing}`) ===
+      `imagefile:${cameraFeedPath(serial, facing)}`,
+  );
+}
+
 export async function readCameraStatus(
   serial: string,
-  wiredAtLaunch: boolean,
+  readWiring: typeof readCameraWiring = readCameraWiring,
 ): Promise<CameraStatus> {
+  const [wiredAtLaunch, feeds] = await Promise.all([
+    readWiring(serial),
+    Promise.all(CAMERA_FACINGS.map((facing) => readCameraFeed(serial, facing))),
+  ]);
   return {
     serial,
     supported: isEmulatorSerial(serial),
     wiredAtLaunch,
     launchArgs: cameraLaunchArgs(serial),
-    feeds: await Promise.all(
-      CAMERA_FACINGS.map((facing) => readCameraFeed(serial, facing)),
-    ),
+    feeds,
   };
 }
 
@@ -382,7 +428,8 @@ export async function readCameraImage(
 
 export type CameraRequestContext = {
   serial: string;
-  wiredAtLaunch: boolean;
+  /** Injectable so a host's tests need no live emulator console. */
+  readWiring?: typeof readCameraWiring;
   /**
    * Runs after the body is read and before the feed file changes, so a host can
    * refuse a mutation whose device session moved on while the body streamed in.
@@ -417,7 +464,7 @@ export function isCameraPath(pathname: string): boolean {
 /**
  * The one camera HTTP handler. Both the standalone server and the middleware
  * router mount it, so the routes cannot drift apart; each supplies only the
- * serial, the wiring claim, and its own session and error policy.
+ * serial and its own session and error policy.
  */
 export async function handleCameraRequest(
   request: Request,
@@ -427,10 +474,11 @@ export async function handleCameraRequest(
   if (!isCameraPath(url.pathname)) return null;
   const isStatusPath = url.pathname === "/api/camera";
 
-  const { serial, wiredAtLaunch } = context;
+  const { serial } = context;
+  const readWiring = context.readWiring ?? readCameraWiring;
   const errorResponse = context.errorResponse ?? defaultCameraErrorResponse;
   const statusResponse = async () =>
-    Response.json({ ok: true, camera: await readCameraStatus(serial, wiredAtLaunch) });
+    Response.json({ ok: true, camera: await readCameraStatus(serial, readWiring) });
 
   if (isStatusPath) {
     if (request.method !== "GET") return methodNotAllowed();

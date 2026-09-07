@@ -2,7 +2,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import type { ServerWebSocket } from "bun";
-import { handleCameraRequest } from "./camera.ts";
+import { handleCameraRequest, readCameraWiring } from "./camera.ts";
 import { getExecSnapshot } from "./exec.ts";
 import {
   getFontScale,
@@ -200,11 +200,6 @@ export type ServerOpts = {
   uploadQueueTimeoutMs?: number;
   /** Default viewer transport. Each browser viewer may select either available path. */
   streamSettings?: StreamSettings;
-  /**
-   * Serial whose emulator was started with serve-emu's camera feeds attached.
-   * Only a launch can attach them, so the server cannot infer this.
-   */
-  cameraSerial?: string;
 };
 
 export const DEFAULT_HOST = "127.0.0.1";
@@ -324,6 +319,7 @@ export type ServerDependencies = {
   stopEmulator?: typeof stopEmulator;
   listRunningAvds?: typeof listRunningAvds;
   listAvds?: typeof listAvds;
+  readCameraWiring?: typeof readCameraWiring;
   loadAccessibility?: (
     serial: string,
     signal: AbortSignal,
@@ -399,6 +395,7 @@ export async function startServer(
   const killEmulator = dependencies.stopEmulator ?? stopEmulator;
   const listActiveAvds = dependencies.listRunningAvds ?? listRunningAvds;
   const availableAvds = dependencies.listAvds ?? listAvds;
+  const readWiring = dependencies.readCameraWiring ?? readCameraWiring;
   const loadAccessibility =
     dependencies.loadAccessibility ??
     ((serial: string, signal: AbortSignal) =>
@@ -657,10 +654,6 @@ export async function startServer(
   let stopRequested = false;
   console.log(
     `${initialMode} ready: ${initialStream.meta.deviceName} • ${initialStream.meta.codecId} • ${initialStream.meta.width}×${initialStream.meta.height}`,
-  );
-
-  const cameraWiredSerials = new Set<string>(
-    opts.cameraSerial ? [opts.cameraSerial] : [],
   );
 
   const health = (context = sessions.current) => {
@@ -2277,19 +2270,6 @@ export async function startServer(
           }
           const camera = requestedCamera === true;
           const launch = await launchEmulator({ avd: avd.trim(), camera });
-          // Only a launch this server owns tells us anything. Emulator serials
-          // are recycled, so an owned launch without feeds clears whatever
-          // claim an earlier one left on the same serial, while a reattach to
-          // a running emulator knows nothing about the flags it started with.
-          // Neither sees an emulator started elsewhere, or this one killed
-          // after the server exits; see the camera docs.
-          if (launch.ownsProcess) {
-            if (launch.cameraFeed) cameraWiredSerials.add(launch.serial);
-            else cameraWiredSerials.delete(launch.serial);
-            launch.proc?.once("exit", () => {
-              cameraWiredSerials.delete(launch.serial);
-            });
-          }
           if (camera && !launch.cameraFeed) {
             throw new Error(
               `AVD "${avd.trim()}" is already running, so its camera source cannot be changed; ` +
@@ -2300,7 +2280,6 @@ export async function startServer(
             sessions.assertPublished(requestContext);
           } catch (err) {
             launch.stop();
-            if (launch.ownsProcess) cameraWiredSerials.delete(launch.serial);
             throw err;
           }
           const select = (payload as Record<string, unknown>).select !== false;
@@ -2310,7 +2289,6 @@ export async function startServer(
               return Response.json({ ...switched, avd: avd.trim() });
             } catch (err) {
               launch.stop();
-              if (launch.ownsProcess) cameraWiredSerials.delete(launch.serial);
               throw err;
             }
           }
@@ -2359,7 +2337,6 @@ export async function startServer(
             await stopCurrentSession(requestContext, "current emulator stopped");
           }
           await killEmulator(serial);
-          cameraWiredSerials.delete(serial);
           sessions.assertPublished(requestContext);
           return Response.json({ ok: true, serial });
         } catch (err) {
@@ -2900,7 +2877,7 @@ export async function startServer(
 
       const cameraResponse = await handleCameraRequest(req, url, {
         serial: requestContext.serial,
-        wiredAtLaunch: cameraWiredSerials.has(requestContext.serial),
+        readWiring,
         beforeMutation: () => sessions.assertCurrent(requestContext),
         errorResponse,
       });

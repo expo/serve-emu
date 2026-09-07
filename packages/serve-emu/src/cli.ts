@@ -459,7 +459,6 @@ async function main() {
     maxActiveUploads,
     maxQueuedUploads,
     uploadQueueTimeoutMs,
-    cameraSerial: emulatorLaunch?.cameraFeed ? serial : undefined,
   });
   try {
     activeServer = await startupTask;

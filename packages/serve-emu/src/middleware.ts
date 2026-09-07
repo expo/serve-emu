@@ -14,7 +14,7 @@ import {
   type OrientationMode,
 } from "./adb.ts";
 import { getAccessibilitySnapshot } from "./accessibility.ts";
-import { handleCameraRequest, isCameraPath } from "./camera.ts";
+import { handleCameraRequest, isCameraPath, readCameraWiring } from "./camera.ts";
 import {
   clearAppData,
   forceStopApp,
@@ -1888,6 +1888,7 @@ export type RouterDependencies = {
   resolveRunningAvds?: typeof resolveRunningAvds;
   startEmulator?: typeof startEmulator;
   stopEmulator?: typeof stopEmulator;
+  readCameraWiring?: typeof readCameraWiring;
   createApp?: (opts: AppOptions) => Promise<EmuApp>;
 };
 
@@ -1910,6 +1911,7 @@ export function createRouter(
   const resolveAvds = dependencies.resolveRunningAvds ?? resolveRunningAvds;
   const launchEmulator = dependencies.startEmulator ?? startEmulator;
   const killEmulator = dependencies.stopEmulator ?? stopEmulator;
+  const readWiring = dependencies.readCameraWiring ?? readCameraWiring;
   const createDeviceApp = dependencies.createApp ?? createApp;
   const apps = new Map<string, EmuApp>();
   const pending = new Map<string, Promise<EmuApp>>();
@@ -1921,7 +1923,6 @@ export function createRouter(
   const sessionGenerations = new Map<string, number>();
   const operationControllers = new Map<string, Set<AbortController>>();
   const stoppingSerials = new Set<string>();
-  const cameraWiredSerials = new Set<string>();
   let selectedSerial = defaults.serial ?? null;
   let selectionRevision = 0;
   let stopped = false;
@@ -2460,16 +2461,6 @@ export function createRouter(
     return streamingApps[0] ?? null;
   };
 
-  /**
-   * Hosts that boot their own emulators own the wiring truth: the router never
-   * sees a launch it did not make, so it cannot infer whether the feeds are
-   * attached.
-   */
-  const setCameraWired = (serial: string, wired: boolean): void => {
-    if (wired) cameraWiredSerials.add(serial);
-    else cameraWiredSerials.delete(serial);
-  };
-
   const handleRequest = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
     if (
@@ -2655,19 +2646,6 @@ export function createRouter(
         const camera = requestedCamera === true;
         const launch = await launchEmulator({ avd, camera });
         stoppingSerials.delete(launch.serial);
-        // Only a launch this router owns tells us anything. Emulator serials
-        // are recycled, so an owned launch without feeds clears whatever claim
-        // an earlier one left on the same serial, while a reattach to a
-        // running emulator knows nothing about the flags it started with.
-        // Neither sees an emulator started elsewhere, or this one killed after
-        // the host exits; see the camera docs.
-        if (launch.ownsProcess) {
-          if (launch.cameraFeed) cameraWiredSerials.add(launch.serial);
-          else cameraWiredSerials.delete(launch.serial);
-          launch.proc?.once("exit", () => {
-            cameraWiredSerials.delete(launch.serial);
-          });
-        }
         if (camera && !launch.cameraFeed) {
           throw new Error(
             `AVD "${avd}" is already running, so its camera source cannot be changed; ` +
@@ -2688,7 +2666,6 @@ export function createRouter(
           });
         } catch (err) {
           launch.stop();
-          if (launch.ownsProcess) cameraWiredSerials.delete(launch.serial);
           throw err;
         }
       } catch (err) {
@@ -2726,7 +2703,6 @@ export function createRouter(
           stoppingSerials.delete(serial);
           throw err;
         }
-        cameraWiredSerials.delete(serial);
         if (selectedSerial === serial) {
           selectionRevision++;
           selectedSerial = null;
@@ -2749,10 +2725,7 @@ export function createRouter(
       } catch (err) {
         return Response.json({ ok: false, error: errMsg(err) }, { status: 503 });
       }
-      const response = await handleCameraRequest(req, url, {
-        serial,
-        wiredAtLaunch: cameraWiredSerials.has(serial),
-      });
+      const response = await handleCameraRequest(req, url, { serial, readWiring });
       if (response) return response;
     }
 
@@ -2827,7 +2800,6 @@ export function createRouter(
       streamModeQueues.clear();
       sessionGenerations.clear();
       operationControllers.clear();
-      cameraWiredSerials.clear();
     })();
     return stopAllTask;
   };
@@ -2838,7 +2810,6 @@ export function createRouter(
     ensure,
     handleRequest,
     attachWebSocket,
-    setCameraWired,
     stopAll,
   };
 }
