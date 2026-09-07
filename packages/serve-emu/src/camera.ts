@@ -461,6 +461,24 @@ export async function readCameraImage(
   }
 }
 
+/**
+ * Serve a feed image without copying it. A feed is up to 32MB, and re-viewing
+ * the same memory keeps that off the event loop that also forwards video
+ * frames. `readFile` types its buffer over `ArrayBufferLike`, which `BodyInit`
+ * refuses, so the view narrows it; a Node buffer never sits on a
+ * `SharedArrayBuffer`.
+ */
+export function cameraImageResponse(png: Uint8Array): Response {
+  const bytes = new Uint8Array(
+    png.buffer as ArrayBuffer,
+    png.byteOffset,
+    png.byteLength,
+  );
+  return new Response(bytes, {
+    headers: { "Content-Type": "image/png", "Cache-Control": "no-store" },
+  });
+}
+
 export type CameraRequestContext = {
   serial: string;
   /** Injectable so a host's tests need no live emulator console. */
@@ -544,9 +562,7 @@ export async function handleCameraRequest(
           { status: 404 },
         );
       }
-      return new Response(Uint8Array.from(png).buffer, {
-        headers: { "Content-Type": "image/png", "Cache-Control": "no-store" },
-      });
+      return cameraImageResponse(png);
     }
     if (request.method === "POST") {
       const png = await readBodyLimited(request, MAX_CAMERA_IMAGE_BYTES);

@@ -1,5 +1,6 @@
 import {
   assertCameraImage,
+  cameraImageResponse,
   MAX_CAMERA_IMAGE_BYTES,
   parseCameraFacing,
 } from "../../camera.ts";
@@ -33,9 +34,7 @@ export function cameraRoutes(): ContractApiRoute<ApiDependencies>[] {
         if (!png) {
           throw new ApiError(404, "not_found", "no camera image is set for this facing");
         }
-        return new Response(Uint8Array.from(png).buffer, {
-          headers: { "Content-Type": "image/png", "Cache-Control": "no-store" },
-        });
+        return cameraImageResponse(png);
       },
     },
     {
