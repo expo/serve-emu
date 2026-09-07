@@ -254,6 +254,11 @@ describe("createRouter camera routes", () => {
       get("/api/camera/image?facing=front"),
     );
     expect(missing.status).toBe(404);
+    expect(await responseJson(missing)).toMatchObject({
+      ok: false,
+      code: "not_found",
+      error: expect.stringContaining("no camera image is set"),
+    });
 
     expect(
       (

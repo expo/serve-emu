@@ -558,7 +558,11 @@ export async function handleCameraRequest(
       const png = await readCameraImage(serial, facing);
       if (!png) {
         return Response.json(
-          { ok: false, error: `no camera image is set for ${facing}` },
+          {
+            ok: false,
+            code: "not_found",
+            error: `no camera image is set for ${facing}`,
+          },
           { status: 404 },
         );
       }
