@@ -10,6 +10,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
 
 ## Unreleased
 
+### Fixed
+
+- Synchronize emulator rotation controls with the simulated orientation used by
+  gRPC PNG and MMAP screenshots, and align gRPC touch input with rotated frames.
+
 ### Added
 
 - Add emulator-only gRPC screenshot streaming with host-side H.264 encoding,
