@@ -51,9 +51,10 @@ scrcpy setup lazily on first start.
 - Camera image passthrough is emulator-only. The [Camera Image](README.md#camera-image)
   section is the source of truth for the mechanism and its constraints. In code, wire feeds
   through `startEmulator({ camera: true })`, and keep a valid PNG at every wired feed path.
-  `handleCameraRequest` in `src/camera.ts` is the single camera HTTP handler; both the
-  standalone server and the middleware router mount it rather than routing camera requests
-  themselves.
+  `wiredAtLaunch` is derived by reading the running emulator's `hardware-qemu.ini`, never
+  tracked in memory. `handleCameraRequest` in `src/camera.ts` is the single camera HTTP
+  handler; both the standalone server and the middleware router mount it rather than
+  routing camera requests themselves.
 - WebCodecs support matters for the bundled UI, so test streaming changes in a browser that supports it.
 
 ## scrcpy Protocol Notes

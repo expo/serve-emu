@@ -452,11 +452,9 @@ which is why there is no way to add this to an emulator that is already running.
 
 The embeddable middleware (`createRouter`, the package's default export) serves
 the same routes, scoped per `?device=<serial>`. A host that launches the
-emulator itself calls `seedCameraFeeds(serial)` first, adds
-`cameraLaunchArgs(serial)` to its emulator command, and then calls
-`router.setCameraWired(serial, true)`. It calls `setCameraWired(serial, false)`
-when it stops that emulator. The router tracks its own launches, so a start
-through `POST /api/avds/start` with `"camera": true` needs no such call.
+emulator itself calls `seedCameraFeeds(serial)` first and adds
+`cameraLaunchArgs(serial)` to its emulator command. Nothing else: serve-emu
+reads the wiring back off the emulator, so no host has to declare it.
 
 Once wired, changing the picture is a plain file write, so no restart is needed:
 
@@ -470,10 +468,12 @@ curl -X DELETE "$BASE/api/camera/image?facing=front"
 
 `GET /api/camera` reports, per facing, the feed path and the current image's
 size, byte count, and sha256. `GET /api/camera/image?facing=` returns the
-current PNG for one facing. `wiredAtLaunch` is true only when serve-emu itself
-started the emulator with the feeds attached; when it is false the response
-still lists the `launchArgs` that would attach them. `DELETE` restores a
-generated checkerboard test card that means "no image set".
+current PNG for one facing. `wiredAtLaunch` is read from the running emulator's
+`hardware-qemu.ini`, the effective hardware config it writes at launch, so it is
+true for any launch route (serve-emu's own, or a host's own emulator command)
+and survives a serve-emu restart. When it is false the response still lists the
+`launchArgs` that would attach the feeds. `DELETE` restores a generated
+checkerboard test card that means "no image set".
 
 Three constraints come from the emulator, not from serve-emu:
 
