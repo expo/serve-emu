@@ -340,6 +340,22 @@ export async function readCameraWiring(
   );
 }
 
+/**
+ * Whether a camera request is satisfied by the emulator this launch resolved.
+ *
+ * A launch that spawned the emulator wired the feeds itself. A launch that
+ * reattached to a running AVD cannot change its camera source, but that AVD may
+ * already carry serve-emu's feeds from an earlier launch, so ask the emulator
+ * before refusing. A serve-emu restart, or a second host, therefore keeps using
+ * a camera that already works.
+ */
+export async function cameraLaunchIsWired(
+  launch: { serial: string; cameraFeed: boolean },
+  readWiring: typeof readCameraWiring = readCameraWiring,
+): Promise<boolean> {
+  return launch.cameraFeed || (await readWiring(launch.serial));
+}
+
 export async function readCameraStatus(
   serial: string,
   readWiring: typeof readCameraWiring = readCameraWiring,

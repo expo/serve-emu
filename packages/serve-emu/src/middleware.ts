@@ -14,7 +14,12 @@ import {
   type OrientationMode,
 } from "./adb.ts";
 import { getAccessibilitySnapshot } from "./accessibility.ts";
-import { handleCameraRequest, isCameraPath, readCameraWiring } from "./camera.ts";
+import {
+  cameraLaunchIsWired,
+  handleCameraRequest,
+  isCameraPath,
+  readCameraWiring,
+} from "./camera.ts";
 import {
   clearAppData,
   forceStopApp,
@@ -2646,7 +2651,7 @@ export function createRouter(
         const camera = requestedCamera === true;
         const launch = await launchEmulator({ avd, camera });
         stoppingSerials.delete(launch.serial);
-        if (camera && !launch.cameraFeed) {
+        if (camera && !(await cameraLaunchIsWired(launch, readWiring))) {
           throw new Error(
             `AVD "${avd}" is already running, so its camera source cannot be changed; ` +
               "the emulator only reads that flag at startup. Stop it with POST /api/avds/stop first.",

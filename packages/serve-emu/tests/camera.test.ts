@@ -8,6 +8,7 @@ import {
   cameraFeedPath,
   cameraFeedRoot,
   cameraLaunchArgs,
+  cameraLaunchIsWired,
   clearCameraImage,
   MAX_CAMERA_IMAGE_BYTES,
   parseCameraFacing,
@@ -371,5 +372,28 @@ describe("readCameraWiring", () => {
     const { runExec, calls } = fakeConsole("R3CN90ABCDE", consoleOk(`${avdDir}\nOK\n`));
     expect(await readCameraWiring("R3CN90ABCDE", runExec)).toBe(false);
     expect(calls).toEqual([]);
+  });
+});
+
+describe("cameraLaunchIsWired", () => {
+  const serial = "emulator-5554";
+
+  test("trusts a launch that attached the feeds itself", async () => {
+    let reads = 0;
+    const wired = await cameraLaunchIsWired({ serial, cameraFeed: true }, async () => {
+      reads += 1;
+      return false;
+    });
+    expect(wired).toBe(true);
+    expect(reads).toBe(0);
+  });
+
+  test("asks the running emulator when the launch only reattached", async () => {
+    await expect(
+      cameraLaunchIsWired({ serial, cameraFeed: false }, async () => true),
+    ).resolves.toBe(true);
+    await expect(
+      cameraLaunchIsWired({ serial, cameraFeed: false }, unwired),
+    ).resolves.toBe(false);
   });
 });

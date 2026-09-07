@@ -2,7 +2,11 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import type { ServerWebSocket } from "bun";
-import { handleCameraRequest, readCameraWiring } from "./camera.ts";
+import {
+  cameraLaunchIsWired,
+  handleCameraRequest,
+  readCameraWiring,
+} from "./camera.ts";
 import { getExecSnapshot } from "./exec.ts";
 import {
   getFontScale,
@@ -2270,7 +2274,7 @@ export async function startServer(
           }
           const camera = requestedCamera === true;
           const launch = await launchEmulator({ avd: avd.trim(), camera });
-          if (camera && !launch.cameraFeed) {
+          if (camera && !(await cameraLaunchIsWired(launch, readWiring))) {
             throw new Error(
               `AVD "${avd.trim()}" is already running, so its camera source cannot be changed; ` +
                 "the emulator only reads that flag at startup. Stop it with POST /api/avds/stop first.",

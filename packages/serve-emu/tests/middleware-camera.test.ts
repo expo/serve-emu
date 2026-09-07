@@ -147,7 +147,10 @@ function onlineState(overrides: Partial<FakeState> = {}): FakeState {
   return fakeState({ devices: [{ serial: SERIAL, state: "device" }], ...overrides });
 }
 
-function runningAvdState(avd: string): FakeState {
+function runningAvdState(
+  avd: string,
+  overrides: Partial<FakeState> = {},
+): FakeState {
   return fakeState({
     avds: [avd],
     devices: [
@@ -155,6 +158,7 @@ function runningAvdState(avd: string): FakeState {
       { serial: LAUNCHED, state: "device" },
     ],
     running: [{ serial: LAUNCHED, avd, state: "device" }],
+    ...overrides,
   });
 }
 
@@ -347,7 +351,7 @@ describe("createRouter camera routes", () => {
     expect(state.launches).toBe(0);
   });
 
-  test("refuses a camera launch that reused an already running AVD", async () => {
+  test("refuses a camera launch that reused an unwired running AVD", async () => {
     const state = runningAvdState("Pixel_9");
     const router = createRouter({}, routerDependencies(state));
 
@@ -359,6 +363,22 @@ describe("createRouter camera routes", () => {
     expect(await responseJson(response)).toMatchObject({
       ok: false,
       error: expect.stringContaining("already running"),
+    });
+  });
+
+  test("accepts a camera launch that reused an already wired running AVD", async () => {
+    const state = runningAvdState("Pixel_9", { cameraWired: true });
+    const router = createRouter({}, routerDependencies(state));
+
+    const response = await router.handleRequest(
+      post("/api/avds/start", { avd: "Pixel_9", camera: true, select: false }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await responseJson(response)).toEqual({
+      ok: true,
+      serial: LAUNCHED,
+      avd: "Pixel_9",
     });
   });
 

@@ -448,7 +448,10 @@ serve-emu --avd Pixel_8 --camera-image ~/fixtures/id-card.png
 `--camera` starts the emulator with `-camera-back` and `-camera-front` pointed
 at two PNG files under `~/.cache/serve-emu/camera/` (override the directory with
 `SERVE_EMU_CAMERA_DIR`). The emulator only reads its camera source at startup,
-which is why there is no way to add this to an emulator that is already running.
+so feeds cannot be added to an emulator that is already running. Asking for the
+camera against one an earlier launch already wired still succeeds: serve-emu
+reads the wiring back off the emulator instead of refusing, so a restart keeps
+working. Use `--restart-avd` for an emulator that is running unwired.
 
 The embeddable middleware (`createRouter`, the package's default export) serves
 the same routes, scoped per `?device=<serial>`. A host that launches the

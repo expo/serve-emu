@@ -71,6 +71,16 @@ function postImage(
   });
 }
 
+function reattachedLaunch() {
+  return {
+    serial: "emulator-5558",
+    proc: null,
+    ownsProcess: false,
+    cameraFeed: false,
+    stop: () => {},
+  };
+}
+
 async function readWired(captured: CapturedServer): Promise<boolean> {
   return parseCameraStatusResponse(
     await (await request(captured, "/api/camera")).json(),
@@ -218,7 +228,7 @@ describe("standalone server camera image API", () => {
     );
   });
 
-  test("refuses a camera launch that reused an already running AVD", async () => {
+  test("refuses a camera launch that reused an unwired running AVD", async () => {
     await withServer(
       async (captured) => {
         const response = await request(captured, "/api/avds/start", {
@@ -231,13 +241,30 @@ describe("standalone server camera image API", () => {
       },
       {
         listDevices: async () => [{ serial: SERIAL, state: "device" }],
-        startEmulator: async () => ({
+        startEmulator: async () => reattachedLaunch(),
+      },
+    );
+  });
+
+  test("accepts a camera launch that reused an already wired running AVD", async () => {
+    await withServer(
+      async (captured) => {
+        const response = await request(captured, "/api/avds/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ avd: "AlreadyUp", camera: true, select: false }),
+        });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({
+          ok: true,
           serial: "emulator-5558",
-          proc: null,
-          ownsProcess: false,
-          cameraFeed: false,
-          stop: () => {},
-        }),
+          avd: "AlreadyUp",
+        });
+      },
+      {
+        listDevices: async () => [{ serial: SERIAL, state: "device" }],
+        startEmulator: async () => reattachedLaunch(),
+        readCameraWiring: async () => true,
       },
     );
   });

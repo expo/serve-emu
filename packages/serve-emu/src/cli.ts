@@ -3,7 +3,11 @@ import { parseArgs } from "node:util";
 import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { pickDevice } from "./adb.ts";
-import { assertCameraImage, setCameraImage } from "./camera.ts";
+import {
+  assertCameraImage,
+  cameraLaunchIsWired,
+  setCameraImage,
+} from "./camera.ts";
 import { listAvds, listRunningAvds, startEmulator } from "./emulator.ts";
 import { SCRCPY_DEFAULTS } from "./scrcpy.ts";
 import {
@@ -364,7 +368,7 @@ async function main() {
         camera,
       })).serial
     : await pickDevice(values.serial);
-  if (camera && emulatorLaunch && !emulatorLaunch.cameraFeed) {
+  if (camera && emulatorLaunch && !(await cameraLaunchIsWired(emulatorLaunch))) {
     throw new Error(
       `AVD "${avdName(values.avd)}" is already running, so its camera source cannot be changed; ` +
         "the emulator only reads that flag at startup. Pass --restart-avd to relaunch it with camera feeds attached.",
