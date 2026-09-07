@@ -52,6 +52,21 @@ const PNG_CHUNK_OVERHEAD_BYTES = 12;
 
 type Rgb = readonly [number, number, number];
 
+/**
+ * A camera request the caller can fix: an unknown facing, a body that is not a
+ * PNG the emulator can load, a device that has no imagefile camera. Anything
+ * else the camera routes throw is this host's fault, and an unwritable or full
+ * feed directory must not be reported as bad input.
+ */
+export class CameraInputError extends Error {
+  readonly status = 400;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "CameraInputError";
+  }
+}
+
 function isCameraFacing(value: unknown): value is CameraFacing {
   return typeof value === "string" && CAMERA_FACINGS.includes(value as CameraFacing);
 }
@@ -59,7 +74,7 @@ function isCameraFacing(value: unknown): value is CameraFacing {
 export function parseCameraFacing(value: unknown): CameraFacing {
   if (value === undefined || value === null || value === "") return "back";
   if (!isCameraFacing(value)) {
-    throw new Error(`facing must be one of: ${CAMERA_FACINGS.join(", ")}`);
+    throw new CameraInputError(`facing must be one of: ${CAMERA_FACINGS.join(", ")}`);
   }
   return value;
 }
@@ -81,7 +96,9 @@ export function cameraLaunchArgs(serial: string): string[] {
 
 export function assertCameraSupported(serial: string): void {
   if (!isEmulatorSerial(serial)) {
-    throw new Error("camera image passthrough is supported for Android Emulator serials only");
+    throw new CameraInputError(
+      "camera image passthrough is supported for Android Emulator serials only",
+    );
   }
 }
 
@@ -89,17 +106,19 @@ export type PngSize = { width: number; height: number };
 
 function readPngSize(bytes: Uint8Array): PngSize {
   if (bytes.length < 24 || !PNG_SIGNATURE.every((byte, i) => bytes[i] === byte)) {
-    throw new Error(
+    throw new CameraInputError(
       "camera image must be a PNG; the Android emulator imagefile camera loads PNG only",
     );
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   if (String.fromCharCode(...bytes.subarray(12, 16)) !== "IHDR") {
-    throw new Error("camera image PNG is missing its IHDR header");
+    throw new CameraInputError("camera image PNG is missing its IHDR header");
   }
   const width = view.getUint32(16);
   const height = view.getUint32(20);
-  if (width < 1 || height < 1) throw new Error("camera image PNG has zero dimensions");
+  if (width < 1 || height < 1) {
+    throw new CameraInputError("camera image PNG has zero dimensions");
+  }
   return { width, height };
 }
 
@@ -121,25 +140,25 @@ function assertPngChunkStream(bytes: Uint8Array): void {
     const type = String.fromCharCode(...bytes.subarray(offset + 4, offset + 8));
     const end = offset + PNG_CHUNK_OVERHEAD_BYTES + length;
     if (end > bytes.length) {
-      throw new Error(`camera image PNG is truncated inside its ${type} chunk`);
+      throw new CameraInputError(`camera image PNG is truncated inside its ${type} chunk`);
     }
     if (crc32(bytes.subarray(offset + 4, end - 4)) !== view.getUint32(end - 4)) {
-      throw new Error(`camera image PNG has a corrupt ${type} chunk`);
+      throw new CameraInputError(`camera image PNG has a corrupt ${type} chunk`);
     }
     if (type === "IDAT") sawImageData = true;
     if (type === "IEND") {
-      if (!sawImageData) throw new Error("camera image PNG has no IDAT chunk");
+      if (!sawImageData) throw new CameraInputError("camera image PNG has no IDAT chunk");
       return;
     }
     offset = end;
   }
 
-  throw new Error("camera image PNG is truncated before its IEND chunk");
+  throw new CameraInputError("camera image PNG is truncated before its IEND chunk");
 }
 
 export function assertCameraImage(bytes: Uint8Array): PngSize {
   if (bytes.length > MAX_CAMERA_IMAGE_BYTES) {
-    throw new Error(`camera image exceeds ${MAX_CAMERA_IMAGE_BYTES} bytes`);
+    throw new CameraInputError(`camera image exceeds ${MAX_CAMERA_IMAGE_BYTES} bytes`);
   }
   const size = readPngSize(bytes);
   assertPngChunkStream(bytes);
@@ -454,6 +473,12 @@ export type CameraRequestContext = {
   errorResponse?: (error: unknown) => Response;
 };
 
+/**
+ * Only the input validators and the body reader know a request is the caller's
+ * fault. Everything else that reaches here failed on this host, so it reports
+ * 500 rather than sending an agent off to fix a PNG that was already fine.
+ * A host that supplies its own `errorResponse` owes the same split.
+ */
 function defaultCameraErrorResponse(error: unknown): Response {
   if (error instanceof HttpBodyError) {
     return Response.json(
@@ -463,7 +488,7 @@ function defaultCameraErrorResponse(error: unknown): Response {
   }
   return Response.json(
     { ok: false, error: error instanceof Error ? error.message : String(error) },
-    { status: 400 },
+    { status: error instanceof CameraInputError ? error.status : 500 },
   );
 }
 

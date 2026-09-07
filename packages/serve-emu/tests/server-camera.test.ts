@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ControlInputQueue } from "../src/control-input-queue.ts";
@@ -267,6 +267,22 @@ describe("standalone server camera image API", () => {
         readCameraWiring: async () => true,
       },
     );
+  });
+
+  test("reports a feed directory it cannot write as a server failure", async () => {
+    await withServer(async (captured) => {
+      await chmod(root, 0o500);
+      try {
+        const response = await postImage(
+          captured,
+          Uint8Array.from(solidPng(16, 16, [7, 7, 7])),
+        );
+        expect(response.status).toBe(500);
+        expect((await response.json()).error).toContain("EACCES");
+      } finally {
+        await chmod(root, 0o700);
+      }
+    });
   });
 
   test("rejects a body the emulator could not decode", async () => {

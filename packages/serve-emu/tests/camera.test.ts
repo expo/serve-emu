@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +17,7 @@ import {
   cameraLaunchArgs,
   cameraLaunchIsWired,
   clearCameraImage,
+  handleCameraRequest,
   MAX_CAMERA_IMAGE_BYTES,
   parseCameraFacing,
   placeholderCameraImage,
@@ -372,6 +380,48 @@ describe("readCameraWiring", () => {
     const { runExec, calls } = fakeConsole("R3CN90ABCDE", consoleOk(`${avdDir}\nOK\n`));
     expect(await readCameraWiring("R3CN90ABCDE", runExec)).toBe(false);
     expect(calls).toEqual([]);
+  });
+});
+
+describe("handleCameraRequest error statuses", () => {
+  const serial = "emulator-5554";
+
+  async function postBody(bytes: Uint8Array): Promise<Response> {
+    const request = new Request("http://host.test/api/camera/image?facing=back", {
+      method: "POST",
+      headers: { "Content-Type": "image/png" },
+      body: Uint8Array.from(bytes),
+    });
+    const response = await handleCameraRequest(request, new URL(request.url), {
+      serial,
+      readWiring: unwired,
+    });
+    if (!response) throw new Error("the camera handler did not answer");
+    return response;
+  }
+
+  test("reports a feed directory it cannot write as a server failure", async () => {
+    await chmod(root, 0o500);
+    try {
+      const response = await postBody(solidPng(16, 16, [1, 2, 3]));
+      expect(response.status).toBe(500);
+      expect(await response.json()).toMatchObject({
+        ok: false,
+        error: expect.stringContaining("EACCES"),
+      });
+    } finally {
+      await chmod(root, 0o700);
+    }
+  });
+
+  test("still reports a body the emulator cannot load as bad input", async () => {
+    const jpeg = Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, ...new Array(64).fill(0)]);
+    const response = await postBody(jpeg);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("PNG only"),
+    });
   });
 });
 

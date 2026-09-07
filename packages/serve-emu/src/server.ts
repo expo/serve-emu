@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import type { ServerWebSocket } from "bun";
 import {
+  CameraInputError,
   cameraLaunchIsWired,
   handleCameraRequest,
   readCameraWiring,
@@ -924,6 +925,8 @@ export async function startServer(
     if (err instanceof HttpBodyError) {
       status = err.status;
       code = err.code;
+    } else if (err instanceof CameraInputError) {
+      status = err.status;
     } else if (err instanceof WebRtcSignalingError) {
       status = err.status;
       code = err.code;
@@ -2883,7 +2886,9 @@ export async function startServer(
         serial: requestContext.serial,
         readWiring,
         beforeMutation: () => sessions.assertCurrent(requestContext),
-        errorResponse,
+        // A camera failure this router cannot classify is a host failure, not
+        // the 400 the other routes fall back to.
+        errorResponse: (err) => errorResponse(err, 500),
       });
       if (cameraResponse) return cameraResponse;
 
