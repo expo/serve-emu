@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { listAllDevices, type Device } from "./adb.ts";
+import { listAllDevices, readEmuConsoleValue, type Device } from "./adb.ts";
 import { cameraLaunchArgs, seedCameraFeeds } from "./camera.ts";
 import {
   isEmulatorSerial,
@@ -224,24 +224,12 @@ function adb(
   return runExec("adb", ["-s", serial, ...args], { timeout: 5_000 });
 }
 
-function parseEmuAvdName(stdout: string): string | null {
-  return (
-    stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find((line) => line && line !== "OK" && !line.startsWith("KO:")) ?? null
-  );
-}
-
 async function runningAvdName(
   serial: string,
   runExec: typeof execText = execText,
 ): Promise<string | null> {
-  const fromConsole = await adb(serial, ["emu", "avd", "name"], runExec);
-  if (execSucceeded(fromConsole)) {
-    const name = parseEmuAvdName(fromConsole.stdout);
-    if (name) return name;
-  }
+  const fromConsole = await readEmuConsoleValue(serial, ["avd", "name"], runExec);
+  if (fromConsole) return fromConsole;
 
   const fromProp = await adb(
     serial,

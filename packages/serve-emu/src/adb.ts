@@ -4,6 +4,7 @@ import { execBuffer, execText, type ExecResult } from "./exec.ts";
 const ADB_QUERY_TIMEOUT_MS = 2_000;
 const ADB_MUTATION_TIMEOUT_MS = 5_000;
 const ADB_SCREENSHOT_TIMEOUT_MS = 8_000;
+const EMU_CONSOLE_TIMEOUT_MS = 5_000;
 
 export type Device = { serial: string; state: string };
 export type OrientationMode = "auto" | "portrait" | "landscape";
@@ -117,6 +118,28 @@ export function shellSpawn(
   runSpawn: typeof spawn = spawn,
 ) {
   return runSpawn("adb", ["-s", serial, "shell", ...cmd]);
+}
+
+/**
+ * Run an emulator console command and return the single value it printed. The
+ * console echoes the value on its own line and then `OK`, or `KO: <reason>`
+ * when it refuses. Returns null when the command fails or prints no value.
+ */
+export async function readEmuConsoleValue(
+  serial: string,
+  args: string[],
+  runExec: typeof execText = execText,
+): Promise<string | null> {
+  const r = await runExec("adb", ["-s", serial, "emu", ...args], {
+    timeout: EMU_CONSOLE_TIMEOUT_MS,
+  });
+  if (execFailed(r)) return null;
+  return (
+    r.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line && line !== "OK" && !line.startsWith("KO:")) ?? null
+  );
 }
 
 export async function getDeviceSize(
