@@ -34,11 +34,32 @@ describe("WebSocket contracts", () => {
     const messages = [
       parseWsServerMessage({ ok: true }),
       parseWsServerMessage({ ok: false, error: "bad gesture" }),
-      parseWsServerMessage({ type: "video-session", size: { width: 1080, height: 2400 } }),
+      parseWsServerMessage({
+        type: "video-session",
+        size: { width: 1080, height: 2400 },
+        codec: "vp9",
+      }),
     ];
     expect(messages.map(serverMessageName)).toEqual(["ack", "failure", "video-session"]);
     expect(() =>
-      parseWsServerMessage({ type: "video-session", size: { width: 0, height: 2400 } }),
+      parseWsServerMessage({
+        type: "video-session",
+        size: { width: 0, height: 2400 },
+        codec: "h264",
+      }),
     ).toThrow("positive finite");
+    expect(() =>
+      parseWsServerMessage({
+        type: "video-session",
+        size: { width: 1080, height: 2400 },
+      }),
+    ).toThrow("codec is invalid");
+    expect(() =>
+      parseWsServerMessage({
+        type: "video-session",
+        size: { width: 1080, height: 2400 },
+        codec: "av1",
+      }),
+    ).toThrow("codec is invalid");
   });
 });

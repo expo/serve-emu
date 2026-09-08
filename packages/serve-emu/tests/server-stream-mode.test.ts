@@ -5,6 +5,7 @@ import { GrpcCaptureDiagnosticsTracker } from "../src/grpc-session.ts";
 import { startServer } from "../src/server.ts";
 import type {
   GrpcImageMode,
+  GrpcVideoCodec,
   InputSource,
   StreamMode,
 } from "../src/shared/api-contracts.ts";
@@ -31,6 +32,7 @@ function fakeSession(
   mode: StreamMode,
   grpcImageMode?: GrpcImageMode,
   inputSource: InputSource = "scrcpy",
+  grpcVideoCodec: GrpcVideoCodec = "h264",
 ) {
   const end = deferred<null>();
   let closeCalls = 0;
@@ -46,7 +48,7 @@ function fakeSession(
     serial,
     meta: {
       deviceName: `${mode}:${serial}`,
-      codecId: "h264",
+      codecId: grpcVideoCodec,
       width: 720,
       height: 1280,
     },
@@ -111,6 +113,7 @@ const putMode = (
   mode: StreamMode,
   grpcImageMode?: GrpcImageMode,
   inputSource?: InputSource,
+  grpcVideoCodec?: GrpcVideoCodec,
 ): Promise<Response> =>
   request(captured, "/api/stream-mode", {
     method: "PUT",
@@ -119,6 +122,7 @@ const putMode = (
       mode,
       ...(grpcImageMode === undefined ? {} : { grpcImageMode }),
       ...(inputSource === undefined ? {} : { inputSource }),
+      ...(grpcVideoCodec === undefined ? {} : { grpcVideoCodec }),
     }),
   });
 
@@ -326,6 +330,21 @@ describe("server stream source switching", () => {
       },
     });
 
+    const scrcpyCodec = await request(captured, "/api/stream-mode", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "scrcpy", grpcVideoCodec: "vp8" }),
+    });
+    expect(scrcpyCodec.status).toBe(400);
+    expect(await scrcpyCodec.json()).toEqual({
+      ok: false,
+      error: {
+        code: "invalid_request",
+        message:
+          "stream mode request gRPC options are available only with mode grpc-screenshot",
+      },
+    });
+
     await started.stop();
   });
 
@@ -352,15 +371,18 @@ describe("server stream source switching", () => {
     expect(openCalls).toBe(0);
   });
 
-  test("passes the configured initial gRPC image mode to capture", async () => {
+  test("passes the configured initial gRPC image mode and codec to capture", async () => {
     const opened: Array<{
       mode: StreamMode;
       grpcImageMode: GrpcImageMode;
+      grpcVideoCodec: GrpcVideoCodec;
     }> = [];
     const capture = fakeSession(
       "emulator-5554",
       "grpc-screenshot",
       "mmap",
+      "scrcpy",
+      "vp9",
     );
     const captured: CapturedServer = { options: null };
     const started = await startServer(
@@ -369,10 +391,15 @@ describe("server stream source switching", () => {
         port: 3300,
         streamMode: "grpc-screenshot",
         grpcImageMode: "mmap",
+        grpcVideoCodec: "vp9",
       },
       {
-        openSession: async ({ mode, grpcImageMode }) => {
-          opened.push({ mode, grpcImageMode });
+        openSession: async ({ mode, grpcImageMode, grpcVideoCodec }) => {
+          opened.push({
+            mode,
+            grpcImageMode,
+            grpcVideoCodec: grpcVideoCodec ?? "h264",
+          });
           return capture.session;
         },
         serve: capturingServe(captured),
@@ -380,17 +407,23 @@ describe("server stream source switching", () => {
     );
 
     expect(opened).toEqual([
-      { mode: "grpc-screenshot", grpcImageMode: "mmap" },
+      {
+        mode: "grpc-screenshot",
+        grpcImageMode: "mmap",
+        grpcVideoCodec: "vp9",
+      },
     ]);
     expect(
       await (await request(captured, "/api/stream-mode")).json(),
     ).toMatchObject({
       mode: "grpc-screenshot",
       grpcImageMode: "mmap",
+      grpcVideoCodec: "vp9",
     });
     expect(await (await request(captured, "/health")).json()).toMatchObject({
       streamMode: "grpc-screenshot",
       grpcImageMode: "mmap",
+      grpcVideoCodec: "vp9",
       grpcCapture: { imageMode: "mmap", usableImages: 0 },
     });
     await started.stop();
@@ -514,6 +547,7 @@ describe("server stream source switching", () => {
       grpcImageMode: "png",
       inputSource: "scrcpy",
       availableInputSources: ["scrcpy"],
+      grpcVideoCodec: "h264",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 0,
     });
@@ -641,6 +675,58 @@ describe("server stream source switching", () => {
 
     await started.stop();
     expect(captures[2]?.closeCalls()).toBe(1);
+  });
+
+  test("restarts gRPC capture when switching among h264, vp8, and vp9", async () => {
+    const opened: Array<{
+      mode: StreamMode;
+      grpcVideoCodec: GrpcVideoCodec;
+    }> = [];
+    const captured: CapturedServer = { options: null };
+    const started = await startServer(
+      { serial: "emulator-5554", port: 3300 },
+      {
+        openSession: async ({ serial, mode, grpcVideoCodec }) => {
+          const codec = grpcVideoCodec ?? "h264";
+          opened.push({ mode, grpcVideoCodec: codec });
+          return fakeSession(
+            serial,
+            mode,
+            undefined,
+            "scrcpy",
+            codec,
+          ).session;
+        },
+        serve: capturingServe(captured),
+      },
+    );
+
+    try {
+      for (const [index, codec] of (["vp8", "vp9", "h264"] as const).entries()) {
+        const response = await putMode(
+          captured,
+          "grpc-screenshot",
+          undefined,
+          undefined,
+          codec,
+        );
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({
+          mode: "grpc-screenshot",
+          grpcImageMode: "png",
+          grpcVideoCodec: codec,
+          sessionGeneration: index + 1,
+        });
+      }
+      expect(opened).toEqual([
+        { mode: "scrcpy", grpcVideoCodec: "h264" },
+        { mode: "grpc-screenshot", grpcVideoCodec: "vp8" },
+        { mode: "grpc-screenshot", grpcVideoCodec: "vp9" },
+        { mode: "grpc-screenshot", grpcVideoCodec: "h264" },
+      ]);
+    } finally {
+      await started.stop();
+    }
   });
 
   test("reports the image mode paired with a newly published context while the old context drains", async () => {

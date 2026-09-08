@@ -1,9 +1,19 @@
-import { buildCodecString, scanAU } from "./h264";
+import { scanAU } from "./h264.ts";
 import {
   controlAcknowledgementMessage,
   logControlAcknowledgement,
 } from "./control-ack";
 import { epochNowMs, parseFramePacket } from "../../shared/frame-meta";
+import type { GrpcVideoCodec } from "../../shared/api-contracts.ts";
+import {
+  fixedWebCodecsCodec,
+  isWebCodecsUnsupportedError,
+  parseVideoSession,
+  resolveVideoKeyFrame,
+  videoCodecLabel,
+  webCodecsCodec,
+  webCodecsHardwareAcceleration,
+} from "./video-codec.ts";
 import {
   StreamSessionResources,
   beginStreamGeneration,
@@ -45,7 +55,12 @@ export type StreamStats = {
 type StreamWorkerEventPayload =
   | { type: "lifecycle"; generation: number; state: StreamLifecycleState }
   | { type: "status"; generation: number; status: string }
-  | { type: "session"; generation: number; size: { width: number; height: number } }
+  | {
+      type: "session";
+      generation: number;
+      size: { width: number; height: number };
+      codec: GrpcVideoCodec;
+    }
   | { type: "rendered"; generation: number; at: number }
   | { type: "stats"; generation: number; stats: StreamStats }
   | { type: "control-error"; generation: number; message: string }
@@ -90,6 +105,8 @@ let reconnectDelay = 500;
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let statsTimer: ReturnType<typeof setInterval> | null = null;
 let decoder: VideoDecoder | null = null;
+let activeCodec: GrpcVideoCodec | null = null;
+let decoderConfigFailed = false;
 let sawKeyframe = false;
 let frameIdx = 0;
 let renderHandle = 0;
@@ -181,6 +198,7 @@ const resetSessionResources = () => {
   closeDecoderInstance();
   cancelRender();
   resources.reset();
+  decoderConfigFailed = false;
   sawKeyframe = false;
   frameIdx = 0;
   lastDecoderRecoveryAt = Number.NEGATIVE_INFINITY;
@@ -326,12 +344,16 @@ const renderFromQueue = (generation: number) => {
   renderedSinceTick++;
 };
 
-const ensureDecoder = (spsBytes: Uint8Array, generation: number): boolean => {
+const ensureDecoder = (
+  codec: string,
+  sourceCodec: GrpcVideoCodec,
+  generation: number,
+): boolean => {
   if (!isCurrentStreamGeneration(lifecycle, generation)) return false;
   if (decoder?.state === "configured") return true;
+  if (decoderConfigFailed) return false;
   closeDecoderInstance();
   if (!ctx) return false;
-  const codec = buildCodecString(spsBytes);
   let dec: VideoDecoder;
   dec = new VideoDecoder({
     output: (frame) => {
@@ -347,12 +369,26 @@ const ensureDecoder = (spsBytes: Uint8Array, generation: number): boolean => {
     error: (e) => {
       if (decoder !== dec || !isCurrentStreamGeneration(lifecycle, generation)) return;
       console.error("VideoDecoder error", e);
+      if (isWebCodecsUnsupportedError(e)) {
+        decoderConfigFailed = true;
+        closeDecoderInstance();
+        postStatus(
+          activeCodec
+            ? `${videoCodecLabel(activeCodec)} unsupported by WebCodecs`
+            : "decoder config failed",
+        );
+        return;
+      }
       postStatus("decoder error");
       beginDecoderRecovery();
     },
   });
   try {
-    dec.configure({ codec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
+    dec.configure({
+      codec,
+      optimizeForLatency: true,
+      hardwareAcceleration: webCodecsHardwareAcceleration(sourceCodec),
+    });
     if (!isCurrentStreamGeneration(lifecycle, generation)) {
       dec.close();
       return false;
@@ -366,17 +402,26 @@ const ensureDecoder = (spsBytes: Uint8Array, generation: number): boolean => {
     return true;
   } catch (e) {
     console.error("VideoDecoder configure failed", e);
+    decoderConfigFailed = true;
     try {
       dec.close();
     } catch {}
-    postStatus("decoder config failed");
-    requestKeyframe(generation);
+    postStatus(
+      activeCodec
+        ? `${videoCodecLabel(activeCodec)} unsupported by WebCodecs`
+        : "decoder config failed",
+    );
     return false;
   }
 };
 
 const feedFrame = (raw: ArrayBuffer, generation: number) => {
   if (!isCurrentStreamGeneration(lifecycle, generation)) return;
+  const codec = activeCodec;
+  // Binary data is deliberately unusable until the server announces the
+  // codec for this generation. Guessing H.264 here could feed VPx bytes into a
+  // stale decoder during a live source/codec switch.
+  if (!codec) return;
   const recvMs = epochNowMs();
   let packet: ReturnType<typeof parseFramePacket>;
   try {
@@ -391,13 +436,25 @@ const feedFrame = (raw: ArrayBuffer, generation: number) => {
     transitSumMs += recvMs - packet.serverTsMs;
     transitCount++;
   }
-  const needsScan =
-    packet.isKey === null ||
-    (packet.isKey && (!decoder || decoder.state !== "configured" || droppingUntilKeyframe));
-  const scanned = needsScan ? scanAU(packet.data) : null;
-  const isKey = packet.isKey ?? scanned?.isKey ?? false;
-  const spsBytes = scanned?.spsBytes ?? null;
-  if (spsBytes && !ensureDecoder(spsBytes, generation)) return;
+  const needsH264Scan =
+    codec === "h264" &&
+    (packet.isKey === null ||
+      (packet.isKey &&
+        (!decoder || decoder.state !== "configured" || droppingUntilKeyframe)));
+  const scanned = needsH264Scan ? scanAU(packet.data) : null;
+  const isKey =
+    packet.isKey ??
+    scanned?.isKey ??
+    resolveVideoKeyFrame(codec, null, packet.data);
+  const decoderCodec = webCodecsCodec(codec, scanned?.spsBytes ?? null);
+  if (
+    (!decoder || decoder.state !== "configured") &&
+    decoderCodec &&
+    !ensureDecoder(decoderCodec, codec, generation)
+  ) {
+    return;
+  }
+  if (decoderConfigFailed) return;
 
   if (droppingUntilKeyframe) {
     if (!isKey) return;
@@ -409,7 +466,7 @@ const feedFrame = (raw: ArrayBuffer, generation: number) => {
   }
 
   if (!decoder || decoder.state !== "configured") {
-    if (!isKey) requestKeyframe(generation);
+    requestKeyframe(generation);
     return;
   }
 
@@ -459,6 +516,7 @@ const connect = (reason: "connect" | "reconnect") => {
   try {
     previousSocket?.close();
   } catch {}
+  activeCodec = null;
   beginWorkerGeneration("connecting", reason);
 
   let sock: WebSocket;
@@ -489,6 +547,7 @@ const connect = (reason: "connect" | "reconnect") => {
   sock.onclose = () => {
     if (stopped || ws !== sock) return;
     ws = null;
+    activeCodec = null;
     const retryIn = reconnectDelay;
     beginWorkerGeneration("disconnected", "disconnect");
     postStatus(`disconnected — retrying in ${Math.round(retryIn / 1000)}s`, true);
@@ -511,16 +570,21 @@ const connect = (reason: "connect" | "reconnect") => {
         });
       }
       try {
-        const msg = JSON.parse(e.data) as { type?: string; size?: { width: number; height: number } };
-        if (
-          msg.type === "video-session" &&
-          msg.size &&
-          Number.isFinite(msg.size.width) &&
-          Number.isFinite(msg.size.height)
-        ) {
+        const msg = parseVideoSession(JSON.parse(e.data));
+        if (msg) {
           const generation = beginWorkerGeneration("awaiting-keyframe", "video-session");
+          activeCodec = msg.codec;
           droppingUntilKeyframe = true;
-          postEvent({ type: "session", generation, size: msg.size });
+          postEvent({
+            type: "session",
+            generation,
+            size: msg.size,
+            codec: msg.codec,
+          });
+          const fixedCodec = fixedWebCodecsCodec(msg.codec);
+          if (fixedCodec && !ensureDecoder(fixedCodec, msg.codec, generation)) {
+            return;
+          }
           requestKeyframe(generation);
         }
       } catch {}
@@ -548,6 +612,7 @@ const stop = () => {
   }
   const sock = ws;
   ws = null;
+  activeCodec = null;
   beginWorkerGeneration("stopped", "stop");
   try {
     sock?.close();

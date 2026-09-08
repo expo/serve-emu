@@ -12,6 +12,7 @@ import {
 import type { RunningAvd } from "../src/emulator.ts";
 import type { ScrcpySession } from "../src/scrcpy.ts";
 import type {
+  GrpcVideoCodec,
   InputSource,
   StreamMode,
 } from "../src/shared/api-contracts.ts";
@@ -731,6 +732,19 @@ describe("createRouter stream mode", () => {
       },
     });
 
+    const scrcpyCodec = await router.handleRequest(
+      put("/api/stream-mode", { mode: "scrcpy", grpcVideoCodec: "vp8" }),
+    );
+    expect(scrcpyCodec.status).toBe(400);
+    expect(await responseJson(scrcpyCodec)).toEqual({
+      ok: false,
+      error: {
+        code: "invalid_request",
+        message:
+          "stream mode request gRPC options are available only with mode grpc-screenshot",
+      },
+    });
+
     await router.stopAll();
   });
 
@@ -760,6 +774,7 @@ describe("createRouter stream mode", () => {
       grpcImageMode: "png",
       inputSource: "scrcpy",
       availableInputSources: ["scrcpy"],
+      grpcVideoCodec: "h264",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 0,
     });
@@ -787,6 +802,7 @@ describe("createRouter stream mode", () => {
       grpcImageMode: "png",
       inputSource: "scrcpy",
       availableInputSources: ["scrcpy", "grpc"],
+      grpcVideoCodec: "h264",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 1,
     });
@@ -885,6 +901,60 @@ describe("createRouter stream mode", () => {
       },
     });
     expect(opened).toHaveLength(3);
+
+    await router.stopAll();
+  });
+
+  test("atomically replaces gRPC capture for h264, vp8, and vp9", async () => {
+    const opened: Array<{
+      mode: StreamMode;
+      grpcVideoCodec: GrpcVideoCodec;
+    }> = [];
+    const router = createRouter(
+      { serial: "emulator-5554" },
+      {
+        listDevices: async () => [
+          { serial: "emulator-5554", state: "device" },
+        ],
+        createApp: (options) =>
+          createApp(options, {
+            startSession: async ({ mode, grpcVideoCodec }) => {
+              opened.push({
+                mode,
+                grpcVideoCodec: grpcVideoCodec ?? "h264",
+              });
+              return liveStreamSession(mode);
+            },
+          }),
+      },
+    );
+
+    await router.handleRequest(
+      new Request("http://router.test/api/stream-mode"),
+    );
+    for (const [index, grpcVideoCodec] of (
+      ["vp8", "vp9", "h264"] as const
+    ).entries()) {
+      const response = await router.handleRequest(
+        put("/api/stream-mode", {
+          mode: "grpc-screenshot",
+          grpcVideoCodec,
+        }),
+      );
+      expect(response.status).toBe(200);
+      expect(await responseJson(response)).toMatchObject({
+        mode: "grpc-screenshot",
+        grpcImageMode: "png",
+        grpcVideoCodec,
+        sessionGeneration: index + 1,
+      });
+    }
+    expect(opened).toEqual([
+      { mode: "scrcpy", grpcVideoCodec: "h264" },
+      { mode: "grpc-screenshot", grpcVideoCodec: "vp8" },
+      { mode: "grpc-screenshot", grpcVideoCodec: "vp9" },
+      { mode: "grpc-screenshot", grpcVideoCodec: "h264" },
+    ]);
 
     await router.stopAll();
   });

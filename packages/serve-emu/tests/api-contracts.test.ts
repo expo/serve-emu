@@ -2,9 +2,10 @@ import { describe, expect, test } from "bun:test";
 import {
   API_ERROR_CODES,
   API_SUCCESS_PARSERS,
-  isGrpcImageMode,
-  isInputSource,
   isApiFailure,
+  isGrpcImageMode,
+  isGrpcVideoCodec,
+  isInputSource,
   isStreamMode,
   parseApiFailure,
   parseApiResponse,
@@ -52,11 +53,13 @@ describe("API contracts", () => {
         mode: "grpc-screenshot",
         grpcImageMode: "mmap",
         inputSource: "scrcpy",
+        grpcVideoCodec: "vp9",
       }),
     ).toEqual({
       mode: "grpc-screenshot",
       grpcImageMode: "mmap",
       inputSource: "scrcpy",
+      grpcVideoCodec: "vp9",
     });
     expect(() => parseStreamModeRequest(null)).toThrow(
       "stream mode request must be an object",
@@ -73,6 +76,12 @@ describe("API contracts", () => {
     expect(() =>
       parseStreamModeRequest({ mode: "scrcpy", inputSource: "grpc" })
     ).toThrow("available only with mode grpc-screenshot");
+    expect(() =>
+      parseStreamModeRequest({ mode: "grpc-screenshot", grpcVideoCodec: "av1" })
+    ).toThrow("stream mode request.grpcVideoCodec is invalid");
+    expect(() =>
+      parseStreamModeRequest({ mode: "scrcpy", grpcVideoCodec: "vp8" })
+    ).toThrow("available only with mode grpc-screenshot");
   });
 
   test("recognizes only explicit gRPC image modes", () => {
@@ -87,6 +96,14 @@ describe("API contracts", () => {
     expect(isInputSource("grpc")).toBe(true);
     expect(isInputSource("adb")).toBe(false);
     expect(isInputSource(null)).toBe(false);
+  });
+
+  test("recognizes every supported gRPC video codec", () => {
+    expect(isGrpcVideoCodec("h264")).toBe(true);
+    expect(isGrpcVideoCodec("vp8")).toBe(true);
+    expect(isGrpcVideoCodec("vp9")).toBe(true);
+    expect(isGrpcVideoCodec("av1")).toBe(false);
+    expect(isGrpcVideoCodec(null)).toBe(false);
   });
 
   test("accepts every stable failure code and rejects drift", () => {
@@ -132,6 +149,7 @@ describe("API contracts", () => {
       grpcImageMode: "mmap",
       inputSource: "scrcpy",
       availableInputSources: ["scrcpy", "grpc"],
+      grpcVideoCodec: "vp9",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 7,
     });
@@ -142,6 +160,7 @@ describe("API contracts", () => {
       grpcImageMode: "mmap",
       inputSource: "scrcpy",
       availableInputSources: ["scrcpy", "grpc"],
+      grpcVideoCodec: "vp9",
       availableModes: ["scrcpy", "grpc-screenshot"],
       sessionGeneration: 7,
     });
@@ -157,6 +176,12 @@ describe("API contracts", () => {
         grpcImageMode: "auto",
       }),
     ).toThrow("grpcImageMode");
+    expect(() =>
+      parseStreamModeResponse({
+        ...response,
+        grpcVideoCodec: "av1",
+      }),
+    ).toThrow("grpcVideoCodec");
     expect(() =>
       parseStreamModeResponse({
         ...response,

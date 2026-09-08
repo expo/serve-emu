@@ -11,6 +11,7 @@ import {
 import type {
   GrpcCaptureDiagnostics,
   GrpcImageMode,
+  GrpcVideoCodec,
   InputSource,
   StreamMode,
 } from "./shared/api-contracts.ts";
@@ -67,6 +68,8 @@ export type StartEmuSessionOptions = StartOpts & {
   grpcImageMode: GrpcImageMode;
   /** Exact input source. scrcpy capture always requires scrcpy input. */
   inputSource: InputSource;
+  /** Host encoder used by grpc-screenshot. Ignored by scrcpy. */
+  grpcVideoCodec?: GrpcVideoCodec;
 };
 
 export async function startEmuSession(

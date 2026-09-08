@@ -58,7 +58,10 @@ export type StreamDisplayStatus =
 
 export type StreamFatalStatus =
   | "WebCodecs unsupported"
-  | "canvas unavailable";
+  | "canvas unavailable"
+  | "H.264 unsupported by WebCodecs"
+  | "VP8 unsupported by WebCodecs"
+  | "VP9 unsupported by WebCodecs";
 
 export type StreamEventGenerationDisposition =
   | "invalid"
@@ -154,7 +157,13 @@ export function isCurrentStreamClientEpoch(
 }
 
 export function isStreamFatalStatus(status: string): status is StreamFatalStatus {
-  return status === "WebCodecs unsupported" || status === "canvas unavailable";
+  return (
+    status === "WebCodecs unsupported" ||
+    status === "canvas unavailable" ||
+    status === "H.264 unsupported by WebCodecs" ||
+    status === "VP8 unsupported by WebCodecs" ||
+    status === "VP9 unsupported by WebCodecs"
+  );
 }
 
 /**

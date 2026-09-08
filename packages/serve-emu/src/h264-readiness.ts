@@ -1,4 +1,5 @@
 import type { VideoFrame } from "./scrcpy.ts";
+import type { GrpcVideoCodec } from "./shared/api-contracts.ts";
 
 function annexBNalTypes(data: Buffer): Set<number> {
   const types = new Set<number>();
@@ -18,7 +19,9 @@ function annexBNalTypes(data: Buffer): Set<number> {
 }
 
 /** Readiness latch proving that a newly published source is browser-decodable. */
-export class H264StartupGate {
+export class VideoStartupGate {
+  readonly #codec: GrpcVideoCodec;
+  readonly #codecLabel: string;
   readonly #promise: Promise<void>;
   #resolve!: () => void;
   #reject!: (error: Error) => void;
@@ -28,7 +31,9 @@ export class H264StartupGate {
   #sawPps = false;
   #sawKeyFrame = false;
 
-  constructor() {
+  constructor(codec: GrpcVideoCodec) {
+    this.#codec = codec;
+    this.#codecLabel = codec === "h264" ? "H.264" : codec.toUpperCase();
     this.#promise = new Promise<void>((resolve, reject) => {
       this.#resolve = resolve;
       this.#reject = reject;
@@ -49,7 +54,9 @@ export class H264StartupGate {
       this.#sawPps ||= types.has(8);
     }
     this.#sawKeyFrame ||= frame.isKey;
-    if (this.#sawSps && this.#sawPps && this.#sawKeyFrame) {
+    const hasConfiguration =
+      this.#codec !== "h264" || (this.#sawSps && this.#sawPps);
+    if (hasConfiguration && this.#sawKeyFrame) {
       this.#settled = true;
       this.#ready = true;
       this.#resolve();
@@ -66,17 +73,17 @@ export class H264StartupGate {
     if (signal.aborted) {
       this.fail(signal.reason instanceof Error
         ? signal.reason
-        : new DOMException("H.264 startup aborted", "AbortError"));
+        : new DOMException(`${this.#codecLabel} startup aborted`, "AbortError"));
     }
     const onAbort = () =>
       this.fail(signal.reason instanceof Error
         ? signal.reason
-        : new DOMException("H.264 startup aborted", "AbortError"));
+        : new DOMException(`${this.#codecLabel} startup aborted`, "AbortError"));
     signal.addEventListener("abort", onAbort, { once: true });
     const timer = setTimeout(() => {
       this.fail(
         new Error(
-          `timed out waiting for decodable H.264 output after ${timeoutMs}ms`,
+          `timed out waiting for decodable ${this.#codecLabel} output after ${timeoutMs}ms`,
         ),
       );
     }, timeoutMs);
@@ -85,5 +92,12 @@ export class H264StartupGate {
       clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
     });
+  }
+}
+
+/** Backwards-compatible H.264 specialization used by the scrcpy path. */
+export class H264StartupGate extends VideoStartupGate {
+  constructor() {
+    super("h264");
   }
 }

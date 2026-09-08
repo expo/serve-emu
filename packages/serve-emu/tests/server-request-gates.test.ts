@@ -793,18 +793,26 @@ describe("server HTTP and WebSocket boundaries", () => {
     harness.handlers.websocket.open(rawSocket);
     harness.handlers.websocket.open(framedSocket);
 
+    expect(rawSocket.sent[0]).toEqual({
+      type: "video-session",
+      size: { width: 720, height: 1280 },
+      codec: "h264",
+    });
+    expect(framedSocket.sent[0]).toEqual(rawSocket.sent[0]);
+
     harness.session.pushFrame({
       type: "session",
       width: 1080,
       height: 1920,
       clientResized: true,
     });
-    await waitFor(() => rawSocket.sent.length === 1);
-    expect(rawSocket.sent[0]).toEqual({
+    await waitFor(() => rawSocket.sent.length === 2);
+    expect(rawSocket.sent[1]).toEqual({
       type: "video-session",
       size: { width: 1080, height: 1920 },
+      codec: "h264",
     });
-    expect(framedSocket.sent[0]).toEqual(rawSocket.sent[0]);
+    expect(framedSocket.sent[1]).toEqual(rawSocket.sent[1]);
 
     const config = Buffer.from([0, 0, 0, 1, 0x67, 0x64]);
     const keyFrame = Buffer.from([0, 0, 0, 1, 0x65, 0x01]);
@@ -886,7 +894,12 @@ describe("server HTTP and WebSocket boundaries", () => {
     expect(sockets[2]!.closes).toEqual([
       { code: 1011, reason: "frame send failed" },
     ]);
-    expect(sockets[5]!.sent).toHaveLength(1);
+    expect(sockets[5]!.sent).toHaveLength(2);
+    expect(sockets[5]!.sent[0]).toEqual({
+      type: "video-session",
+      size: { width: 720, height: 1280 },
+      codec: "h264",
+    });
 
     const health = await response(harness.request("/health"));
     expect(await health.json()).toMatchObject({
