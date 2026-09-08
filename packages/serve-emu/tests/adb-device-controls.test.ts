@@ -478,11 +478,12 @@ describe("ADB accessibility controls", () => {
     expect(writes.every((write) => write.endsWith(" 1"))).toBe(true);
   });
 
-  test("reads high text contrast as on for any non-zero int", async () => {
+  test("reads high text contrast as on only at the exact 1 Android compares to", async () => {
     for (const [raw, enabled] of [
       ["null", false],
       ["1", true],
       ["0", false],
+      ["2", false],
       ["1.9", false],
       ["not-a-flag", false],
     ] as const) {
@@ -609,7 +610,7 @@ describe("ADB display density controls", () => {
         return result("");
       }) as typeof execText;
       await expect(setDisplayDensity("device-1", invalid, runExec)).rejects.toThrow(
-        "display size scale must be between 0.5 and 2.0",
+        "display density scale must be between 0.5 and 2.0",
       );
       expect(calls).toBe(0);
     }

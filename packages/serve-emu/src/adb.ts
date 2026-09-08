@@ -469,7 +469,7 @@ function reduceMotionFromScale(raw: string): boolean {
   return raw !== "" && Number(raw.replace(",", ".")) === 0;
 }
 
-/** An unset key reads back as the literal `null`, so anything but an int is off. */
+/** `Configuration.fontWeightAdjustment` takes the raw int; an unset key reads back as `null`. */
 function enabledFromIntSetting(raw: string): boolean {
   return /^[+-]?\d+$/.test(raw) && Number(raw) !== 0;
 }
@@ -508,7 +508,8 @@ export async function getHighTextContrast(
   runExec: typeof execText = execText,
 ): Promise<HighTextContrastStatus> {
   const raw = await secureSetting(serial, "high_text_contrast_enabled", runExec);
-  return { enabled: enabledFromIntSetting(raw), raw };
+  // AccessibilityManagerService compares this key to exactly 1, not to non-zero.
+  return { enabled: raw === "1", raw };
 }
 
 /** Write the flag as the `1` or `0` int Android's `Settings.Secure` stores. */
@@ -627,7 +628,7 @@ export async function setDisplayDensity(
   runExec: typeof execText = execText,
 ): Promise<DisplayDensityStatus> {
   if (!Number.isFinite(scale) || scale < 0.5 || scale > 2) {
-    throw new Error("display size scale must be between 0.5 and 2.0");
+    throw new Error("display density scale must be between 0.5 and 2.0");
   }
   const { physical } = await readDisplayDensity(serial, runExec);
   const density = Math.round(physical * scale);

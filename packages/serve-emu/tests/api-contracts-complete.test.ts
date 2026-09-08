@@ -20,6 +20,10 @@ import {
   parseLogcatEvent,
   parseLogcatEventJson,
   parseNetworkResponse,
+  parseReduceMotionResponse,
+  parseHighTextContrastResponse,
+  parseFontWeightResponse,
+  parseDisplayDensityResponse,
   parseNightModeResponse,
   parseOrientationResponse,
   parseRouteMutationResponse,
@@ -303,6 +307,51 @@ describe("complete API success contracts", () => {
       mobileData: "unknown",
       raw: { wifi: "1", mobileData: "null" },
     });
+  });
+
+  test("parses the accessibility setting payloads", () => {
+    expect(
+      parseReduceMotionResponse({
+        ok: true,
+        reduceMotion: {
+          enabled: true,
+          raw: { transition: "0", window: "0", animator: "0" },
+        },
+      }).reduceMotion,
+    ).toEqual({
+      enabled: true,
+      raw: { transition: "0", window: "0", animator: "0" },
+    });
+    expect(() =>
+      parseReduceMotionResponse({
+        ok: true,
+        reduceMotion: { enabled: true, raw: { transition: "0" } },
+      }),
+    ).toThrow("reduceMotion.raw.window");
+    expect(
+      parseHighTextContrastResponse({
+        ok: true,
+        highTextContrast: { enabled: false, raw: "null" },
+      }).highTextContrast,
+    ).toEqual({ enabled: false, raw: "null" });
+    expect(
+      parseFontWeightResponse({
+        ok: true,
+        fontWeight: { enabled: true, raw: "300" },
+      }).fontWeight,
+    ).toEqual({ enabled: true, raw: "300" });
+    expect(
+      parseDisplayDensityResponse({
+        ok: true,
+        displayDensity: { scale: 1.143, widthDp: 360, raw: "Physical density: 420" },
+      }).displayDensity,
+    ).toEqual({ scale: 1.143, widthDp: 360, raw: "Physical density: 420" });
+    expect(() =>
+      parseDisplayDensityResponse({
+        ok: true,
+        displayDensity: { scale: "1", widthDp: 360, raw: "" },
+      }),
+    ).toThrow("displayDensity.scale");
   });
 
   test("parses foreground and accessibility inspection payloads", () => {
