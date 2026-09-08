@@ -363,6 +363,7 @@ describe("startServer device session lifecycle", () => {
       serial: "C",
       proc: null,
       ownsProcess: true,
+      cameraFeed: false,
       stop: () => {
         launchStopCalls += 1;
       },

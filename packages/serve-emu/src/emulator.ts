@@ -2,7 +2,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { listAllDevices, type Device } from "./adb.ts";
+import { listAllDevices, readEmuConsoleValue, type Device } from "./adb.ts";
+import { cameraLaunchArgs, seedCameraFeeds } from "./camera.ts";
 import {
   isEmulatorSerial,
   parseEmulatorSerial,
@@ -13,6 +14,8 @@ export type EmulatorLaunch = {
   serial: string;
   proc: ChildProcess | null;
   ownsProcess: boolean;
+  /** True when this launch attached serve-emu's still-image camera feeds. */
+  cameraFeed: boolean;
   stop: () => void;
 };
 
@@ -37,6 +40,12 @@ export type StartEmulatorOpts = {
    * without a usable GPU.
    */
   gpu?: string;
+  /**
+   * Attach serve-emu's still-image camera feeds with `-camera-back` and
+   * `-camera-front imagefile:<path>`. The emulator only reads those flags at
+   * startup, so a session that wants camera passthrough has to ask for it here.
+   */
+  camera?: boolean;
 };
 
 export type EmulatorResolverDependencies = {
@@ -215,24 +224,12 @@ function adb(
   return runExec("adb", ["-s", serial, ...args], { timeout: 5_000 });
 }
 
-function parseEmuAvdName(stdout: string): string | null {
-  return (
-    stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find((line) => line && line !== "OK" && !line.startsWith("KO:")) ?? null
-  );
-}
-
 async function runningAvdName(
   serial: string,
   runExec: typeof execText = execText,
 ): Promise<string | null> {
-  const fromConsole = await adb(serial, ["emu", "avd", "name"], runExec);
-  if (execSucceeded(fromConsole)) {
-    const name = parseEmuAvdName(fromConsole.stdout);
-    if (name) return name;
-  }
+  const fromConsole = await readEmuConsoleValue(serial, ["avd", "name"], runExec);
+  if (fromConsole) return fromConsole;
 
   const fromProp = await adb(
     serial,
@@ -353,7 +350,13 @@ export async function startEmulator(
   const running = await findRunningAvd(name, dependencies);
   if (running) {
     if (!opts.restartAvd) {
-      return { serial: running.serial, proc: null, ownsProcess: false, stop: () => {} };
+      return {
+        serial: running.serial,
+        proc: null,
+        ownsProcess: false,
+        cameraFeed: false,
+        stop: () => {},
+      };
     }
     await stopEmulator(running.serial, runExec);
     await waitForEmulatorExit(running.serial, 30_000, dependencies);
@@ -362,8 +365,13 @@ export async function startEmulator(
   const port = opts.port ?? (await pickEmulatorPort(dependencies.listAllDevices));
   validateEmulatorPort(port);
 
+  const serial = `emulator-${port}`;
   const args = [emulatorAvdArg(name), "-port", String(port)];
   if (opts.gpu) args.push("-gpu", opts.gpu);
+  if (opts.camera) {
+    await seedCameraFeeds(serial);
+    args.push(...cameraLaunchArgs(serial));
+  }
 
   const proc = (dependencies.spawn ?? spawn)(emulator, args, {
     stdio: ["ignore", "inherit", "inherit"],
@@ -371,7 +379,6 @@ export async function startEmulator(
   const spawnError = new Promise<never>((_, reject) => {
     proc.once("error", reject);
   });
-  const serial = `emulator-${port}`;
   let stopped = false;
 
   const stop = () => {
@@ -393,7 +400,13 @@ export async function startEmulator(
       ),
       spawnError,
     ]);
-    return { serial, proc, ownsProcess: true, stop };
+    return {
+      serial,
+      proc,
+      ownsProcess: true,
+      cameraFeed: Boolean(opts.camera),
+      stop,
+    };
   } catch (err) {
     stop();
     throw err;

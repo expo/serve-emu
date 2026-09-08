@@ -9,6 +9,8 @@ import type {
   AppliedGeoFix,
   AvdStartResponse,
   AvdStopResponse,
+  CameraFacing,
+  CameraStatus,
   DeviceGridResponse,
   DeviceListResponse,
   DeviceSelectionResponse,
@@ -97,4 +99,15 @@ export type ApiDependencies = {
   startRoute: (route: RoutePlaybackRequest) => Promise<RoutePlaybackSnapshot>;
   stopRoute: () => RoutePlaybackSnapshot;
   controlRoute: (action: RouteControlAction) => RoutePlaybackSnapshot;
+
+  getCamera: () => Promise<CameraStatus>;
+  /** `null` when that facing has no feed file yet. */
+  readCameraImage: (facing: CameraFacing) => Promise<Uint8Array | null>;
+  /**
+   * Mutate only. The routes read the status back through `getCamera`, so these
+   * line up with the same-named functions in `camera.ts` rather than returning
+   * a wider shape a host would have to assemble.
+   */
+  setCameraImage: (facing: CameraFacing, png: Uint8Array) => Promise<void>;
+  clearCameraImage: (facing: CameraFacing) => Promise<void>;
 };

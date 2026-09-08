@@ -2,6 +2,12 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import type { ServerWebSocket } from "bun";
+import {
+  CameraInputError,
+  cameraLaunchIsWired,
+  handleCameraRequest,
+  readCameraWiring,
+} from "./camera.ts";
 import { getExecSnapshot } from "./exec.ts";
 import {
   getFontScale,
@@ -318,6 +324,7 @@ export type ServerDependencies = {
   stopEmulator?: typeof stopEmulator;
   listRunningAvds?: typeof listRunningAvds;
   listAvds?: typeof listAvds;
+  readCameraWiring?: typeof readCameraWiring;
   loadAccessibility?: (
     serial: string,
     signal: AbortSignal,
@@ -393,6 +400,7 @@ export async function startServer(
   const killEmulator = dependencies.stopEmulator ?? stopEmulator;
   const listActiveAvds = dependencies.listRunningAvds ?? listRunningAvds;
   const availableAvds = dependencies.listAvds ?? listAvds;
+  const readWiring = dependencies.readCameraWiring ?? readCameraWiring;
   const loadAccessibility =
     dependencies.loadAccessibility ??
     ((serial: string, signal: AbortSignal) =>
@@ -917,6 +925,8 @@ export async function startServer(
     if (err instanceof HttpBodyError) {
       status = err.status;
       code = err.code;
+    } else if (err instanceof CameraInputError) {
+      status = err.status;
     } else if (err instanceof WebRtcSignalingError) {
       status = err.status;
       code = err.code;
@@ -2261,7 +2271,18 @@ export async function startServer(
           const avd = (payload as Record<string, unknown>).avd;
           if (typeof avd !== "string" || !avd.trim())
             throw new Error("avd is required");
-          const launch = await launchEmulator({ avd: avd.trim() });
+          const requestedCamera = (payload as Record<string, unknown>).camera;
+          if (requestedCamera !== undefined && typeof requestedCamera !== "boolean") {
+            throw new Error("camera must be a boolean");
+          }
+          const camera = requestedCamera === true;
+          const launch = await launchEmulator({ avd: avd.trim(), camera });
+          if (camera && !(await cameraLaunchIsWired(launch, readWiring))) {
+            throw new Error(
+              `AVD "${avd.trim()}" is already running, so its camera source cannot be changed; ` +
+                "the emulator only reads that flag at startup. Stop it with POST /api/avds/stop first.",
+            );
+          }
           try {
             sessions.assertPublished(requestContext);
           } catch (err) {
@@ -2860,6 +2881,16 @@ export async function startServer(
           return errorResponse(err);
         }
       }
+
+      const cameraResponse = await handleCameraRequest(req, url, {
+        serial: requestContext.serial,
+        readWiring,
+        beforeMutation: () => sessions.assertCurrent(requestContext),
+        // A camera failure this router cannot classify is a host failure, not
+        // the 400 the other routes fall back to.
+        errorResponse: (err) => errorResponse(err, 500),
+      });
+      if (cameraResponse) return cameraResponse;
 
       if (url.pathname === "/ws") {
         if (requestContext.status !== "streaming") {
