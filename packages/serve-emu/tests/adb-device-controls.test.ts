@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { spawn } from "node:child_process";
 import {
+  getFontWeight,
+  getDisplayDensity,
   getDisplayRotation,
   getDeviceSize,
   getFontScale,
+  getHighTextContrast,
+  getReduceMotion,
   getNetworkStatus,
   getNightMode,
   getUserRotation,
@@ -11,8 +15,12 @@ import {
   listDevices,
   pickDevice,
   screencapPng,
+  setFontWeight,
+  setDisplayDensity,
   setFontScale,
+  setHighTextContrast,
   setNetworkEnabled,
+  setReduceMotion,
   setNightMode,
   setUserRotation,
   shell,
@@ -411,6 +419,218 @@ describe("ADB night mode controls", () => {
     );
     await expect(setNightMode("device-1", "dark", failed)).rejects.toThrow(
       "adb shell cmd uimode night yes failed: uimode unavailable",
+    );
+  });
+});
+
+describe("ADB accessibility controls", () => {
+  test("treats only an exact zero transition scale as reduced motion", async () => {
+    for (const [transition, enabled] of [
+      ["0.0", true],
+      ["0", true],
+      ["0,0", true],
+      ["1", false],
+      ["null", false],
+      ["", false],
+      ["not-a-scale", false],
+    ] as const) {
+      const runExec = (async (_command, args) =>
+        result(args.at(-1) === "transition_animation_scale" ? `${transition}\n` : "1\n")
+      ) as typeof execText;
+      await expect(getReduceMotion("device-1", runExec)).resolves.toEqual({
+        enabled,
+        raw: { transition, window: "1", animator: "1" },
+      });
+    }
+  });
+
+  test("moves all three animation scales and re-reads the authority", async () => {
+    const calls: string[] = [];
+    const runExec = (async (_command, args) => {
+      const shell = args.slice(3).join(" ");
+      calls.push(shell);
+      return result(shell.startsWith("settings get") ? "0\n" : "");
+    }) as typeof execText;
+
+    await expect(setReduceMotion("device-1", true, runExec)).resolves.toEqual({
+      enabled: true,
+      raw: { transition: "0", window: "0", animator: "0" },
+    });
+    expect(calls.slice(0, 3)).toEqual([
+      "settings put global transition_animation_scale 0",
+      "settings put global window_animation_scale 0",
+      "settings put global animator_duration_scale 0",
+    ]);
+  });
+
+  test("restores the Android defaults when reduced motion is turned off", async () => {
+    const writes: string[] = [];
+    const runExec = (async (_command, args) => {
+      const shell = args.slice(3).join(" ");
+      if (shell.startsWith("settings put")) writes.push(shell);
+      return result(shell.startsWith("settings get") ? "1\n" : "");
+    }) as typeof execText;
+
+    await expect(setReduceMotion("device-1", false, runExec)).resolves.toEqual({
+      enabled: false,
+      raw: { transition: "1", window: "1", animator: "1" },
+    });
+    expect(writes.every((write) => write.endsWith(" 1"))).toBe(true);
+  });
+
+  test("reads high text contrast as on for any non-zero int", async () => {
+    for (const [raw, enabled] of [
+      ["null", false],
+      ["1", true],
+      ["0", false],
+      ["1.9", false],
+      ["not-a-flag", false],
+    ] as const) {
+      const runExec = (async () => result(`${raw}\n`)) as typeof execText;
+      await expect(getHighTextContrast("device-1", runExec)).resolves.toEqual({
+        enabled,
+        raw,
+      });
+    }
+
+    const failed = (async () =>
+      result("", { status: 1, stderr: "settings unavailable" })) as typeof execText;
+    await expect(getHighTextContrast("device-1", failed)).rejects.toThrow(
+      "settings get secure high_text_contrast_enabled failed: settings unavailable",
+    );
+  });
+
+  test("writes high text contrast as the int Settings.Secure stores", async () => {
+    const calls: string[] = [];
+    const runExec = (async (_command, args) => {
+      const shell = args.slice(3).join(" ");
+      calls.push(shell);
+      return result(shell.startsWith("settings get") ? "1\n" : "");
+    }) as typeof execText;
+
+    await expect(setHighTextContrast("device-1", true, runExec)).resolves.toEqual({
+      enabled: true,
+      raw: "1",
+    });
+    expect(calls).toEqual([
+      "settings put secure high_text_contrast_enabled 1",
+      "settings get secure high_text_contrast_enabled",
+    ]);
+  });
+
+  test("writes the font weight adjustment Android's own Bold text toggle uses", async () => {
+    const calls: string[] = [];
+    const runExec = (async (_command, args) => {
+      const shell = args.slice(3).join(" ");
+      calls.push(shell);
+      return result(shell.startsWith("settings get") ? "300\n" : "");
+    }) as typeof execText;
+
+    await expect(setFontWeight("device-1", true, runExec)).resolves.toEqual({
+      enabled: true,
+      raw: "300",
+    });
+    expect(calls).toEqual([
+      "settings put secure font_weight_adjustment 300",
+      "settings get secure font_weight_adjustment",
+    ]);
+
+    const off = (async () => result("0\n")) as typeof execText;
+    await expect(getFontWeight("device-1", off)).resolves.toEqual({
+      enabled: false,
+      raw: "0",
+    });
+  });
+});
+
+describe("ADB display density controls", () => {
+  const DENSITY_OUTPUT = "Physical density: 420\nOverride density: 480";
+  const SIZE_OUTPUT = "Physical size: 1080x2400";
+
+  function densityRunner(density: string, size = SIZE_OUTPUT) {
+    const calls: string[] = [];
+    const runExec = (async (_command, args) => {
+      const shell = args.slice(3).join(" ");
+      calls.push(shell);
+      if (shell === "wm density") return result(`${density}\n`);
+      if (shell === "wm size") return result(`${size}\n`);
+      return result("");
+    }) as typeof execText;
+    return { runExec, calls };
+  }
+
+  test("reports the override as a ratio and the smallest-width dp", async () => {
+    const { runExec } = densityRunner(DENSITY_OUTPUT);
+    await expect(getDisplayDensity("device-1", runExec)).resolves.toEqual({
+      scale: Math.round((480 / 420) * 1000) / 1000,
+      widthDp: Math.round((1080 * 160) / 480),
+      raw: DENSITY_OUTPUT,
+    });
+  });
+
+  test("reports an unset override as the physical density", async () => {
+    const { runExec } = densityRunner("Physical density: 420");
+    await expect(getDisplayDensity("device-1", runExec)).resolves.toEqual({
+      scale: 1,
+      widthDp: Math.round((1080 * 160) / 420),
+      raw: "Physical density: 420",
+    });
+  });
+
+  test("prefers an override size so the dp width follows the resized display", async () => {
+    const { runExec } = densityRunner(
+      "Physical density: 420",
+      "Physical size: 1080x2400\nOverride size: 720x1600",
+    );
+    await expect(getDisplayDensity("device-1", runExec)).resolves.toEqual({
+      scale: 1,
+      widthDp: Math.round((720 * 160) / 420),
+      raw: "Physical density: 420",
+    });
+  });
+
+  test("rejects malformed wm output", async () => {
+    const { runExec } = densityRunner("Physical density: nonsense");
+    await expect(getDisplayDensity("device-1", runExec)).rejects.toThrow(
+      "Could not parse wm density output",
+    );
+
+    const { runExec: badSize } = densityRunner("Physical density: 420", "no size here");
+    await expect(getDisplayDensity("device-1", badSize)).rejects.toThrow(
+      "Could not parse wm size output",
+    );
+  });
+
+  test("validates the scale before touching the device", async () => {
+    for (const invalid of [Number.NaN, 0.49, 2.01]) {
+      let calls = 0;
+      const runExec = (async () => {
+        calls++;
+        return result("");
+      }) as typeof execText;
+      await expect(setDisplayDensity("device-1", invalid, runExec)).rejects.toThrow(
+        "display size scale must be between 0.5 and 2.0",
+      );
+      expect(calls).toBe(0);
+    }
+  });
+
+  test("scales from the physical density and resets rather than pinning the default", async () => {
+    const { runExec, calls } = densityRunner("Physical density: 420");
+    await expect(setDisplayDensity("device-1", 1.1, runExec)).resolves.toMatchObject({
+      scale: 1,
+    });
+    expect(calls).toContain("wm density 462");
+
+    const { runExec: reset, calls: resetCalls } = densityRunner("Physical density: 420");
+    await setDisplayDensity("device-1", 1, reset);
+    expect(resetCalls).toContain("wm density reset");
+  });
+
+  test("refuses a density below the Android minimum", async () => {
+    const { runExec } = densityRunner("Physical density: 120");
+    await expect(setDisplayDensity("device-1", 0.5, runExec)).rejects.toThrow(
+      "display density 60 is below the Android minimum of 72",
     );
   });
 });

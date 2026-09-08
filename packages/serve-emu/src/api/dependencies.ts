@@ -9,21 +9,25 @@ import type {
   AppliedGeoFix,
   AvdStartResponse,
   AvdStopResponse,
+  FontWeightStatus,
   CameraFacing,
   CameraStatus,
   DeviceGridResponse,
   DeviceListResponse,
   DeviceSelectionResponse,
+  DisplayDensityStatus,
   FileImportResponse,
   FontScaleStatus,
   ForegroundApp,
   GeoFix,
+  HighTextContrastStatus,
   LocationResponse,
   NightMode,
   NightModeStatus,
   NetworkStatus,
   OrientationMode,
   OrientationStatus,
+  ReduceMotionStatus,
   RoutePlaybackRequest,
   RoutePlaybackSnapshot,
   SessionSnapshot,
@@ -65,6 +69,14 @@ export type ApiDependencies = {
   setFontScale: (scale: number) => Promise<FontScaleStatus>;
   getNetwork: () => Promise<NetworkStatus>;
   setNetwork: (enabled: boolean) => Promise<NetworkStatus>;
+  getReduceMotion: () => Promise<ReduceMotionStatus>;
+  setReduceMotion: (enabled: boolean) => Promise<ReduceMotionStatus>;
+  getHighTextContrast: () => Promise<HighTextContrastStatus>;
+  setHighTextContrast: (enabled: boolean) => Promise<HighTextContrastStatus>;
+  getFontWeight: () => Promise<FontWeightStatus>;
+  setFontWeight: (enabled: boolean) => Promise<FontWeightStatus>;
+  getDisplayDensity: () => Promise<DisplayDensityStatus>;
+  setDisplayDensity: (scale: number) => Promise<DisplayDensityStatus>;
 
   openLogcat: (url: URL) => Response;
   takeScreenshot: () => Promise<Uint8Array>;

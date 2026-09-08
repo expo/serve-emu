@@ -18,6 +18,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
   through configuration, the CLI, runtime API, and browser UI.
 - Add selectable scrcpy and emulator gRPC input transports for gRPC screenshot
   streams through configuration, the CLI, runtime API, and browser UI.
+- Add `/api/reduce-motion`, `/api/high-text-contrast`, `/api/font-weight` and
+  `/api/display-density`, four framework-level Android accessibility settings
+  alongside `/api/network` and `/api/font-scale`. Each reads back the key its
+  own framework API parses, and display density reports the resulting
+  smallest-width dp.
 
 ### Changed
 

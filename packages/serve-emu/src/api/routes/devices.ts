@@ -3,6 +3,7 @@ import type { ContractApiRoute } from "./types.ts";
 import { readJsonBody } from "../body.ts";
 import { isEmulatorSerial } from "../../device-capabilities.ts";
 import {
+  parseDisplayDensityScale,
   parseFontScale,
   parseStreamModeRequest,
 } from "../../shared/api-contracts.ts";
@@ -213,6 +214,97 @@ export function deviceRoutes(): ContractApiRoute<ApiDependencies>[] {
           ok: true,
           network: await downstream("set network state", () =>
             deps.setNetwork(enabled)
+          ),
+        });
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/reduce-motion",
+      handler: async ({ deps }) => Response.json({
+        ok: true,
+        reduceMotion: await downstream("read reduce motion", deps.getReduceMotion),
+      }),
+    },
+    {
+      method: "POST",
+      path: "/api/reduce-motion",
+      handler: async ({ request, deps }) => {
+        const body = await readObject(request, "reduce motion payload");
+        const enabled = body.enabled;
+        if (typeof enabled !== "boolean") {
+          invalid("enabled must be a boolean");
+        }
+        return Response.json({
+          ok: true,
+          reduceMotion: await downstream("set reduce motion", () => deps.setReduceMotion(enabled)),
+        });
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/high-text-contrast",
+      handler: async ({ deps }) => Response.json({
+        ok: true,
+        highTextContrast: await downstream("read high text contrast", deps.getHighTextContrast),
+      }),
+    },
+    {
+      method: "POST",
+      path: "/api/high-text-contrast",
+      handler: async ({ request, deps }) => {
+        const body = await readObject(request, "high text contrast payload");
+        const enabled = body.enabled;
+        if (typeof enabled !== "boolean") {
+          invalid("enabled must be a boolean");
+        }
+        return Response.json({
+          ok: true,
+          highTextContrast: await downstream("set high text contrast", () => deps.setHighTextContrast(enabled)),
+        });
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/font-weight",
+      handler: async ({ deps }) => Response.json({
+        ok: true,
+        fontWeight: await downstream("read font weight", deps.getFontWeight),
+      }),
+    },
+    {
+      method: "POST",
+      path: "/api/font-weight",
+      handler: async ({ request, deps }) => {
+        const body = await readObject(request, "font weight payload");
+        const enabled = body.enabled;
+        if (typeof enabled !== "boolean") {
+          invalid("enabled must be a boolean");
+        }
+        return Response.json({
+          ok: true,
+          fontWeight: await downstream("set font weight", () => deps.setFontWeight(enabled)),
+        });
+      },
+    },
+    {
+      method: "GET",
+      path: "/api/display-density",
+      handler: async ({ deps }) => Response.json({
+        ok: true,
+        displayDensity: await downstream("read display density", deps.getDisplayDensity),
+      }),
+    },
+    {
+      method: "POST",
+      path: "/api/display-density",
+      handler: async ({ request, deps }) => {
+        const body = await readObject(request, "display density payload");
+        const scale = parseInput(() => parseDisplayDensityScale(body.scale));
+        return Response.json({
+          ok: true,
+          displayDensity: await downstream("set display density", () =>
+            deps.setDisplayDensity(scale)
           ),
         });
       },

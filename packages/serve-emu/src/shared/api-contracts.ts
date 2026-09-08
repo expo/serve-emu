@@ -228,6 +228,37 @@ export function parseFontScale(value: unknown): number {
   return value;
 }
 
+export type ReduceMotionStatus = {
+  enabled: boolean;
+  raw: { transition: string; window: string; animator: string };
+};
+export type ReduceMotionResponse = ApiSuccess<{ reduceMotion: ReduceMotionStatus }>;
+
+export type HighTextContrastStatus = { enabled: boolean; raw: string };
+export type HighTextContrastResponse = ApiSuccess<
+  { highTextContrast: HighTextContrastStatus }
+>;
+
+export type FontWeightStatus = { enabled: boolean; raw: string };
+export type FontWeightResponse = ApiSuccess<{ fontWeight: FontWeightStatus }>;
+
+export type DisplayDensityStatus = { scale: number; widthDp: number; raw: string };
+export type DisplayDensityResponse = ApiSuccess<
+  { displayDensity: DisplayDensityStatus }
+>;
+
+export function parseDisplayDensityScale(value: unknown): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value < 0.5 ||
+    value > 2
+  ) {
+    throw new Error("scale must be a number between 0.5 and 2.0");
+  }
+  return value;
+}
+
 export type NetworkRadioStatus = "enabled" | "disabled" | "unknown";
 export type NetworkStatus = {
   enabled: boolean | null;
@@ -543,6 +574,22 @@ export type ApiContractMap = {
   "/api/network": {
     GET: EndpointContract<undefined, NetworkResponse>;
     POST: EndpointContract<{ enabled: boolean }, NetworkResponse>;
+  };
+  "/api/reduce-motion": {
+    GET: EndpointContract<undefined, ReduceMotionResponse>;
+    POST: EndpointContract<{ enabled: boolean }, ReduceMotionResponse>;
+  };
+  "/api/high-text-contrast": {
+    GET: EndpointContract<undefined, HighTextContrastResponse>;
+    POST: EndpointContract<{ enabled: boolean }, HighTextContrastResponse>;
+  };
+  "/api/font-weight": {
+    GET: EndpointContract<undefined, FontWeightResponse>;
+    POST: EndpointContract<{ enabled: boolean }, FontWeightResponse>;
+  };
+  "/api/display-density": {
+    GET: EndpointContract<undefined, DisplayDensityResponse>;
+    POST: EndpointContract<{ scale: number }, DisplayDensityResponse>;
   };
   "/api/logcat": { GET: EndpointContract<undefined, never> };
   "/api/screenshot": {
@@ -1169,6 +1216,68 @@ export function parseNetworkResponse(value: unknown): NetworkResponse {
   };
 }
 
+export function parseReduceMotionResponse(value: unknown): ReduceMotionResponse {
+  const root = record(value, "reduce motion response");
+  if (root.ok !== true) fail("reduce motion response.ok must be true");
+  const status = record(root.reduceMotion, "reduceMotion");
+  const raw = record(status.raw, "reduceMotion.raw");
+  return {
+    ok: true,
+    reduceMotion: {
+      enabled: boolean(status.enabled, "reduceMotion.enabled"),
+      raw: {
+        transition: string(raw.transition, "reduceMotion.raw.transition"),
+        window: string(raw.window, "reduceMotion.raw.window"),
+        animator: string(raw.animator, "reduceMotion.raw.animator"),
+      },
+    },
+  };
+}
+
+export function parseHighTextContrastResponse(
+  value: unknown,
+): HighTextContrastResponse {
+  const root = record(value, "high text contrast response");
+  if (root.ok !== true) fail("high text contrast response.ok must be true");
+  const status = record(root.highTextContrast, "highTextContrast");
+  return {
+    ok: true,
+    highTextContrast: {
+      enabled: boolean(status.enabled, "highTextContrast.enabled"),
+      raw: string(status.raw, "highTextContrast.raw"),
+    },
+  };
+}
+
+export function parseFontWeightResponse(value: unknown): FontWeightResponse {
+  const root = record(value, "font weight response");
+  if (root.ok !== true) fail("font weight response.ok must be true");
+  const status = record(root.fontWeight, "fontWeight");
+  return {
+    ok: true,
+    fontWeight: {
+      enabled: boolean(status.enabled, "fontWeight.enabled"),
+      raw: string(status.raw, "fontWeight.raw"),
+    },
+  };
+}
+
+export function parseDisplayDensityResponse(
+  value: unknown,
+): DisplayDensityResponse {
+  const root = record(value, "display density response");
+  if (root.ok !== true) fail("display density response.ok must be true");
+  const status = record(root.displayDensity, "displayDensity");
+  return {
+    ok: true,
+    displayDensity: {
+      scale: number(status.scale, "displayDensity.scale"),
+      widthDp: number(status.widthDp, "displayDensity.widthDp"),
+      raw: string(status.raw, "displayDensity.raw"),
+    },
+  };
+}
+
 function parseForegroundApp(value: unknown): ForegroundApp {
   const item = record(value, "foreground app");
   return {
@@ -1711,6 +1820,16 @@ export const API_SUCCESS_PARSERS = {
   "/api/night-mode": { GET: parseNightModeResponse, POST: parseNightModeResponse },
   "/api/font-scale": { GET: parseFontScaleResponse, POST: parseFontScaleResponse },
   "/api/network": { GET: parseNetworkResponse, POST: parseNetworkResponse },
+  "/api/reduce-motion": { GET: parseReduceMotionResponse, POST: parseReduceMotionResponse },
+  "/api/high-text-contrast": {
+    GET: parseHighTextContrastResponse,
+    POST: parseHighTextContrastResponse,
+  },
+  "/api/font-weight": { GET: parseFontWeightResponse, POST: parseFontWeightResponse },
+  "/api/display-density": {
+    GET: parseDisplayDensityResponse,
+    POST: parseDisplayDensityResponse,
+  },
   "/api/logcat": { GET: unsupportedStreamingResponse },
   "/api/screenshot": { GET: parseScreenshotResponse, POST: parseScreenshotResponse },
   "/api/foreground": { GET: parseForegroundResponse },
