@@ -41,6 +41,14 @@ const EXPECTED_ROUTES = [
   ["POST", "/api/font-scale"],
   ["GET", "/api/network"],
   ["POST", "/api/network"],
+  ["GET", "/api/reduce-motion"],
+  ["POST", "/api/reduce-motion"],
+  ["GET", "/api/high-text-contrast"],
+  ["POST", "/api/high-text-contrast"],
+  ["GET", "/api/font-weight"],
+  ["POST", "/api/font-weight"],
+  ["GET", "/api/display-density"],
+  ["POST", "/api/display-density"],
   ["GET", "/api/logcat"],
   ["GET", "/api/screenshot"],
   ["POST", "/api/screenshot"],
@@ -96,6 +104,10 @@ const VALID_JSON_BODIES: Readonly<Record<string, unknown>> = {
   "POST /api/night-mode": { mode: "dark" },
   "POST /api/font-scale": { scale: 1.25 },
   "POST /api/network": { enabled: true },
+  "POST /api/reduce-motion": { enabled: true },
+  "POST /api/high-text-contrast": { enabled: true },
+  "POST /api/font-weight": { enabled: true },
+  "POST /api/display-density": { scale: 1.1 },
   "POST /api/accessibility/tap": { selector: { text: "Continue" } },
   "POST /api/tap": { x: 0.5, y: 0.5 },
   "POST /api/swipe": {
@@ -264,6 +276,29 @@ function fakeDependencies(
       mobileData: enabled ? "enabled" : "disabled",
       raw: { wifi: String(enabled), mobileData: String(enabled) },
     }),
+    getReduceMotion: async () => ({
+      enabled: false,
+      raw: { transition: "1", window: "1", animator: "1" },
+    }),
+    setReduceMotion: async (enabled) => ({
+      enabled,
+      raw: enabled
+        ? { transition: "0", window: "0", animator: "0" }
+        : { transition: "1", window: "1", animator: "1" },
+    }),
+    getHighTextContrast: async () => ({ enabled: false, raw: "0" }),
+    setHighTextContrast: async (enabled) => ({
+      enabled,
+      raw: enabled ? "1" : "0",
+    }),
+    getFontWeight: async () => ({ enabled: false, raw: "0" }),
+    setFontWeight: async (enabled) => ({ enabled, raw: enabled ? "300" : "0" }),
+    getDisplayDensity: async () => ({ scale: 1, widthDp: 411, raw: "Physical density: 420" }),
+    setDisplayDensity: async (scale) => ({
+      scale,
+      widthDp: Math.round(411 / scale),
+      raw: "Physical density: 420",
+    }),
 
     openLogcat: () =>
       new Response("event: ready\ndata: {}\n\n", {
@@ -430,14 +465,14 @@ const silentLogger: ApiLogger = {
 };
 
 describe("domain API route table", () => {
-  test("registers the exact 48 method/path pairs across 35 paths", () => {
+  test("registers the exact 56 method/path pairs across 39 paths", () => {
     const routes = createApiRoutes();
 
     expect(routes.map(({ method, path }) => [method, path])).toEqual(
       EXPECTED_ROUTES.map(([method, path]) => [method, path]),
     );
-    expect(routes).toHaveLength(48);
-    expect(new Set(routes.map((route) => route.path)).size).toBe(35);
+    expect(routes).toHaveLength(56);
+    expect(new Set(routes.map((route) => route.path)).size).toBe(39);
     const contractPairs = Object.entries(API_SUCCESS_PARSERS).flatMap(
       ([path, methods]) => Object.keys(methods).map((method) => `${method} ${path}`),
     );
@@ -467,12 +502,12 @@ describe("domain API route table", () => {
     );
   });
 
-  test("returns structured OPTIONS 405 with exact Allow for all 35 paths", async () => {
+  test("returns structured OPTIONS 405 with exact Allow for all 39 paths", async () => {
     const router = createApiRouter(createApiRoutes());
     const deps = fakeDependencies();
     const paths = [...new Set(EXPECTED_ROUTES.map((route) => route[1]))];
 
-    expect(paths).toHaveLength(35);
+    expect(paths).toHaveLength(39);
     for (const path of paths) {
       const response = await router.handle(
         new Request(`${BASE_URL}${path}`, { method: "OPTIONS" }),

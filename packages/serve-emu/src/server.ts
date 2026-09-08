@@ -10,15 +10,23 @@ import {
 } from "./camera.ts";
 import { getExecSnapshot } from "./exec.ts";
 import {
+  getFontWeight,
+  getDisplayDensity,
   getFontScale,
+  getHighTextContrast,
   getNetworkStatus,
   getNightMode,
+  getReduceMotion,
   getUserRotation,
   listAllDevices,
   screencapPng,
+  setFontWeight,
+  setDisplayDensity,
   setFontScale,
+  setHighTextContrast,
   setNetworkEnabled,
   setNightMode,
+  setReduceMotion,
   setUserRotation,
   type NightMode,
   type OrientationMode,
@@ -160,6 +168,7 @@ import {
   isGrpcImageMode,
   isInputSource,
   isStreamMode,
+  parseDisplayDensityScale,
   parseFontScale,
   parseStreamModeRequest,
   STREAM_MODES,
@@ -2527,6 +2536,181 @@ export async function startServer(
               ok: true,
               network: await runForContext(requestContext, (context) =>
                 setNetworkEnabled(context.serial, enabled),
+              ),
+            });
+          } catch (err) {
+            return errorResponse(err);
+          }
+        }
+        return new Response("method not allowed", { status: 405 });
+      }
+
+      if (url.pathname === "/api/reduce-motion") {
+        if (req.method === "GET") {
+          try {
+            return Response.json({
+              ok: true,
+              reduceMotion: await runForContext(requestContext, (context) =>
+                getReduceMotion(context.serial),
+              ),
+            });
+          } catch (err) {
+            return errorResponse(err);
+          }
+        }
+        if (req.method === "POST") {
+          try {
+            const payload = await readJsonBody(
+              req,
+              MAX_JSON_BODY_BYTES,
+              requestContext,
+            );
+            if (
+              typeof payload !== "object" ||
+              payload === null ||
+              Array.isArray(payload)
+            ) {
+              throw new Error("reduce motion payload must be an object");
+            }
+            const enabled = (payload as Record<string, unknown>).enabled;
+            if (typeof enabled !== "boolean") {
+              throw new Error("enabled must be a boolean");
+            }
+            return Response.json({
+              ok: true,
+              reduceMotion: await runForContext(requestContext, (context) =>
+                setReduceMotion(context.serial, enabled),
+              ),
+            });
+          } catch (err) {
+            return errorResponse(err);
+          }
+        }
+        return new Response("method not allowed", { status: 405 });
+      }
+
+      if (url.pathname === "/api/high-text-contrast") {
+        if (req.method === "GET") {
+          try {
+            return Response.json({
+              ok: true,
+              highTextContrast: await runForContext(requestContext, (context) =>
+                getHighTextContrast(context.serial),
+              ),
+            });
+          } catch (err) {
+            return errorResponse(err);
+          }
+        }
+        if (req.method === "POST") {
+          try {
+            const payload = await readJsonBody(
+              req,
+              MAX_JSON_BODY_BYTES,
+              requestContext,
+            );
+            if (
+              typeof payload !== "object" ||
+              payload === null ||
+              Array.isArray(payload)
+            ) {
+              throw new Error("high text contrast payload must be an object");
+            }
+            const enabled = (payload as Record<string, unknown>).enabled;
+            if (typeof enabled !== "boolean") {
+              throw new Error("enabled must be a boolean");
+            }
+            return Response.json({
+              ok: true,
+              highTextContrast: await runForContext(requestContext, (context) =>
+                setHighTextContrast(context.serial, enabled),
+              ),
+            });
+          } catch (err) {
+            return errorResponse(err);
+          }
+        }
+        return new Response("method not allowed", { status: 405 });
+      }
+
+      if (url.pathname === "/api/font-weight") {
+        if (req.method === "GET") {
+          try {
+            return Response.json({
+              ok: true,
+              fontWeight: await runForContext(requestContext, (context) =>
+                getFontWeight(context.serial),
+              ),
+            });
+          } catch (err) {
+            return errorResponse(err);
+          }
+        }
+        if (req.method === "POST") {
+          try {
+            const payload = await readJsonBody(
+              req,
+              MAX_JSON_BODY_BYTES,
+              requestContext,
+            );
+            if (
+              typeof payload !== "object" ||
+              payload === null ||
+              Array.isArray(payload)
+            ) {
+              throw new Error("font weight payload must be an object");
+            }
+            const enabled = (payload as Record<string, unknown>).enabled;
+            if (typeof enabled !== "boolean") {
+              throw new Error("enabled must be a boolean");
+            }
+            return Response.json({
+              ok: true,
+              fontWeight: await runForContext(requestContext, (context) =>
+                setFontWeight(context.serial, enabled),
+              ),
+            });
+          } catch (err) {
+            return errorResponse(err);
+          }
+        }
+        return new Response("method not allowed", { status: 405 });
+      }
+
+      if (url.pathname === "/api/display-density") {
+        if (req.method === "GET") {
+          try {
+            return Response.json({
+              ok: true,
+              displayDensity: await runForContext(requestContext, (context) =>
+                getDisplayDensity(context.serial),
+              ),
+            });
+          } catch (err) {
+            return errorResponse(err);
+          }
+        }
+        if (req.method === "POST") {
+          try {
+            const payload = await readJsonBody(
+              req,
+              MAX_JSON_BODY_BYTES,
+              requestContext,
+            );
+            if (
+              typeof payload !== "object" ||
+              payload === null ||
+              Array.isArray(payload)
+            ) {
+              throw new Error("display density payload must be an object");
+            }
+            const scale = parseDisplayDensityScale(
+              (payload as Record<string, unknown>).scale,
+            );
+            return Response.json({
+              ok: true,
+              displayDensity: await runForContext(requestContext, (context) =>
+                setDisplayDensity(context.serial, scale),
               ),
             });
           } catch (err) {

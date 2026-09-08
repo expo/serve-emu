@@ -2,14 +2,22 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import {
+  getFontWeight,
+  getDisplayDensity,
   getFontScale,
+  getHighTextContrast,
   getNetworkStatus,
+  getReduceMotion,
   getUserRotation,
   listAllDevices,
   listDevices,
   screencapPng,
+  setFontWeight,
+  setDisplayDensity,
   setFontScale,
+  setHighTextContrast,
   setNetworkEnabled,
+  setReduceMotion,
   setUserRotation,
   type OrientationMode,
 } from "./adb.ts";
@@ -102,6 +110,7 @@ import {
   INPUT_SOURCES,
   isGrpcImageMode,
   isInputSource,
+  parseDisplayDensityScale,
   parseFontScale,
   parseStreamModeRequest,
   type GrpcImageMode,
@@ -1302,6 +1311,127 @@ async function createAppInternal(
           return Response.json({
             ok: true,
             fontScale: await setFontScale(opts.serial, scale),
+          });
+        } catch (err) {
+          return middlewareRequestFailure(err);
+        }
+      }
+      return middlewareFailure("method_not_allowed", 405);
+    }
+
+    if (url.pathname === "/api/reduce-motion") {
+      if (req.method === "GET") {
+        try {
+          return Response.json({ ok: true, reduceMotion: await getReduceMotion(opts.serial) });
+        } catch (err) {
+          return middlewareRequestFailure(err);
+        }
+      }
+      if (req.method === "POST") {
+        if (!isAllowedBrowserOrigin(req, opts)) {
+          return middlewareFailure("forbidden_origin", 403);
+        }
+        try {
+          const payload = await readJsonBody(req);
+          if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+            throw new Error("reduce motion payload must be an object");
+          }
+          const enabled = (payload as Record<string, unknown>).enabled;
+          if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
+          return Response.json({
+            ok: true,
+            reduceMotion: await setReduceMotion(opts.serial, enabled),
+          });
+        } catch (err) {
+          return middlewareRequestFailure(err);
+        }
+      }
+      return middlewareFailure("method_not_allowed", 405);
+    }
+
+    if (url.pathname === "/api/high-text-contrast") {
+      if (req.method === "GET") {
+        try {
+          return Response.json({ ok: true, highTextContrast: await getHighTextContrast(opts.serial) });
+        } catch (err) {
+          return middlewareRequestFailure(err);
+        }
+      }
+      if (req.method === "POST") {
+        if (!isAllowedBrowserOrigin(req, opts)) {
+          return middlewareFailure("forbidden_origin", 403);
+        }
+        try {
+          const payload = await readJsonBody(req);
+          if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+            throw new Error("high text contrast payload must be an object");
+          }
+          const enabled = (payload as Record<string, unknown>).enabled;
+          if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
+          return Response.json({
+            ok: true,
+            highTextContrast: await setHighTextContrast(opts.serial, enabled),
+          });
+        } catch (err) {
+          return middlewareRequestFailure(err);
+        }
+      }
+      return middlewareFailure("method_not_allowed", 405);
+    }
+
+    if (url.pathname === "/api/font-weight") {
+      if (req.method === "GET") {
+        try {
+          return Response.json({ ok: true, fontWeight: await getFontWeight(opts.serial) });
+        } catch (err) {
+          return middlewareRequestFailure(err);
+        }
+      }
+      if (req.method === "POST") {
+        if (!isAllowedBrowserOrigin(req, opts)) {
+          return middlewareFailure("forbidden_origin", 403);
+        }
+        try {
+          const payload = await readJsonBody(req);
+          if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+            throw new Error("font weight payload must be an object");
+          }
+          const enabled = (payload as Record<string, unknown>).enabled;
+          if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
+          return Response.json({
+            ok: true,
+            fontWeight: await setFontWeight(opts.serial, enabled),
+          });
+        } catch (err) {
+          return middlewareRequestFailure(err);
+        }
+      }
+      return middlewareFailure("method_not_allowed", 405);
+    }
+
+    if (url.pathname === "/api/display-density") {
+      if (req.method === "GET") {
+        try {
+          return Response.json({ ok: true, displayDensity: await getDisplayDensity(opts.serial) });
+        } catch (err) {
+          return middlewareRequestFailure(err);
+        }
+      }
+      if (req.method === "POST") {
+        if (!isAllowedBrowserOrigin(req, opts)) {
+          return middlewareFailure("forbidden_origin", 403);
+        }
+        try {
+          const payload = await readJsonBody(req);
+          if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+            throw new Error("display density payload must be an object");
+          }
+          const scale = parseDisplayDensityScale(
+            (payload as Record<string, unknown>).scale,
+          );
+          return Response.json({
+            ok: true,
+            displayDensity: await setDisplayDensity(opts.serial, scale),
           });
         } catch (err) {
           return middlewareRequestFailure(err);

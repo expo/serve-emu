@@ -34,6 +34,30 @@ export type NetworkStatus = {
   };
 };
 
+export type ReduceMotionStatus = {
+  enabled: boolean;
+  raw: {
+    transition: string;
+    window: string;
+    animator: string;
+  };
+};
+export type HighTextContrastStatus = {
+  enabled: boolean;
+  raw: string;
+};
+export type FontWeightStatus = {
+  enabled: boolean;
+  raw: string;
+};
+export type DisplayDensityStatus = {
+  /** The override density as a ratio of the device's own physical density. */
+  scale: number;
+  /** The smallest-width dp the override produces, the `swNNNdp` resource qualifier. */
+  widthDp: number;
+  raw: string;
+};
+
 function execFailed(result: ExecResult<string | Buffer>): boolean {
   return result.status !== 0 || result.error !== null;
 }
@@ -395,4 +419,228 @@ export async function setNetworkEnabled(
     }
   }
   return getNetworkStatus(serial, runExec);
+}
+
+async function secureSetting(
+  serial: string,
+  name: string,
+  runExec: typeof execText = execText,
+): Promise<string> {
+  const r = await runExec(
+    "adb",
+    ["-s", serial, "shell", "settings", "get", "secure", name],
+    {
+      timeout: ADB_QUERY_TIMEOUT_MS,
+    },
+  );
+  if (execFailed(r)) {
+    throw new Error(
+      `settings get secure ${name} failed: ${execFailure(r)}`,
+      { cause: r.error ?? undefined },
+    );
+  }
+  return r.stdout.trim();
+}
+
+async function mutateShell(
+  serial: string,
+  args: readonly string[],
+  runExec: typeof execText = execText,
+): Promise<void> {
+  const r = await runExec("adb", ["-s", serial, "shell", ...args], {
+    timeout: ADB_MUTATION_TIMEOUT_MS,
+  });
+  if (execFailed(r)) {
+    throw new Error(
+      `adb shell ${args.join(" ")} failed: ${execFailure(r)}`,
+    );
+  }
+}
+
+/** Android's "Remove animations" toggle moves all three scales, so read and write them as one. */
+const ANIMATION_SCALE_KEYS = [
+  "transition_animation_scale",
+  "window_animation_scale",
+  "animator_duration_scale",
+] as const;
+
+/** Mirrors React Native's `AccessibilityInfoModule`, which is on only at exactly zero. */
+function reduceMotionFromScale(raw: string): boolean {
+  return raw !== "" && Number(raw.replace(",", ".")) === 0;
+}
+
+/** `Configuration.fontWeightAdjustment` takes the raw int; an unset key reads back as `null`. */
+function enabledFromIntSetting(raw: string): boolean {
+  return /^[+-]?\d+$/.test(raw) && Number(raw) !== 0;
+}
+
+/** Read the animation scales, with `transition_animation_scale` as the authority. */
+export async function getReduceMotion(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<ReduceMotionStatus> {
+  const [transition, window, animator] = await Promise.all([
+    globalSetting(serial, ANIMATION_SCALE_KEYS[0], runExec),
+    globalSetting(serial, ANIMATION_SCALE_KEYS[1], runExec),
+    globalSetting(serial, ANIMATION_SCALE_KEYS[2], runExec),
+  ]);
+  return {
+    enabled: reduceMotionFromScale(transition),
+    raw: { transition, window, animator },
+  };
+}
+
+/** Write `0` to disable animations and `1` to restore the Android defaults. */
+export async function setReduceMotion(
+  serial: string,
+  enabled: boolean,
+  runExec: typeof execText = execText,
+): Promise<ReduceMotionStatus> {
+  const value = enabled ? "0" : "1";
+  for (const key of ANIMATION_SCALE_KEYS) {
+    await mutateShell(serial, ["settings", "put", "global", key, value], runExec);
+  }
+  return getReduceMotion(serial, runExec);
+}
+
+export async function getHighTextContrast(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<HighTextContrastStatus> {
+  const raw = await secureSetting(serial, "high_text_contrast_enabled", runExec);
+  // AccessibilityManagerService compares this key to exactly 1, not to non-zero.
+  return { enabled: raw === "1", raw };
+}
+
+/** Write the flag as the `1` or `0` int Android's `Settings.Secure` stores. */
+export async function setHighTextContrast(
+  serial: string,
+  enabled: boolean,
+  runExec: typeof execText = execText,
+): Promise<HighTextContrastStatus> {
+  await mutateShell(
+    serial,
+    ["settings", "put", "secure", "high_text_contrast_enabled", enabled ? "1" : "0"],
+    runExec,
+  );
+  return getHighTextContrast(serial, runExec);
+}
+
+/** The adjustment Android's own Bold text toggle writes. */
+const FONT_WEIGHT_BOLD_ADJUSTMENT = 300;
+
+export async function getFontWeight(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<FontWeightStatus> {
+  const raw = await secureSetting(serial, "font_weight_adjustment", runExec);
+  return { enabled: enabledFromIntSetting(raw), raw };
+}
+
+/** `Configuration.fontWeightAdjustment` reads this key, so native and Compose text bold too. */
+export async function setFontWeight(
+  serial: string,
+  enabled: boolean,
+  runExec: typeof execText = execText,
+): Promise<FontWeightStatus> {
+  await mutateShell(
+    serial,
+    [
+      "settings",
+      "put",
+      "secure",
+      "font_weight_adjustment",
+      String(enabled ? FONT_WEIGHT_BOLD_ADJUSTMENT : 0),
+    ],
+    runExec,
+  );
+  return getFontWeight(serial, runExec);
+}
+
+const DISPLAY_DENSITY_MIN_DPI = 72;
+
+/** `wm density` reports the physical density and, only when set, the override. */
+async function readDisplayDensity(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<{ physical: number; override: number | null; raw: string }> {
+  const r = await runExec("adb", ["-s", serial, "shell", "wm", "density"], {
+    timeout: ADB_QUERY_TIMEOUT_MS,
+  });
+  if (execFailed(r)) throw new Error(`wm density failed: ${execFailure(r)}`);
+  const raw = r.stdout.trim();
+  const physical = Number(/Physical density:\s*(\d+)/.exec(raw)?.[1]);
+  if (!Number.isFinite(physical) || physical <= 0) {
+    throw new Error(`Could not parse wm density output: ${raw}`);
+  }
+  const override = /Override density:\s*(\d+)/.exec(raw)?.[1];
+  return { physical, override: override === undefined ? null : Number(override), raw };
+}
+
+/**
+ * `wm size` with the override preferred, unlike {@link getDeviceSize}, which
+ * reports the panel the stream is encoded from.
+ */
+async function readEffectiveDisplaySize(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<{ widthPx: number; heightPx: number }> {
+  const r = await runExec("adb", ["-s", serial, "shell", "wm", "size"], {
+    timeout: ADB_QUERY_TIMEOUT_MS,
+  });
+  if (execFailed(r)) throw new Error(`wm size failed: ${execFailure(r)}`);
+  const raw = r.stdout.trim();
+  const size = /Override size:\s*(\d+)x(\d+)/.exec(raw) ??
+    /Physical size:\s*(\d+)x(\d+)/.exec(raw);
+  const widthPx = Number(size?.[1]);
+  const heightPx = Number(size?.[2]);
+  if (
+    !Number.isFinite(widthPx) || widthPx <= 0 ||
+    !Number.isFinite(heightPx) || heightPx <= 0
+  ) {
+    throw new Error(`Could not parse wm size output: ${raw}`);
+  }
+  return { widthPx, heightPx };
+}
+
+/** Report the override as a ratio of the device's own physical density. */
+export async function getDisplayDensity(
+  serial: string,
+  runExec: typeof execText = execText,
+): Promise<DisplayDensityStatus> {
+  const [{ physical, override, raw }, { widthPx, heightPx }] = await Promise.all([
+    readDisplayDensity(serial, runExec),
+    readEffectiveDisplaySize(serial, runExec),
+  ]);
+  const density = override ?? physical;
+  return {
+    scale: Math.round((density / physical) * 1000) / 1000,
+    // `swNNNdp` keys off the smallest dimension, so this survives rotation.
+    widthDp: Math.round((Math.min(widthPx, heightPx) * 160) / density),
+    raw,
+  };
+}
+
+/** The default step must clear the override, not pin it to the physical density. */
+export async function setDisplayDensity(
+  serial: string,
+  scale: number,
+  runExec: typeof execText = execText,
+): Promise<DisplayDensityStatus> {
+  if (!Number.isFinite(scale) || scale < 0.5 || scale > 2) {
+    throw new Error("display density scale must be between 0.5 and 2.0");
+  }
+  const { physical } = await readDisplayDensity(serial, runExec);
+  const density = Math.round(physical * scale);
+  if (density < DISPLAY_DENSITY_MIN_DPI) {
+    throw new Error(
+      `display density ${density} is below the Android minimum of ${DISPLAY_DENSITY_MIN_DPI}`,
+    );
+  }
+  await mutateShell(
+    serial,
+    ["wm", "density", density === physical ? "reset" : String(density)],
+    runExec,
+  );
+  return getDisplayDensity(serial, runExec);
 }

@@ -393,7 +393,34 @@ curl "$BASE/api/network"
 curl -X POST "$BASE/api/network" \
   -H 'Content-Type: application/json' \
   -d '{"enabled":false}'
+
+curl "$BASE/api/reduce-motion"
+curl -X POST "$BASE/api/reduce-motion" \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled":true}'
+
+curl "$BASE/api/high-text-contrast"
+curl -X POST "$BASE/api/high-text-contrast" \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled":true}'
+
+curl "$BASE/api/font-weight"
+curl -X POST "$BASE/api/font-weight" \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled":true}'
+
+curl "$BASE/api/display-density"
+curl -X POST "$BASE/api/display-density" \
+  -H 'Content-Type: application/json' \
+  -d '{"scale":1.1}'
 ```
+
+Reduce motion writes `0` to all three animation scales and `1` to restore the
+Android defaults. High text contrast and font weight write the `Settings.Secure`
+keys the framework reads; font weight uses the same `300` adjustment as the Android
+Bold text toggle. Display density takes a `scale` from `0.5` to `2.0` relative to
+the physical density, and `1` clears the override. The response reports `scale`
+and `widthDp`, the smallest-width dp that selects `swNNNdp` resources.
 
 ### Location And Routes
 
