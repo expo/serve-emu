@@ -1,5 +1,8 @@
 # serve-emu
 
+> [!WARNING]
+> This repository is archived and no longer maintained. The implementation moved to the [expo/expo-device-hub](https://github.com/expo/expo-device-hub) monorepo. Open new issues and pull requests there.
+
 Host your Android emulator or attached Android device for agent workflows like Codex, Cursor, Claude Desktop, and browser-based QA. `serve-emu` streams the screen locally, over your LAN, or through your tunnel of choice, then accepts low-latency input and device-control commands over HTTP and WebSocket.
 
 
